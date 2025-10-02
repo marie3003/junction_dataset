@@ -14,10 +14,10 @@ rule download_gbk:
     output:
         "data/gbk/{acc}.gbk",
     conda:
-        "entrez-direct"
+        "config/conda_envs/entrez_direct.yaml"
     shell:
         """
-        esearch -db nucleotide -query {wildcards.acc}[Accession] | efetch -format gbwithparts > {output}
+        efetch -db nucleotide -id {wildcards.acc} -format gbwithparts > {output}
         """
 
 
