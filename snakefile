@@ -11,6 +11,9 @@ print(f"N. isolates: {len(acc_nums)}")
 # load the table of junction positions
 with open(config["junction_positions_file"]) as f:
     junc_pos = json.load(f)
+# exclude single-isolate junctions
+junc_pos = {j: p for j, p in junc_pos.items() if len(p) > 1}
+# list of junction IDs
 junc_ids = list(junc_pos.keys())
 print(f"N. junctions: {len(junc_ids)}")
 
@@ -36,7 +39,7 @@ rule extract_junction_sequences:
     conda:
         "config/conda_envs/bioinfo.yaml"
     log:
-        "logs/extract_junctions_{junc}.log",
+        "logs/extract_junctions/{junc}.log",
     shell:
         """
         python scripts/extract_junctions.py \

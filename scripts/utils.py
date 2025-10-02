@@ -266,6 +266,28 @@ def extract_genbank_annotations(genbank_file, start, end, forward_orientation=Tr
             else:
                 attributes[key] = str(value)
 
+        # Add ID and Name attributes if available
+        if "locus_tag" in feature.qualifiers:
+            attributes["ID"] = feature.qualifiers["locus_tag"][0]
+        elif "gene" in feature.qualifiers:
+            attributes["ID"] = feature.qualifiers["gene"][0]
+        elif "label" in feature.qualifiers:
+            attributes["ID"] = feature.qualifiers["label"][0]
+        else:
+            attributes["ID"] = f"{feature.type}_{feat_start}_{feat_end}"
+
+        if "gene" in attributes:
+            attributes["Name"] = attributes["gene"]
+        elif "label" in attributes:
+            attributes["Name"] = attributes["label"]
+        elif "locus_tag" in attributes:
+            attributes["Name"] = attributes["locus_tag"]
+        else:
+            attributes["Name"] = "unknown"
+
+        # Indicate if the feature is partial (has overhangs)
+        attributes["is_partial"] = str(is_partial)
+
         # Create GFF3 entry
         gff_entry = {
             "seqid": record.id,
@@ -277,7 +299,6 @@ def extract_genbank_annotations(genbank_file, start, end, forward_orientation=Tr
             "strand": strand,
             "phase": ".",
             "attributes": attributes,
-            "is_partial": is_partial,  # Additional info, not standard GFF3
         }
 
         annotations.append(gff_entry)
