@@ -1,1 +1,4 @@
 /results
+/data
+/config/config
+/.snakemake
