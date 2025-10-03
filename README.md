@@ -14,3 +14,11 @@ Run the pipeline simply with:
 ```sh
 snakemake --use-conda --cores <num_cores> all
 ```
+
+## Viewing junctions
+
+You can explore junctions visually with [marimo](https://marimo.io/) by running:
+
+```sh
+marimo run explore/view_junctions.py
+```
