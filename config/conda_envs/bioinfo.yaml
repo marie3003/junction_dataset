@@ -149,3 +149,5 @@ dependencies:
   - xorg-libxxf86vm=1.1.6
   - zstd=1.5.7
 prefix: /home/marco/miniconda3/envs/junctions
+
+# This environment yaml file only works on linux
