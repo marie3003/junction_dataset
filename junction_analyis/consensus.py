@@ -179,7 +179,7 @@ def assign_isolates_to_consensus(similarity_df: pd.DataFrame) -> pd.DataFrame:
 
     return assignments
 
-def remove_rare_consensus_paths(consensus_paths, deduplicated_paths, assignment_df, min_n_isolates_per_consensus=5):
+def remove_rare_consensus_paths(consensus_paths, deduplicated_paths, edge_ji_df, assignment_df, min_n_isolates_per_consensus=5):
     """
     Iteratively remove consensus paths that have less than min_n_isolates assigned to them.
     Returns filtered consensus paths and updated assignment_df.
@@ -253,6 +253,6 @@ def find_consensus_paths(pangraph, rare_block_threshold = 10, rare_edge_threshol
     assignment_df = assign_isolates_to_consensus(edge_ji_df)
 
     # refilter consensus paths such that each consensus path has at least n assigned isolate, e.g. n = 5
-    edge_ji_df, assignment_df, consensus_paths = remove_rare_consensus_paths(consensus_paths, deduplicated_paths, assignment_df, min_n_isolates_per_consensus)
+    edge_ji_df, assignment_df, consensus_paths = remove_rare_consensus_paths(consensus_paths, deduplicated_paths, edge_ji_df, assignment_df, min_n_isolates_per_consensus)
 
     return consensus_paths, path_dict, edge_ji_df, assignment_df

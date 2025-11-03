@@ -4,6 +4,8 @@ import pandas as pd
 import string
 from itertools import combinations
 
+from Bio import Align
+
 from junction_analyis.helpers import get_hierarchical_order, get_tree_order
 
 

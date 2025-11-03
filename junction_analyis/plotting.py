@@ -96,6 +96,170 @@ def plot_heatmap_hover(sequence_comparison_df, diff = None, shared = None, show_
 
     fig.show()
 
+def plot_junction_pangraph_combined(
+    pan: pp.Pangraph,
+    show_consensus: bool = False,
+    consensus_paths: list = None,        # list[pu.Path] of Nodes with .id, .strand
+    assignments: pd.DataFrame = None,    # index: isolate names, col 'best_consensus'
+    order: str = "tree",
+):
+    """
+    Plot junction graph blocks for all isolates in `pan`, optionally including consensus paths.
+    Now uses Plotly, with hover tooltips showing block id (and strand).
+    """
+
+    bdf = pan.to_blockstats_df()
+    n_core = int(bdf["core"].sum())
+    n_acc = int(len(bdf) - n_core)
+
+    # distinct color generators for core / accessory
+    cgen_acc = iter(sns.color_palette("rainbow", n_acc))
+    cgen_core = iter(sns.color_palette("pastel", n_core))
+    block_colors: dict = {}
+
+    def get_block_color(block_id):
+        """Return (and cache) a consistent color per block id."""
+        if block_id not in block_colors:
+            color = next(cgen_core) if bool(bdf.loc[block_id, "core"]) else next(cgen_acc)
+            # plotly likes rgb strings as well as tuples
+            if isinstance(color, tuple) and len(color) == 3:
+                color = f"rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})"
+            block_colors[block_id] = color
+        return block_colors[block_id]
+
+    # --- isolate ordering ---
+    tree_order = get_tree_order() if order == "tree" else None
+    if tree_order:
+        isolates_ordered = tree_order
+    else:
+        isolates_ordered = list(pan.paths.keys())
+
+    fig = go.Figure()
+    y_labels = []
+    y_seen = set()
+
+    # --- helpers to actually draw bars (as individual traces) ---
+    def _add_bar(label: str, left: int, width: int, color: str, strand: bool, block_id, block_pos: int):
+        # one horizontal bar segment as its own trace
+        fig.add_bar(
+            x=[width],
+            y=[label],
+            base=[left],
+            orientation="h",
+            marker=dict(
+                color=color,
+                line=dict(color=("black" if strand else "red"), width=1)
+            ),
+            customdata=[[left, width, left + width, block_id, strand, block_pos]],
+        hovertemplate=(
+            "label: %{y}"
+            "<br>start: %{customdata[0]}"
+            "<br>len: %{customdata[1]}"
+            "<br>end: %{customdata[2]}"
+            "<br>block: %{customdata[3]}"
+            "<br>strand: %{customdata[4]:+, -}"
+            "<br>block position: %{customdata[5]}"
+            "<extra></extra>"
+            ),
+            showlegend=False,
+        )
+
+    def draw_isolate_track(isolate_name: str):
+        """Plot one isolate using true genomic coordinates from pan."""
+        if isolate_name not in pan.paths:
+            return
+        p = pan.paths[isolate_name]
+        for block_idx, node_id in enumerate(p.nodes):
+            block, strand, start, end = pan.nodes[node_id][["block_id", "strand", "start", "end"]]
+            _add_bar(
+                label=isolate_name,
+                left=int(start),
+                width=int(end - start),
+                color=get_block_color(block),
+                strand=bool(strand),
+                block_id=block,
+                block_pos = block_idx,
+            )
+        if isolate_name not in y_seen:
+            y_labels.append(isolate_name)
+            y_seen.add(isolate_name)
+
+    def draw_consensus_track(cons_path, label: str):
+        """
+        Plot one consensus path. No absolute coords in pan,
+        so we just accumulate block lengths along x.
+        cons_path is iterable of nodes with .id and .strand
+        """
+        x_left = 0
+        for block_idx, node in enumerate(cons_path):
+            bid = node.id
+            strand = node.strand
+            block_len = int(bdf.loc[bid, "len"])
+            _add_bar(
+                label=label,
+                left=int(x_left),
+                width=block_len,
+                color=get_block_color(bid),
+                strand=bool(strand),
+                block_id=bid,
+                block_pos=block_idx
+            )
+            x_left += block_len
+        if label not in y_seen:
+            y_labels.append(label)
+            y_seen.add(label)
+
+    # === CASE 1: isolates-only mode ===
+    if not show_consensus:
+        for iso in isolates_ordered:
+            draw_isolate_track(iso)
+
+    # === CASE 2: show_consensus mode ===
+    else:
+        grouped = (
+            assignments.reset_index()
+            .groupby("best_consensus")["index"]
+            .apply(list)
+            .to_dict()
+        )
+
+        for i, cons_path in enumerate(consensus_paths):
+            cons_label = f"consensus_{i+1}"
+            isolates_for_this = grouped.get(cons_label, [])
+            if tree_order:
+                isolates_for_this = [iso for iso in tree_order if iso in isolates_for_this]
+            for iso in isolates_for_this:
+                draw_isolate_track(iso)
+            draw_consensus_track(cons_path, cons_label)
+
+        for i, cons_path in enumerate(consensus_paths):
+            cons_label = f"consensus_{i+1}\u200b"
+            draw_consensus_track(cons_path, cons_label)
+
+    # y-axis: keep order we accumulated; bold consensus labels
+    tickvals = y_labels
+    ticktext = [f"<b>{y}</b>" if y.startswith("consensus_") else y for y in y_labels]
+
+    fig.update_layout(
+        barmode="stack",
+        bargap=0.08,
+        xaxis=dict(title="genomic position (bp)", showgrid=True, gridcolor="rgba(0,0,0,0.2)"),
+        yaxis=dict(
+            title="",
+            categoryorder="array",
+            categoryarray=y_labels,
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+        ),
+        margin=dict(l=120, r=20, t=20, b=40),
+        height=max(300, int(len(y_labels) * 22)),
+        template="plotly_white",
+    )
+    plt.show()
+    return fig
+
+
 
 
 def plot_junction_pangraph_combined(
