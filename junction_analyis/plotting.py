@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 
 import pandas as pd
 import pypangraph as pp
+from scipy.cluster.hierarchy import dendrogram
 
 from junction_analyis.helpers import get_tree_order
 import junction_analyis.pangraph_utils as pu
@@ -96,12 +97,14 @@ def plot_heatmap_hover(sequence_comparison_df, diff = None, shared = None, show_
 
     fig.show()
 
-def plot_junction_pangraph_combined(
+# interactive plotly version
+def plot_junction_pangraph_interactive(
     pan: pp.Pangraph,
     show_consensus: bool = False,
     consensus_paths: list = None,        # list[pu.Path] of Nodes with .id, .strand
     assignments: pd.DataFrame = None,    # index: isolate names, col 'best_consensus'
     order: str = "tree",
+    highlight_clusters: dict | None = None, 
 ):
     """
     Plot junction graph blocks for all isolates in `pan`, optionally including consensus paths.
@@ -116,6 +119,19 @@ def plot_junction_pangraph_combined(
     cgen_acc = iter(sns.color_palette("rainbow", n_acc))
     cgen_core = iter(sns.color_palette("pastel", n_core))
     block_colors: dict = {}
+
+    # NEW: prepare cluster -> color and isolate -> color maps
+    isolate_star_color = {} 
+    if highlight_clusters:
+        cluster_ids = sorted(highlight_clusters.keys())
+        palette = sns.color_palette("tab10", n_colors=max(10, len(cluster_ids))) 
+        # assign a distinct color per cluster id
+        for i, cid in enumerate(cluster_ids):
+            col = palette[i % len(palette)]
+            # convert to plotly-friendly rgb
+            col_rgb = f"rgb({int(col[0]*255)},{int(col[1]*255)},{int(col[2]*255)})"
+            for iso in highlight_clusters[cid]:
+                isolate_star_color[iso] = col_rgb
 
     def get_block_color(block_id):
         """Return (and cache) a consistent color per block id."""
@@ -150,7 +166,7 @@ def plot_junction_pangraph_combined(
                 color=color,
                 line=dict(color=("black" if strand else "red"), width=1)
             ),
-            customdata=[[left, width, left + width, block_id, strand, block_pos]],
+            customdata=[[left, width, left + width, str(block_id), strand, block_pos]],
         hovertemplate=(
             "label: %{y}"
             "<br>start: %{customdata[0]}"
@@ -164,11 +180,22 @@ def plot_junction_pangraph_combined(
             showlegend=False,
         )
 
+    def _add_star(label: str, x_star: float, color: str):
+        fig.add_scatter(
+            x=[x_star],
+            y=[label],
+            mode="markers",
+            marker=dict(symbol="star", size=12, color=color, line=dict(width=0)), 
+            showlegend=False,
+            hoverinfo="skip",
+        )
+
     def draw_isolate_track(isolate_name: str):
         """Plot one isolate using true genomic coordinates from pan."""
         if isolate_name not in pan.paths:
             return
         p = pan.paths[isolate_name]
+
         for block_idx, node_id in enumerate(p.nodes):
             block, strand, start, end = pan.nodes[node_id][["block_id", "strand", "start", "end"]]
             _add_bar(
@@ -180,6 +207,12 @@ def plot_junction_pangraph_combined(
                 block_id=block,
                 block_pos = block_idx,
             )
+            # CHANGED: update bounds
+
+        if isolate_name in isolate_star_color:
+            x_star = -600
+            _add_star(isolate_name, x_star, isolate_star_color[isolate_name])
+
         if isolate_name not in y_seen:
             y_labels.append(isolate_name)
             y_seen.add(isolate_name)
@@ -251,6 +284,7 @@ def plot_junction_pangraph_combined(
             tickmode="array",
             tickvals=tickvals,
             ticktext=ticktext,
+            ticklabelposition="inside",
         ),
         margin=dict(l=120, r=20, t=20, b=40),
         height=max(300, int(len(y_labels) * 22)),
@@ -592,3 +626,12 @@ def plot_junction_pangraph(pan: pp.Pangraph, add_consensus: bool = False, consen
     ax.set_ylim(-1, len(y_labels))
     sns.despine()
     plt.tight_layout()
+
+
+def plot_dendrogram(Z, names):
+    plt.figure(figsize=(10, 5))
+    dendrogram(Z, labels=names, leaf_rotation=90)
+    plt.title("Hierarchical clustering (p-distance)")
+    plt.ylabel("p-distance")
+    plt.tight_layout()
+    plt.show()

@@ -2,6 +2,12 @@ from pathlib import Path
 import subprocess
 
 import pandas as pd
+import numpy as np
+
+from Bio import AlignIO
+from Bio.Phylo.TreeConstruction import DistanceCalculator
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from scipy.spatial.distance import squareform
 
 import pypangraph as pp
 from Bio import SeqIO
@@ -72,7 +78,7 @@ def analyze_alignment(path):
             mismatch_cols += 1
 
     return dict(file=path.name,
-                block_id=path.stem.replace("_aln","").replace("block_",""),
+                block_id=int(path.stem.replace("_aln","").replace("block_","")),
                 n_seqs=len(recs),
                 alignment_len = length,
                 core_len=core_len,
@@ -87,7 +93,33 @@ def summarize_block_msas(junction_name, save_df = True):
     summary_df = pd.DataFrame(results).sort_values("block_id")
 
     if save_df:
-        out_csv = Path(f"../results/block_alignments/{junction_name}_alignment_stats.csv")
+        out_csv = Path(f"../results/block_alignments/{junction_name}/{junction_name}_alignment_stats.csv")
         summary_df.to_csv(out_csv, index=False)
 
     return summary_df
+
+def cluster_alignment(alignment_path):
+    # gap positions are ignored in identity calculation (that's why one doesn't have to worry about missing parts on the ends)
+    aln = AlignIO.read(alignment_path, "fasta")
+    calc = DistanceCalculator('identity') # counts non identical positions, ignoring gaps
+    dm = calc.get_distance(aln)
+
+    distance_df = pd.DataFrame(dm.matrix, index=dm.names, columns=dm.names)
+    distance_matrix = distance_df.to_numpy()
+    distance_matrix = np.nan_to_num(distance_matrix, nan = 0.0)
+    distance_matrix = distance_matrix + distance_matrix.T
+
+    # --- hierarchical clustering (UPGMA/average by default) ---
+    Z = linkage(squareform(distance_matrix), method="average")  # use 'single'/'complete' if preferred
+
+    return distance_matrix, Z, dm.names
+
+def retrieve_cluster_members(Z, names, n_clusters):
+    labels_k = fcluster(Z, t=n_clusters, criterion="maxclust")
+    names = np.array(names)
+
+    clusters_k = {}
+    for label in np.unique(labels_k):
+        clusters_k[int(label)] = names[labels_k == label].tolist()
+
+    return clusters_k
