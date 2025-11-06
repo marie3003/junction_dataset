@@ -1,5 +1,8 @@
 import numpy as np
+import random
+
 import plotly.graph_objects as go
+import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
 
@@ -101,101 +104,61 @@ def plot_heatmap_hover(sequence_comparison_df, diff = None, shared = None, show_
 def plot_junction_pangraph_interactive(
     pan: pp.Pangraph,
     show_consensus: bool = False,
-    consensus_paths: list = None,        # list[pu.Path] of Nodes with .id, .strand
-    assignments: pd.DataFrame = None,    # index: isolate names, col 'best_consensus'
+    consensus_paths: list = None,
+    assignments: pd.DataFrame = None,
     order: str = "tree",
-    highlight_clusters: dict | None = None, 
+    cluster_map: dict = None,
+    title: str = "", 
 ):
-    """
-    Plot junction graph blocks for all isolates in `pan`, optionally including consensus paths.
-    Now uses Plotly, with hover tooltips showing block id (and strand).
-    """
-
     bdf = pan.to_blockstats_df()
     n_core = int(bdf["core"].sum())
     n_acc = int(len(bdf) - n_core)
-
-    # distinct color generators for core / accessory
     cgen_acc = iter(sns.color_palette("rainbow", n_acc))
     cgen_core = iter(sns.color_palette("pastel", n_core))
     block_colors: dict = {}
 
-    # NEW: prepare cluster -> color and isolate -> color maps
-    isolate_star_color = {} 
-    if highlight_clusters:
-        cluster_ids = sorted(highlight_clusters.keys())
-        palette = sns.color_palette("tab10", n_colors=max(10, len(cluster_ids))) 
-        # assign a distinct color per cluster id
-        for i, cid in enumerate(cluster_ids):
-            col = palette[i % len(palette)]
-            # convert to plotly-friendly rgb
-            col_rgb = f"rgb({int(col[0]*255)},{int(col[1]*255)},{int(col[2]*255)})"
-            for iso in highlight_clusters[cid]:
-                isolate_star_color[iso] = col_rgb
-
     def get_block_color(block_id):
-        """Return (and cache) a consistent color per block id."""
         if block_id not in block_colors:
             color = next(cgen_core) if bool(bdf.loc[block_id, "core"]) else next(cgen_acc)
-            # plotly likes rgb strings as well as tuples
             if isinstance(color, tuple) and len(color) == 3:
                 color = f"rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})"
             block_colors[block_id] = color
         return block_colors[block_id]
 
-    # --- isolate ordering ---
     tree_order = get_tree_order() if order == "tree" else None
-    if tree_order:
-        isolates_ordered = tree_order
-    else:
-        isolates_ordered = list(pan.paths.keys())
-
+    isolates_ordered = tree_order if tree_order else list(pan.paths.keys())
     fig = go.Figure()
     y_labels = []
     y_seen = set()
+    max_x = 0  # track max end to pad space for stars
 
-    # --- helpers to actually draw bars (as individual traces) ---
     def _add_bar(label: str, left: int, width: int, color: str, strand: bool, block_id, block_pos: int):
-        # one horizontal bar segment as its own trace
+        nonlocal max_x
+        max_x = max(max_x, int(left) + int(width))
         fig.add_bar(
             x=[width],
             y=[label],
             base=[left],
             orientation="h",
-            marker=dict(
-                color=color,
-                line=dict(color=("black" if strand else "red"), width=1)
-            ),
-            customdata=[[left, width, left + width, str(block_id), strand, block_pos]],
-        hovertemplate=(
-            "label: %{y}"
-            "<br>start: %{customdata[0]}"
-            "<br>len: %{customdata[1]}"
-            "<br>end: %{customdata[2]}"
-            "<br>block: %{customdata[3]}"
-            "<br>strand: %{customdata[4]:+, -}"
-            "<br>block position: %{customdata[5]}"
-            "<extra></extra>"
+            marker=dict(color=color, line=dict(color=("black" if strand else "red"), width=1)),
+            customdata=[[left, width, left + width, block_id, strand, block_pos]],
+            hovertemplate=(
+                "label: %{y}"
+                "<br>start: %{customdata[0]}"
+                "<br>len: %{customdata[1]}"
+                "<br>end: %{customdata[2]}"
+                "<br>block: %{customdata[3]}"
+                "<br>strand: %{customdata[4]:+, -}"
+                "<br>block position: %{customdata[5]}"
+                "<extra></extra>"
             ),
             showlegend=False,
-        )
-
-    def _add_star(label: str, x_star: float, color: str):
-        fig.add_scatter(
-            x=[x_star],
-            y=[label],
-            mode="markers",
-            marker=dict(symbol="star", size=12, color=color, line=dict(width=0)), 
-            showlegend=False,
-            hoverinfo="skip",
         )
 
     def draw_isolate_track(isolate_name: str):
-        """Plot one isolate using true genomic coordinates from pan."""
         if isolate_name not in pan.paths:
             return
         p = pan.paths[isolate_name]
-
         for block_idx, node_id in enumerate(p.nodes):
             block, strand, start, end = pan.nodes[node_id][["block_id", "strand", "start", "end"]]
             _add_bar(
@@ -205,24 +168,13 @@ def plot_junction_pangraph_interactive(
                 color=get_block_color(block),
                 strand=bool(strand),
                 block_id=block,
-                block_pos = block_idx,
+                block_pos=block_idx,
             )
-            # CHANGED: update bounds
-
-        if isolate_name in isolate_star_color:
-            x_star = -600
-            _add_star(isolate_name, x_star, isolate_star_color[isolate_name])
-
         if isolate_name not in y_seen:
             y_labels.append(isolate_name)
             y_seen.add(isolate_name)
 
     def draw_consensus_track(cons_path, label: str):
-        """
-        Plot one consensus path. No absolute coords in pan,
-        so we just accumulate block lengths along x.
-        cons_path is iterable of nodes with .id and .strand
-        """
         x_left = 0
         for block_idx, node in enumerate(cons_path):
             bid = node.id
@@ -235,19 +187,16 @@ def plot_junction_pangraph_interactive(
                 color=get_block_color(bid),
                 strand=bool(strand),
                 block_id=bid,
-                block_pos=block_idx
+                block_pos=block_idx,
             )
             x_left += block_len
         if label not in y_seen:
             y_labels.append(label)
             y_seen.add(label)
 
-    # === CASE 1: isolates-only mode ===
     if not show_consensus:
         for iso in isolates_ordered:
             draw_isolate_track(iso)
-
-    # === CASE 2: show_consensus mode ===
     else:
         grouped = (
             assignments.reset_index()
@@ -255,7 +204,6 @@ def plot_junction_pangraph_interactive(
             .apply(list)
             .to_dict()
         )
-
         for i, cons_path in enumerate(consensus_paths):
             cons_label = f"consensus_{i+1}"
             isolates_for_this = grouped.get(cons_label, [])
@@ -264,19 +212,77 @@ def plot_junction_pangraph_interactive(
             for iso in isolates_for_this:
                 draw_isolate_track(iso)
             draw_consensus_track(cons_path, cons_label)
-
         for i, cons_path in enumerate(consensus_paths):
             cons_label = f"consensus_{i+1}\u200b"
             draw_consensus_track(cons_path, cons_label)
 
-    # y-axis: keep order we accumulated; bold consensus labels
     tickvals = y_labels
     ticktext = [f"<b>{y}</b>" if y.startswith("consensus_") else y for y in y_labels]
 
+    # add a star per isolate based on cluster_map ---
+    if cluster_map:
+        # assign random colors per cluster id
+        clusters = sorted(set(cluster_map.values()))
+        palette = px.colors.qualitative.Plotly + px.colors.qualitative.Pastel + px.colors.qualitative.Bold
+        random.shuffle(palette)
+        cluster_color = {cid: palette[i % len(palette)] for i, cid in enumerate(clusters)}
+
+        # position stars slightly left of the first base (add small negative pad)
+        star_x = - 800
+
+        xs, ys, cs = [], [], []
+        for iso in y_labels:
+            if iso.startswith("consensus_"):
+                continue
+            if iso in cluster_map:
+                xs.append(star_x)
+                ys.append(iso)
+                cs.append(cluster_color[cluster_map[iso]])
+
+
+        if xs:
+            fig.add_trace(go.Scatter(
+                x=xs,
+                y=ys,
+                mode="markers",
+                marker=dict(symbol="star", size=14, color=cs),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+
+        # --- simple legend stars for clusters ---
+        for cid, color in cluster_color.items():
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],  # invisible points just for legend
+                mode="markers",
+                marker=dict(symbol="star", size=14, color=color),
+                name=f"Cluster {cid}",
+                hoverinfo="skip",
+            ))
+
+        fig.update_layout(legend_title_text="Clusters")
+
+
     fig.update_layout(
+        title=dict(
+            text=title,
+            x=0.05,               # align to the left edge (0 = left, 1 = right)
+            y = 0.99,
+            xanchor="left",    # anchor the title text to its left
+            yanchor="top",
+            yref="container",  # relative to the full container
+            font=dict(size=18, family="Arial", color="black"),
+            pad=dict(l=10, t=10),  # small left/top padding
+        ),
         barmode="stack",
         bargap=0.08,
-        xaxis=dict(title="genomic position (bp)", showgrid=True, gridcolor="rgba(0,0,0,0.2)"),
+        xaxis=dict(
+            title="genomic position (bp)",
+            showgrid=True,
+            gridcolor="rgba(0,0,0,0.2)",
+            range=[-max(1, int(0.05 * max_x)), max_x],  # extend left to show stars
+            zeroline=True,
+        ),
         yaxis=dict(
             title="",
             categoryorder="array",
@@ -284,14 +290,13 @@ def plot_junction_pangraph_interactive(
             tickmode="array",
             tickvals=tickvals,
             ticktext=ticktext,
-            ticklabelposition="inside",
         ),
-        margin=dict(l=120, r=20, t=20, b=40),
+        margin=dict(l=140, r=20, t=20, b=40),
         height=max(300, int(len(y_labels) * 22)),
         template="plotly_white",
     )
-    plt.show()
     return fig
+
 
 
 
