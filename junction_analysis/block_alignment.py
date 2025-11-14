@@ -1,5 +1,6 @@
 from pathlib import Path
 import subprocess
+import re
 
 import pandas as pd
 import numpy as np
@@ -12,7 +13,7 @@ from scipy.spatial.distance import squareform
 import pypangraph as pp
 from Bio import SeqIO
 
-from junction_analyis.helpers import write_isolate_fasta
+from junction_analysis.helpers import write_isolate_fasta
 
 
 # create block fasta files
@@ -58,6 +59,98 @@ def core_bounds(records):
     start, end = max(firsts), min(lasts)
     return (start,end)
 
+def avg_pairwise_distance(arr):
+    # ignores gaps
+    # shape: (n, L_core)
+    n, L = arr.shape
+
+    if n < 2 or L == 0:
+        return 0.0
+
+    # valid ACGT positions
+    valid = np.isin(arr, list("ACGT"))          # (n, L)
+
+    # broadcast to pairwise (i, j, pos)
+    arr_i = arr[:, None, :]                     # (n, 1, L)
+    arr_j = arr[None, :, :]                     # (1, n, L)
+    valid_i = valid[:, None, :]                 # (n, 1, L)
+    valid_j = valid[None, :, :]                 # (1, n, L)
+
+    pair_valid = valid_i & valid_j              # (n, n, L)
+    pair_mismatch = (arr_i != arr_j) & pair_valid
+
+    valid_counts = pair_valid.sum(axis=2)       # (n, n)
+    mism_counts = pair_mismatch.sum(axis=2)     # (n, n)
+
+    # only upper triangle (i < j), no self-pairs
+    iu, ju = np.triu_indices(n, k=1)
+    vc = valid_counts[iu, ju]
+    mc = mism_counts[iu, ju]
+
+    # keep only pairs with at least one valid site
+    mask = vc > 0
+    if not np.any(mask):
+        return 0.0
+
+    dists = mc[mask] / vc[mask]
+    return float(dists.mean())
+
+def calc_consensus_seq(arr):
+    """
+    Majority/plurality consensus:
+    - counts A,C,G,T and '-' as valid characters
+    - chooses the most frequent symbol (in tie chooses in this order ACGT_)
+    """
+    n, L = arr.shape
+
+    # allowed consensus symbols (gaps included)
+    symbols = np.array(list("ACGT-"))   # shape (5,)
+
+    # count occurrences: shape (5, L)
+    counts = np.vstack([(arr == sym).sum(axis=0) for sym in symbols])
+    # find most frequent symbol, if tie returns the first maximal one
+    max_idx = counts.argmax(axis=0)     # index in symbols
+    consensus = symbols[max_idx]
+
+    # guard a gainst positions with no nucleotide in acgt, shouldn't happen
+    no_info = counts.sum(axis=0) == 0
+    consensus[no_info] = "N"
+
+    return "".join(consensus)
+
+def avg_distance_to_consensus(arr, consensus):
+    """
+    arr: (n, L) array of single characters (A/C/G/T/-)
+    consensus: string of length L
+    Ignores positions where either seq or consensus is not A/C/G/T.
+    Returns average Hamming distance (mismatches / valid sites) over sequences.
+    """
+    n, L = arr.shape
+    if n == 0 or L == 0:
+        return 0.0
+
+    bases = np.array(list("ACGT"))
+
+    cons_arr = np.array(list(consensus))
+    cons_arr = np.char.upper(cons_arr)
+
+    # valid positions: both in A/C/G/T (no gaps)
+    valid_seq  = np.isin(arr, bases)          # (n, L)
+    valid_cons = np.isin(cons_arr, bases)     # (L,)
+    valid = valid_seq & valid_cons[None, :]   # (n, L)
+
+    mismatches = (arr != cons_arr[None, :]) & valid
+
+    valid_counts = valid.sum(axis=1)          # per sequence
+    mism_counts  = mismatches.sum(axis=1)
+
+    mask = valid_counts > 0
+    if not np.any(mask):
+        return 0.0
+
+    dists = mism_counts[mask] / valid_counts[mask]
+    return float(dists.mean())
+
 
 def analyze_alignment(path):
     recs = list(read_fasta_alignment(path))
@@ -77,6 +170,14 @@ def analyze_alignment(path):
         if len(bases) >= 2:           # ≥2 distinct symbols
             mismatch_cols += 1
 
+    seqs_arr = np.array([list(s) for s in seqs])
+    seqs_arr = np.char.upper(seqs_arr) 
+
+    avg_pair_dist = avg_pairwise_distance(seqs_arr)
+
+    consensus_seq = calc_consensus_seq(seqs_arr)
+    avg_cons_dist = avg_distance_to_consensus(seqs_arr, consensus_seq)
+
     return dict(file=path.name,
                 block_id=int(path.stem.replace("_aln","").replace("block_","")),
                 n_seqs=len(recs),
@@ -85,7 +186,10 @@ def analyze_alignment(path):
                 left_overhang=left_overhang,
                 right_overhang=right_overhang,
                 mismatch_columns=mismatch_cols,
-                mismatch_fraction=(mismatch_cols / core_len) if core_len > 0 else 0.0)
+                mismatch_fraction=(mismatch_cols / core_len) if core_len > 0 else 0.0,
+                avg_pairwise_dist = avg_pair_dist,
+                avg_consensus_dist = avg_cons_dist)
+
 
 def summarize_block_msas(junction_name, save_df = True):
     aligned_dir = Path(f"../results/block_alignments/{junction_name}")
@@ -114,12 +218,10 @@ def cluster_alignment(alignment_path):
 
     return distance_matrix, Z, dm.names
 
-def retrieve_cluster_members(Z, names, n_clusters):
+def retrieve_cluster_assignments(Z, names, n_clusters):
     labels_k = fcluster(Z, t=n_clusters, criterion="maxclust")
-    names = np.array(names)
 
-    clusters_k = {}
-    for label in np.unique(labels_k):
-        clusters_k[int(label)] = names[labels_k == label].tolist()
+    # Create dictionary mapping isolate name -> cluster number
+    cluster_assignments = {name: int(label) for name, label in zip(names, labels_k)}
 
-    return clusters_k
+    return cluster_assignments

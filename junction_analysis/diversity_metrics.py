@@ -6,7 +6,7 @@ from itertools import combinations
 
 from Bio import Align
 
-from junction_analyis.helpers import get_hierarchical_order, get_tree_order
+from junction_analysis.helpers import get_hierarchical_order, get_tree_order
 
 
 def compare_sequences_by_shared_proportion(sequence_comparison_df, order="hierarchical"):

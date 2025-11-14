@@ -5,7 +5,7 @@ from itertools import combinations
 from collections import Counter
 
 import pypangraph as pp
-import junction_analyis.pangraph_utils as pu
+import junction_analysis.pangraph_utils as pu
 
 
 def find_invertible_ids(paths: dict) -> set:
@@ -213,9 +213,8 @@ def remove_rare_consensus_paths(consensus_paths, deduplicated_paths, edge_ji_df,
 
 def find_consensus_paths(pangraph, rare_block_threshold = 10, rare_edge_threshold = 10, min_n_isolates_per_consensus=5):
     """
-    Finds consesus paths of junction pangraph.
-    Paths are first filtered by rare blocks and then deduplicated. Block filtering is repeated on deduplicated blocks also taking into account strandedness and block context.
-    A third filtering step filters out paths with rare edges.
+    Finds consesus paths of junction pangraph. Paths are first deduplicated, then rare blocks are filtered out, then paths containing rare edges are filtered out.
+    It is possible that the context of some blocks contains blocks that were filtered out, but this should not affect the consensus path finding too much.
     @param rare_block_threshold: blocks that are less frequent then this threshold are filtered out of the paths.
     @param rare_edge_threshold: paths containing an edge that is less frequent than this threshold are filtered out.
     @return consensus paths: unique paths that remain after filtering
@@ -225,17 +224,10 @@ def find_consensus_paths(pangraph, rare_block_threshold = 10, rare_edge_threshol
     # transform Node, Path structure from path_dict
     path_dict = pangraph.to_path_dictionary()
     blockstats_df = pangraph.to_blockstats_df()
-
     path_dict = {isolate: pu.Path.from_tuple_list(path, 'node') for isolate, path in path_dict.items()}
 
-    # removal of rare blocks (ignore duplication and strandedness)
-    rare_blocks = set(blockstats_df.loc[blockstats_df['count'] < rare_block_threshold].index)
-    keep_f = lambda bid: bid not in rare_blocks
-
-    filtered_paths = pu.filter_paths(path_dict, keep_f)
-
     # deduplicate
-    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(blockstats_df, filtered_paths)
+    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(blockstats_df, path_dict)
 
     # refilter, after deduplication some blocks might now have a frequency below the threshold (now consider duplication and inversion)
     rare_deduplicated_blocks = {dnode for dnode, cnt in deduplicated_blog_freq.items() if cnt < rare_block_threshold}

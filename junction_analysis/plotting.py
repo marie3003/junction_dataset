@@ -5,13 +5,14 @@ import plotly.graph_objects as go
 import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 import pandas as pd
 import pypangraph as pp
 from scipy.cluster.hierarchy import dendrogram
 
-from junction_analyis.helpers import get_tree_order
-import junction_analyis.pangraph_utils as pu
+from junction_analysis.helpers import get_tree_order
+import junction_analysis.pangraph_utils as pu
 
 
 def plot_heatmap_hover(sequence_comparison_df, diff = None, shared = None, show_tick_labels=False, similarity_measure = "shared_proportion"):
@@ -298,38 +299,18 @@ def plot_junction_pangraph_interactive(
     return fig
 
 
-
-
-
 def plot_junction_pangraph_combined(
     pan: pp.Pangraph,
     show_consensus: bool = False,
     consensus_paths: list = None,        # list[pu.Path] of Nodes with .id, .strand
     assignments: pd.DataFrame = None,    # index: isolate names, col 'best_consensus'
     order: str = "tree",
+    cluster_map: dict = None,            # <--- NEW
 ):
     """
     Plot junction graph blocks for all isolates in `pan`, optionally including consensus paths.
-
-    Args
-    ----
-    pan : pp.Pangraph
-        Pangraph object providing paths and node coordinates.
-    show_consensus : bool
-        Whether to include consensus tracks.
-    consensus_paths : list
-        consensus_paths[i] is a consensus "path"-like iterable of nodes,
-        where each node has attributes .id (block id) and .strand (bool).
-        Required if show_consensus=True.
-    assignments : pd.DataFrame
-        Must have index of isolate names and a column 'best_consensus'
-        whose values are "consensus_1", "consensus_2", ...
-        Required if show_consensus=True.
-    order : str
-        "tree" or anything else. If "tree", isolates are ordered by get_tree_order()
-        whenever reasonable.
+    Also supports drawing cluster stars (one star per isolate row) if `cluster_map` is provided.
     """
-
 
     bdf = pan.to_blockstats_df()
     n_core = int(bdf["core"].sum())
@@ -347,16 +328,16 @@ def plot_junction_pangraph_combined(
             block_colors[block_id] = color
         return block_colors[block_id]
 
-    # --- isolate ordering ---
+    # isolate ordering
     tree_order = get_tree_order() if order == "tree" else None
-    if tree_order:
-        isolates_ordered = tree_order
-    else:
-        isolates_ordered = list(pan.paths.keys())
+    isolates_ordered = tree_order if tree_order else list(pan.paths.keys())
 
-    # --- helpers to actually draw bars ---
+    # helpers to draw bars
+    max_x = 0
+    min_x = 0
+
     def draw_isolate_track(isolate_name: str, y_val: int) -> int:
-        """Plot one isolate using true genomic coordinates from pan."""
+        nonlocal max_x, min_x
         if isolate_name not in pan.paths:
             return y_val
         p = pan.paths[isolate_name]
@@ -369,15 +350,13 @@ def plot_junction_pangraph_combined(
                 color=get_block_color(block),
                 edgecolor=("black" if strand else "red"),
             )
+            max_x = max(max_x, float(end))
+            min_x = min(min_x, float(start))
         y_labels.append(isolate_name)
         return y_val + 1
 
     def draw_consensus_track(cons_path, label: str, y_val: int) -> int:
-        """
-        Plot one consensus path. No absolute coords in pan,
-        so we just accumulate block lengths along x.
-        cons_path is iterable of nodes with .id and .strand
-        """
+        nonlocal max_x
         x_left = 0
         for node in cons_path:
             bid = node.id
@@ -391,6 +370,7 @@ def plot_junction_pangraph_combined(
                 edgecolor=("black" if strand else "red"),
             )
             x_left += block_len
+        max_x = max(max_x, float(x_left))
         y_labels.append(label)
         return y_val + 1
 
@@ -402,14 +382,13 @@ def plot_junction_pangraph_combined(
     y = 0
     y_labels = []
 
-    # === CASE 1: isolates-only mode ===
+    # CASE 1: isolates-only
     if not show_consensus:
         for iso in isolates_ordered:
             y = draw_isolate_track(iso, y)
 
-    # === CASE 2: show_consensus mode ===
+    # CASE 2: with consensus
     else:
-
         grouped = (
             assignments.reset_index()
             .groupby("best_consensus")["index"]
@@ -419,41 +398,82 @@ def plot_junction_pangraph_combined(
 
         for i, cons_path in enumerate(consensus_paths):
             cons_label = f"consensus_{i+1}"
-
             isolates_for_this = grouped.get(cons_label, [])
-
-            # respect tree ordering if we have it
             if tree_order:
                 isolates_for_this = [iso for iso in tree_order if iso in isolates_for_this]
 
-            # plot isolates for this consensus
             for iso in isolates_for_this:
                 y = draw_isolate_track(iso, y)
 
-            # plot consensus again
             y = draw_consensus_track(cons_path, cons_label, y)
 
         for i, cons_path in enumerate(consensus_paths):
             cons_label = f"consensus_{i+1}"
             y = draw_consensus_track(cons_path, cons_label, y)
 
-
+    # y ticks and bold consensus labels
     ax.set_yticks(range(len(y_labels)))
     ax.set_yticklabels(y_labels)
-
-    # make consensus labels bold so they stand out
     for idx, tick in enumerate(ax.get_yticklabels()):
         if y_labels[idx].startswith("consensus_"):
             tick.set_fontweight("bold")
 
+    # axes labels & grid
     ax.set_xlabel("genomic position (bp)")
     ax.grid(axis="x", alpha=0.4)
-
     ax.set_ylim(-1, len(y_labels))
+
+    # --- NEW: cluster stars ---
+    if cluster_map:
+        # assign random colors per cluster id (use a qualitative palette and shuffle)
+        clusters = sorted(set(cluster_map.values()))
+        palette = sns.color_palette("tab20", n_colors=max(20, len(clusters)))
+        palette = [tuple(c) for c in palette]
+        random.shuffle(palette)
+        cluster_color = {cid: palette[i % len(palette)] for i, cid in enumerate(clusters)}
+
+        # choose a star x-position left of content; similar to Plotly version
+        span = max(1.0, max_x - min_x)
+        star_x = min_x - 0.05 * span  # 5% to the left of the leftmost data
+        # draw one star per isolate row (skip consensus labels)
+        for row, iso in enumerate(y_labels):
+            if iso.startswith("consensus_"):
+                continue
+            cid = cluster_map.get(iso)
+            if cid is None:
+                continue
+            ax.scatter(
+                star_x, row,
+                marker="*",
+                s=80,
+                c=[cluster_color[cid]],
+                linewidths=0.8,
+                zorder=3,
+            )
+
+        # ensure stars are visible
+        right = ax.get_xlim()[1]
+        ax.set_xlim(star_x - 0.02 * span, right)
+
+        # legend: one star per cluster
+        handles = [
+            Line2D(
+                [0], [0],
+                marker="*",
+                linestyle="",
+                markersize=15,
+                markerfacecolor=cluster_color[cid],
+                markeredgecolor="white",
+                label=f"Cluster {cid}"
+            )
+            for cid in sorted(clusters)
+        ]
+        ax.legend(handles=handles, title="Clusters", loc="upper left", bbox_to_anchor=(1.01, 1.0))
 
     sns.despine()
     plt.tight_layout()
     return fig, ax
+
 
 
 def plot_junction_pangraph_grouped(
