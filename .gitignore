@@ -7,3 +7,6 @@ __pycache__
 /logs
 /justfile
 .DS_Store
+.coverage
+settings.json
+explore/trash.ipynb
