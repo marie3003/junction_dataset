@@ -1,2 +1,3 @@
 acc_nums_file: "config/acc_nums.txt"
 junction_positions_file: "config/junction_positions.json"
+plasmids_file: "config/plasmids.json"
