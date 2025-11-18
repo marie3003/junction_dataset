@@ -16,6 +16,9 @@ junc_pos = {j: p for j, p in junc_pos.items() if len(p) > 1}
 # list of junction IDs
 junc_ids = list(junc_pos.keys())
 print(f"N. junctions: {len(junc_ids)}")
+# list of plasmids
+with open(config["plasmids_file"]) as f:
+    plasmids = json.load(f)
 
 
 rule download_gbk:
@@ -80,11 +83,31 @@ rule genome_lengths:
         """
 
 
+rule plasmids:
+    input:
+        rules.download_gbk.output,
+    output:
+        "results/plasmids/{acc_iso}/{acc}.gbk",
+    shell:
+        """
+        cp {input} {output}
+        """
+
+
+def all_plasmid_outputs(wildcards):
+    outs = []
+    for iso, plasmid_list in plasmids.items():
+        outs.extend(expand(rules.plasmids.output, acc_iso=iso, acc=plasmid_list))
+    return outs
+
+
 rule all:
     input:
         expand(rules.build_junction_pangraph.output, junc=junc_ids),
         rules.genome_lengths.output,
+        all_plasmid_outputs,
 
 
 localrules:
     download_gbk,
+    plasmids,
