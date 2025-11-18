@@ -1,6 +1,7 @@
 import scipy.cluster.hierarchy as sch
 from Bio import Phylo, SeqIO
 from Bio.SeqRecord import SeqRecord
+import os
 
 def get_hierarchical_order(distance_df):
     linkage_matrix = sch.linkage(distance_df, method="ward")
@@ -49,3 +50,22 @@ def write_isolate_fasta(example_pangraph, block, output_path):
 
     # Write all sequences to a FASTA file
     SeqIO.write(fasta_records, output_path, "fasta")
+
+
+def convert_gbk_fasta(gbk_folder, fasta_folder):
+
+    os.makedirs(fasta_folder, exist_ok=True)
+
+    # List all .gbk files
+    for fname in os.listdir(gbk_folder):
+        if not fname.endswith(".gbk"):
+            continue
+
+        input_gbk = os.path.join(gbk_folder, fname)
+        genome_fasta = os.path.join(fasta_folder, fname.replace(".gbk", ".fasta"))
+
+        print(f"Converting: {input_gbk} → {genome_fasta}")
+
+        with open(genome_fasta, "w") as out_f:
+            for record in SeqIO.parse(input_gbk, "genbank"):
+                SeqIO.write(record, out_f, "fasta")
