@@ -23,31 +23,45 @@ def find_invertible_ids(paths: dict) -> set:
 
     return invertible_ids
 
-def make_deduplicated_paths(blockstats_df, paths: dict) -> dict:
+def make_deduplicated_paths(pangraph, paths: dict, rare_context_thresh=10) -> dict:
     """
     Convert a dict[isolate -> Path(Node,...)] into dict[isolate -> Path(DeduplicatedNode, ...)],
-    where duplicated blocks get a context = closest non-duplicated, never inverted block (ID) to the left.
+    where duplicated blocks get a context = closest non-duplicated, never inverted, less rare than rare_context_thresh block (ID) to the left.
     For non-duplicated blocks, context is set to "".
+    @param rare_context_threshold: is a threshold how rare blocks can be to be allowed as context anchors, right now it is hard coded to 10
     Additionally also return deduplicated block count dictionary.
     """
+    blockstats_df = pangraph.to_blockstats_df()
     duplicated_ids = set(blockstats_df.loc[blockstats_df['duplicated'] == True].index)
+    rare_ids = set(blockstats_df.loc[blockstats_df['count'] < rare_context_thresh].index)
     invertible_ids = find_invertible_ids(paths)
 
     deduplicated_paths: dict = {}
     freq = Counter()
 
     for isolate, path in paths.items():
-        last_non_dup: str | None = None
+        last_non_dup: str | None = None # context anchor = last suitable non-dup block id
+        context_counts: dict[str, int] = {}  # per-context counts for duplicated node ids
+
         dedup_nodes = []
-        for n in path:  # path is iterable over its nodes
+        for idx, n in enumerate(path):  # path is iterable over its nodes
+            block_nid = pangraph.paths[isolate].nodes[idx]
             if n.id in duplicated_ids:
-                context = last_non_dup if last_non_dup is not None else ""
-                dn = pu.DeduplicatedNode(n.id, n.strand, context)
+                if last_non_dup is None:
+                    raise ValueError("last_non_dup must not be None when encountering a duplicated node")
+                
+                # per-node count within the current context
+                count = context_counts.get(n.id, 0) + 1 # default is 0 if not inside dict yet
+                context_counts[n.id] = count
+
+                context = f"{last_non_dup}_{count}"
+                dn = pu.DeduplicatedNode(n.id, n.strand, context, block_nid)
                 
             else:
-                dn = pu.DeduplicatedNode(n.id, n.strand, "")
-                if n.id not in invertible_ids:
+                dn = pu.DeduplicatedNode(n.id, n.strand, "", block_nid)
+                if n.id not in invertible_ids and n.id not in rare_ids:
                     last_non_dup = n.id
+                    context_counts.clear()
 
             dedup_nodes.append(dn)
             freq[dn] += 1
@@ -58,6 +72,8 @@ def make_deduplicated_paths(blockstats_df, paths: dict) -> dict:
 
 def count_edges(dedup_paths: dict) -> dict:
     """
+    When edges are counted, context is not considered, deduplication is only done based on nodes which could lead to overcounting of edges within duplicated path segments.
+    However, if path segments are duplicated incoming and outgoing edges to the path segments are rare which would still lead to filtering out these paths as consensus paths.
     dedup_paths: dict[isolate -> Path(DeduplicatedNode,...)]
     returns: dict[Edge, int]  (edge -> frequency across all paths)
     """
@@ -227,24 +243,24 @@ def find_consensus_paths(pangraph, rare_block_threshold = 10, rare_edge_threshol
     path_dict = {isolate: pu.Path.from_tuple_list(path, 'node') for isolate, path in path_dict.items()}
 
     # deduplicate
-    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(blockstats_df, path_dict)
+    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(pangraph, path_dict)
 
     # refilter, after deduplication some blocks might now have a frequency below the threshold (now consider duplication and inversion)
     rare_deduplicated_blocks = {dnode for dnode, cnt in deduplicated_blog_freq.items() if cnt < rare_block_threshold}
-    deduplicated_paths = filter_deduplicated_paths(deduplicated_paths, rare_deduplicated_blocks)
+    deduplicated_paths_filtered = filter_deduplicated_paths(deduplicated_paths, rare_deduplicated_blocks)
 
     # instead of edge matrix make dictionary with edge as key and count as value to store edge frequency
-    edge_count = count_edges(deduplicated_paths)
+    edge_count = count_edges(deduplicated_paths_filtered)
 
     # filter paths with rare edges (inversed edged are considered the same)
-    consensus_paths = find_unique_frequent_paths(deduplicated_paths, edge_count, flow_threshold = rare_edge_threshold)
+    consensus_paths = find_unique_frequent_paths(deduplicated_paths_filtered, edge_count, flow_threshold = rare_edge_threshold)
 
     # to add paths to their consensus paths, compare the deduplicated paths (after rare node deletion) to the selected consensus paths and add it to the one which is most similar
     # TODO: what is a good similarity metric, since they should be quite similar to their consensus paths, edge jaccard index could be a good choice
-    edge_ji_df = compute_edge_jaccard_matrix(deduplicated_paths, consensus_paths)
+    edge_ji_df = compute_edge_jaccard_matrix(deduplicated_paths_filtered, consensus_paths)
     assignment_df = assign_isolates_to_consensus(edge_ji_df)
 
     # refilter consensus paths such that each consensus path has at least n assigned isolate, e.g. n = 5
-    edge_ji_df, assignment_df, consensus_paths = remove_rare_consensus_paths(consensus_paths, deduplicated_paths, edge_ji_df, assignment_df, min_n_isolates_per_consensus)
+    edge_ji_df, assignment_df, consensus_paths = remove_rare_consensus_paths(consensus_paths, deduplicated_paths_filtered, edge_ji_df, assignment_df, min_n_isolates_per_consensus)
 
-    return consensus_paths, path_dict, edge_ji_df, assignment_df
+    return consensus_paths, deduplicated_paths, deduplicated_blog_freq, edge_ji_df, assignment_df

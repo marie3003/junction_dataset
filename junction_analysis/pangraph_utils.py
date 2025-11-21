@@ -1,14 +1,16 @@
 from collections import defaultdict, Counter
+from typing import Optional, Iterable, List, Tuple, Union
 
 class Node:
-    """Combination of block id and strandedness"""
+    """Combination of block id and strandedness, node id can be added optionally but equality doesn't depend on it."""
 
-    def __init__(self, bid: str, strand: bool) -> None:
+    def __init__(self, bid: str, strand: bool, nid: Optional[str] = None) -> None:
         self.id = bid
         self.strand = strand
+        self.nid = nid
 
     def invert(self) -> "Node":
-        return Node(self.id, not self.strand)
+        return Node(self.id, not self.strand, self.nid)
 
     def __eq__(self, other: object) -> bool:
         return self.id == other.id and self.strand == other.strand
@@ -31,16 +33,17 @@ class Node:
         return Node(bid, strand)
     
 class DeduplicatedNode:
-    """Combination of block id, strandedness and context in path (closest, non-duplicated block to the left)"""
+    """Combination of block id, strandedness and context in path (closest, non-duplicated block to the left), node id can be added optionally but equality doesn't depend on it."""
 
-    def __init__(self, bid: str, strand: bool, context: str) -> None:
+    def __init__(self, bid: str, strand: bool, context: str, nid: Optional[str] = None,) -> None:
         self.id = bid
         self.strand = strand
         self.context = context
+        self.nid = nid
 
     # for now context is always block that is never inverted, that's why we can just keep the context in the case of an inversion
     def invert(self) -> "DeduplicatedNode":
-        return DeduplicatedNode(self.id, not self.strand, self.context)
+        return DeduplicatedNode(self.id, not self.strand, self.context, self.nid)
 
     def __eq__(self, other: object) -> bool:
         return self.id == other.id and self.strand == other.strand and self.context == other.context
@@ -81,6 +84,7 @@ class Path:
     def invert(self) -> "Path":
         return Path([n.invert() for n in self.nodes[::-1]])
 
+    # TODO: add check for context dependent paths to consider a path equal to its fully inverted path
     def __eq__(self, o: object) -> bool:
         return self.nodes == o.nodes
 
@@ -102,13 +106,39 @@ class Path:
             return Path([DeduplicatedNode.from_str_id(nid) for nid in path_list])
         elif type == 'node':
             return Path([Node.from_str_id(nid) for nid in path_list])
-        
+    
     @staticmethod
-    def from_tuple_list(path_list, type = 'node') -> "Path":
-        if type == 'deduplicatednode':
-            return Path([DeduplicatedNode(node_tuple[0], node_tuple[1], node_tuple[2]) for node_tuple in path_list])
-        elif type == 'node':
-            return Path([Node(node_tuple[0], node_tuple[1]) for node_tuple in path_list])
+    def from_tuple_list(path_list, type: str = "node") -> "Path":
+        """
+        Accepts tuples with or without nid:
+        - Node: (bid, strand) or (bid, strand, nid)
+        - DeduplicatedNode: (bid, strand, context) or (bid, strand, context, nid)
+        """
+        nodes = []
+        if type == "deduplicatednode":
+            for t in path_list:
+                if len(t) == 3:
+                    bid, strand, context = t
+                    nid = None
+                elif len(t) == 4:
+                    bid, strand, context, nid = t
+                else:
+                    raise ValueError("DeduplicatedNode tuple must have 3 or 4 elements")
+                nodes.append(DeduplicatedNode(bid, strand, context, nid))
+        elif type == "node":
+            for t in path_list:
+                if len(t) == 2:
+                    bid, strand = t
+                    nid = None
+                elif len(t) == 3:
+                    bid, strand, nid = t
+                else:
+                    raise ValueError("Node tuple must have 2 or 3 elements")
+                nodes.append(Node(bid, strand, nid))
+        else:
+            raise ValueError(f"Unknown node type: {type}")
+
+        return Path(nodes)
 
 
 class Edge:
@@ -122,13 +152,14 @@ class Edge:
         return Edge(self.right.invert(), self.left.invert())
 
     def __side_eq__(self, o: object) -> bool:
-        return self.left == o.left and self.right == o.right
+        # comparison of edges doesn't depend on context
+        return self.left.id == o.left.id and self.left.strand == o.left.strand and self.right.id == o.right.id and self.right.strand == o.right.strand
 
     def __eq__(self, o: object) -> bool:
         return self.__side_eq__(o) or self.__side_eq__(o.invert())
 
     def __side_hash__(self) -> int:
-        return hash((self.left, self.right))
+        return hash((self.left.id, self.left.strand, self.right.id, self.right.strand))
 
     def __hash__(self) -> int:
         return self.__side_hash__() ^ self.invert().__side_hash__()
