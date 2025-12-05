@@ -60,12 +60,12 @@ def core_bounds(records):
     return (start,end)
 
 def avg_pairwise_distance(arr):
-    # ignores gaps
+    # ignores gap positions
     # shape: (n, L_core)
     n, L = arr.shape
 
     if n < 2 or L == 0:
-        return 0.0
+        return 0.0, np.array([])
 
     # valid ACGT positions
     valid = np.isin(arr, list("ACGT"))          # (n, L)
@@ -90,10 +90,10 @@ def avg_pairwise_distance(arr):
     # keep only pairs with at least one valid site
     mask = vc > 0
     if not np.any(mask):
-        return 0.0
+        return 0.0, np.array([])
 
     dists = mc[mask] / vc[mask]
-    return float(dists.mean())
+    return float(dists.mean()), dists
 
 def calc_consensus_seq(arr):
     """
@@ -152,7 +152,7 @@ def avg_distance_to_consensus(arr, consensus):
     return float(dists.mean())
 
 
-def analyze_alignment(path):
+def analyze_alignment(path, return_pairwise_dists=False):
     recs = list(read_fasta_alignment(path))
 
     start, end = core_bounds(recs)
@@ -173,34 +173,60 @@ def analyze_alignment(path):
     seqs_arr = np.array([list(s) for s in seqs])
     seqs_arr = np.char.upper(seqs_arr) 
 
-    avg_pair_dist = avg_pairwise_distance(seqs_arr)
+    avg_pair_dist, dists = avg_pairwise_distance(seqs_arr)
 
     consensus_seq = calc_consensus_seq(seqs_arr)
     avg_cons_dist = avg_distance_to_consensus(seqs_arr, consensus_seq)
 
-    return dict(file=path.name,
-                block_id=int(path.stem.replace("_aln","").replace("block_","")),
-                n_seqs=len(recs),
-                alignment_len = length,
-                core_len=core_len,
-                left_overhang=left_overhang,
-                right_overhang=right_overhang,
-                mismatch_columns=mismatch_cols,
-                mismatch_fraction=(mismatch_cols / core_len) if core_len > 0 else 0.0,
-                avg_pairwise_dist = avg_pair_dist,
-                avg_consensus_dist = avg_cons_dist)
+    stats = dict(
+        file=path.name,
+        block_id=int(path.stem.replace("_aln","").replace("block_","")),
+        n_seqs=len(recs),
+        alignment_len=length,
+        core_len=core_len,
+        left_overhang=left_overhang,
+        right_overhang=right_overhang,
+        mismatch_columns=mismatch_cols,
+        mismatch_fraction=(mismatch_cols / core_len) if core_len > 0 else 0.0,
+        avg_pairwise_dist=avg_pair_dist,
+        avg_consensus_dist=avg_cons_dist,
+    )
 
-
-def summarize_block_msas(junction_name, save_df = True):
+    if return_pairwise_dists:
+        return stats, dists
+    else:
+        return stats
+    
+def summarize_block_msas(junction_name, save_df=True, return_pairwise_dists=False):
     aligned_dir = Path(f"../results/block_alignments/{junction_name}")
-    results = [analyze_alignment(p) for p in sorted(aligned_dir.glob("block_*_aln.fa"))]
+    results = []
+    pairwise_dict = {} if return_pairwise_dists else None
+
+    for p in sorted(aligned_dir.glob("block_*_aln.fa")):
+        if return_pairwise_dists:
+            stats, dists = analyze_alignment(p, return_pairwise_dists=True)
+            results.append(stats)
+            pairwise_dict[stats["block_id"]] = dists
+        else:
+            stats = analyze_alignment(p)
+            results.append(stats)
+
     summary_df = pd.DataFrame(results).sort_values("block_id")
+
+    pangraph = pp.Pangraph.from_json(f"../results/junction_pangraphs/{junction_name}.json")
+    blockstats_df = pangraph.to_blockstats_df().reset_index()
+    merged_df = summary_df.merge(blockstats_df, on="block_id", how="left")
 
     if save_df:
         out_csv = Path(f"../results/block_alignments/{junction_name}/{junction_name}_alignment_stats.csv")
-        summary_df.to_csv(out_csv, index=False)
+        merged_df.to_csv(out_csv, index=False)
 
-    return summary_df
+    if return_pairwise_dists:
+        # DataFrame + per-block pairwise distance vectors
+        return merged_df, pairwise_dict
+
+    return merged_df
+
 
 def cluster_alignment(alignment_path):
     # gap positions are ignored in identity calculation (that's why one doesn't have to worry about missing parts on the ends)
@@ -222,6 +248,86 @@ def retrieve_cluster_assignments(Z, names, n_clusters):
     labels_k = fcluster(Z, t=n_clusters, criterion="maxclust")
 
     # Create dictionary mapping isolate name -> cluster number
-    cluster_assignments = {name: int(label) for name, label in zip(names, labels_k)}
+    cluster_assignments = {name.split("__", 1)[0]: int(label) for name, label in zip(names, labels_k)}
 
     return cluster_assignments
+
+def build_block_trees(
+    junction_name,
+    fasttree_exe="fasttree",
+    overwrite=False,
+    min_seqs=3,
+    min_core_len=500,
+):
+    """
+    For a given junction, run FastTree on all block alignment files that pass
+    sequence count and core length thresholds, and write the resulting trees
+    into the same directory.
+
+    Parameters
+    ----------
+    junction_name : str
+        Name of the junction (subfolder under ../results/block_alignments/).
+    fasttree_exe : str, optional
+        Path to the FastTree executable (default: "fasttree" on PATH).
+    overwrite : bool, optional
+        If False, skip tree files that already exist.
+    min_seqs : int, optional
+        Minimum number of sequences (n_seqs) required to run FastTree.
+    min_core_len : int, optional
+        Minimum core alignment length (core_len) required to run FastTree.
+    """
+    aligned_dir = Path(f"../results/block_alignments/{junction_name}")
+    aln_files = sorted(aligned_dir.glob("block_*_aln.fa"))
+
+    if not aln_files:
+        print(f"No alignments found for junction {junction_name} in {aligned_dir}")
+        return
+
+    stats_csv = aligned_dir / f"{junction_name}_alignment_stats.csv"
+
+    stats_df = pd.read_csv(stats_csv)
+    stats_df = stats_df.set_index("file")
+    stats_df["tree_built"] = False
+
+    for aln_file in aln_files:
+        fname = aln_file.name
+
+        if fname not in stats_df.index:
+            print(f"[{junction_name}] No stats for {fname}, skipping.")
+            continue
+
+        row = stats_df.loc[fname]
+        n_seqs = int(row["n_seqs"])
+        core_len = int(row["core_len"])
+
+        # Apply thresholds
+        if n_seqs < min_seqs or core_len < min_core_len:
+            print(
+                f"[{junction_name}] Skipping {fname}: "
+                f"n_seqs={n_seqs} (min {min_seqs}), "
+                f"core_len={core_len} (min {min_core_len})"
+            )
+            continue
+
+        # Tree filename: block_X_aln.tree (same directory)
+        tree_file = aln_file.with_suffix(".tree")
+
+        if tree_file.exists() and not overwrite:
+            print(f"[{junction_name}] Skipping existing tree: {tree_file.name}")
+            continue
+
+        print(
+            f"[{junction_name}] Building tree for {fname} "
+            f"(n_seqs={n_seqs}, core_len={core_len}) -> {tree_file.name}"
+        )
+        with tree_file.open("w") as out_f:
+            subprocess.run(
+                [fasttree_exe, "-nt", "-gtr", str(aln_file)],
+                stdout=out_f,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+        stats_df.loc[fname, "tree_built"] = True
+        
+    stats_df.to_csv(stats_csv)

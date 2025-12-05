@@ -14,6 +14,7 @@ from Bio.SeqRecord import SeqRecord
 from pathlib import Path
 
 from junction_analysis.consensus import make_deduplicated_paths
+from junction_analysis.helpers import get_isolate_sequence
 from junction_analysis import pangraph_utils as pu
 
 
@@ -105,10 +106,6 @@ def get_isolate_sequence_from_fasta(fasta_path, isolate_name):
             return str(record.seq)
     return None
 
-def get_isolate_sequence(pangraph, block_id, node_id):
-    sequence = pangraph.blocks[block_id].alignment.generate_alignment()[str(node_id)]
-    return sequence
-
 def write_segment_fasta(example_junction, isolate_name, segment_name, consensus, sequence, path):
     record = SeqRecord(
         Seq(sequence),
@@ -149,14 +146,9 @@ def print_insertions_deletions(insertions, deletions):
 def get_insertions_deletions_from_consensus(example_pangraph, assignment_df, consensus_paths, consensus = 1, verbose = True):
     # get isolates belonging to consensus 1
     isolates_1 = assignment_df[assignment_df['best_consensus'] == f"consensus_{consensus}"].index.tolist()
-    isolates_1_set = set(isolates_1)
-
-    # make path dict
-    path_dict = example_pangraph.to_path_dictionary()
-    path_dict = {isolate: pu.Path.from_tuple_list(path, 'node') for isolate, path in path_dict.items() if isolate in isolates_1_set}
 
     # deduplicate blocks
-    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(example_pangraph, path_dict)
+    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(example_pangraph, include_isolates=isolates_1)
 
     # compare deduplicated paths to consensus paths to find deviations, consensus paths are already deduplicated
     insertions, deletions = get_insertions_deletions(deduplicated_paths, consensus_paths[consensus - 1])

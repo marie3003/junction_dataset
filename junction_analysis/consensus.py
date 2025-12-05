@@ -1,9 +1,9 @@
 import pandas as pd
 import numpy as np
+import math
 
 from itertools import combinations
-from collections import Counter
-
+from collections import Counter, defaultdict
 import pypangraph as pp
 import junction_analysis.pangraph_utils as pu
 
@@ -23,7 +23,7 @@ def find_invertible_ids(paths: dict) -> set:
 
     return invertible_ids
 
-def make_deduplicated_paths(pangraph, paths: dict, rare_context_thresh=10) -> dict:
+def make_deduplicated_paths(pangraph, rare_context_thresh=10, include_isolates=None) -> dict:
     """
     Convert a dict[isolate -> Path(Node,...)] into dict[isolate -> Path(DeduplicatedNode, ...)],
     where duplicated blocks get a context = closest non-duplicated, never inverted, less rare than rare_context_thresh block (ID) to the left.
@@ -31,15 +31,23 @@ def make_deduplicated_paths(pangraph, paths: dict, rare_context_thresh=10) -> di
     @param rare_context_threshold: is a threshold how rare blocks can be to be allowed as context anchors, right now it is hard coded to 10
     Additionally also return deduplicated block count dictionary.
     """
+    # create path dictionary of Path objects
+    path_dict = pangraph.to_path_dictionary()
+    # filter isolates if requested
+    if include_isolates is not None:
+        include_isolates = set(include_isolates)
+        path_dict = {iso: path for iso, path in path_dict.items() if iso in include_isolates}
+    path_dict = {isolate: pu.Path.from_tuple_list(path, 'node') for isolate, path in path_dict.items()}
+
     blockstats_df = pangraph.to_blockstats_df()
     duplicated_ids = set(blockstats_df.loc[blockstats_df['duplicated'] == True].index)
     rare_ids = set(blockstats_df.loc[blockstats_df['count'] < rare_context_thresh].index)
-    invertible_ids = find_invertible_ids(paths)
+    invertible_ids = find_invertible_ids(path_dict)
 
     deduplicated_paths: dict = {}
     freq = Counter()
 
-    for isolate, path in paths.items():
+    for isolate, path in path_dict.items():
         last_non_dup: str | None = None # context anchor = last suitable non-dup block id
         context_counts: dict[str, int] = {}  # per-context counts for duplicated node ids
 
@@ -236,14 +244,8 @@ def find_consensus_paths(pangraph, rare_block_threshold = 10, rare_edge_threshol
     @return consensus paths: unique paths that remain after filtering
     @return path_dict: original paths written as Path and Node objects
     """
-
-    # transform Node, Path structure from path_dict
-    path_dict = pangraph.to_path_dictionary()
-    blockstats_df = pangraph.to_blockstats_df()
-    path_dict = {isolate: pu.Path.from_tuple_list(path, 'node') for isolate, path in path_dict.items()}
-
     # deduplicate
-    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(pangraph, path_dict)
+    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(pangraph)
 
     # refilter, after deduplication some blocks might now have a frequency below the threshold (now consider duplication and inversion)
     rare_deduplicated_blocks = {dnode for dnode, cnt in deduplicated_blog_freq.items() if cnt < rare_block_threshold}
@@ -264,3 +266,156 @@ def find_consensus_paths(pangraph, rare_block_threshold = 10, rare_edge_threshol
     edge_ji_df, assignment_df, consensus_paths = remove_rare_consensus_paths(consensus_paths, deduplicated_paths_filtered, edge_ji_df, assignment_df, min_n_isolates_per_consensus)
 
     return consensus_paths, deduplicated_paths, deduplicated_blog_freq, edge_ji_df, assignment_df
+
+
+def filter_cluster_paths_by_block_freq(paths, cluster_map, freq_threshold = 0.5):
+    """
+    Filter blocks out of all paths that are in less than half of the isolates
+    of their cluster.
+
+    - paths: dict {isolate_id: pu.Path}
+    - cluster_map_core: dict {isolate_id: cluster_id}
+    - freq_tresh: float, how frequent do blocks need to be per cluster to not be filtered out
+
+    Returns
+    -------
+    dict {isolate_id: pu.Path} with filtered paths.
+    """
+    # Group isolates by cluster
+    cluster_to_isos = defaultdict(list)
+    for iso, cl in cluster_map.items():
+        if iso in paths:  # ignore isolates not in paths
+            cluster_to_isos[cl].append(iso)
+
+    filtered_paths = {}
+
+    for cl, isos in cluster_to_isos.items():
+        n_isos = len(isos)
+
+        # If only one isolate in the cluster, do not filter anything
+        if n_isos <= 1:
+            for iso in isos:
+                filtered_paths[iso] = paths[iso]
+            continue
+
+        # i.e. keep blocks with count >= ceil(n_isos * freq_threshold)
+        threshold = math.ceil(n_isos * freq_threshold)
+
+        # Count block presence per cluster (after deduplication max. once per isolate)
+        block_counts = defaultdict(int)
+        for iso in isos:
+            for node in paths[iso].nodes:
+                block_counts[node] += 1
+
+        # Blocks to filter in this cluster
+        filter_set = {node for node, cnt in block_counts.items() if cnt < threshold}
+
+        # Apply your helper function on this cluster only
+        cluster_paths = {iso: paths[iso] for iso in isos}
+        filtered_cluster_paths = filter_deduplicated_paths(cluster_paths, filter_set)
+
+        # Collect results
+        filtered_paths.update(filtered_cluster_paths)
+
+    # If there are isolates in `paths` not in cluster_map_core, copy as-is
+    for iso, path in paths.items():
+        if iso not in filtered_paths:
+            filtered_paths[iso] = path
+
+    return filtered_paths
+
+
+def compute_cluster_consensus_paths(paths, cluster_map):
+    """
+    For each cluster, find the majority path (consensus) among its isolates.
+
+    - paths: dict {isolate_id: pu.Path}
+    - cluster_map: dict {isolate_id: cluster_id}
+
+    Returns
+    -------
+    dict {cluster_id: pu.Path}  # consensus path per cluster
+    """
+    # group isolates by cluster
+    cluster_to_isos = defaultdict(list)
+    for iso, cl in cluster_map.items():
+        if iso in paths:  # only consider isolates that have a path
+            cluster_to_isos[cl].append(iso)
+
+    consensus_paths = {}
+
+    for cl, isos in cluster_to_isos.items():
+        # If only one isolate in cluster, that path *is* the consensus
+        if len(isos) == 1:
+            iso = isos[0]
+            consensus_paths[cl] = paths[iso]
+            continue
+
+        # Count identical paths in this cluster
+        path_counter = Counter(paths[iso] for iso in isos)
+
+        # Pick the majority path
+        # tie-breaker: higher count, then longer path
+        majority_path, _ = max(
+            path_counter.items(),
+            key=lambda kv: (kv[1], len(kv[0].nodes))
+        )
+        consensus_paths[cl] = majority_path
+
+    return consensus_paths
+
+
+def consensus_paths_and_assignments(consensus_paths_by_cluster, cluster_map):
+    """
+    Build:
+      1) an ordered list of consensus paths for plotting
+      2) a DataFrame with best_consensus per isolate.
+
+    Parameters
+    ----------
+    consensus_paths_by_cluster : dict
+        {cluster_id: pu.Path}
+    cluster_map : dict
+        {isolate_id: cluster_id}
+
+    Returns
+    -------
+    consensus_list : list of pu.Path
+        Ordered list of consensus paths (for plotting).
+    assignment_df : pd.DataFrame
+        Index: isolate_id
+        Columns:
+          - 'cluster'        : cluster_id
+          - 'best_consensus' : 'consensus_i' label for that cluster
+    cluster_to_consensus_name : dict
+        {cluster_id: 'consensus_i'}
+    """
+    # all clusters present
+    clusters = sorted(set(cluster_map.values()))
+
+    consensus_list = []
+    cluster_to_consensus_name = {}
+
+    # assign consensus_i names in a stable order of clusters
+    i = 1
+    for cl in clusters:
+        if cl not in consensus_paths_by_cluster:
+            continue
+        consensus_list.append(consensus_paths_by_cluster[cl])
+        cluster_to_consensus_name[cl] = f"consensus_{i}"
+        i += 1
+
+    # build assignment dataframe
+    rows = []
+    # preserve input order of isolates (if cluster_map is an OrderedDict) 
+    # otherwise this will just be some deterministic order
+    for iso, cl in cluster_map.items():
+        best_cons = cluster_to_consensus_name.get(cl, None)
+        rows.append(
+            {"isolate": iso, "cluster": cl, "best_consensus": best_cons}
+        )
+
+    assignment_df = pd.DataFrame(rows).set_index("isolate")
+    assignment_df = assignment_df.rename_axis(None)
+
+    return consensus_list, assignment_df, cluster_to_consensus_name

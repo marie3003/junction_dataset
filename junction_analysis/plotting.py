@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import random
 
 import plotly.graph_objects as go
@@ -142,7 +143,7 @@ def plot_junction_pangraph_interactive(
             base=[left],
             orientation="h",
             marker=dict(color=color, line=dict(color=("black" if strand else "red"), width=1)),
-            customdata=[[left, width, left + width, block_id, strand, block_pos]],
+            customdata=[[left, width, left + width, str(block_id), strand, block_pos]],
             hovertemplate=(
                 "label: %{y}"
                 "<br>start: %{customdata[0]}"
@@ -658,5 +659,112 @@ def plot_dendrogram(Z, names):
     dendrogram(Z, labels=names, leaf_rotation=90)
     plt.title("Hierarchical clustering (p-distance)")
     plt.ylabel("p-distance")
+    plt.tight_layout()
+    plt.show()
+
+def plot_pairwise_distance_hist(distances, bins=30, figsize=(6, 4),
+                                vline=None, vline_kwargs=None,
+                                title="Pairwise Distance Distribution"):
+    """
+    Plot a histogram of pairwise distances with an optional vertical line.
+
+    Parameters
+    ----------
+    distances : array-like
+        1D array of pairwise distances.
+    bins : int
+        Number of histogram bins.
+    figsize : tuple
+        Figure size.
+    vline : float or None
+        If provided, draw a vertical line at this x-position.
+    vline_kwargs : dict or None
+        Custom style for the vertical line.
+    title : str
+        Plot title.
+    """
+    distances = np.asarray(distances)
+
+    if vline_kwargs is None:
+        vline_kwargs = dict(color="black", linestyle="--", linewidth=1.5)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # histogram
+    ax.hist(distances, bins=bins, density=True, alpha=0.7)
+
+    # vertical line
+    if vline is not None:
+        ax.axvline(vline, **vline_kwargs)
+
+    # labels
+    ax.set_title(title)
+    ax.set_xlabel("Distance")
+    ax.set_ylabel("Density")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_block_distance_distribution(pair_dists, block_list, bins=30, cols=4,
+                                 figsize=(14, 20), vline=None, vline_kwargs=None, same_xrange=False):
+    """
+    pair_dists: dict {block_id: 1D numpy array of pairwise distances}
+    block_list: list or Series of block IDs to plot
+    vline: float or None — if given, draw vertical line at this x-value
+    vline_kwargs: dict passed to ax.axvline() (e.g. color, linestyle)
+    """
+    block_list = list(block_list)
+    n = len(block_list)
+
+    rows = math.ceil(n / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=figsize, squeeze=False)
+    axes = axes.flatten()
+
+    # default style for vertical line
+    if vline_kwargs is None:
+        vline_kwargs = dict(color="red", linestyle="--", linewidth=1.5)
+    
+    if same_xrange:
+        all_dists = []
+        for block_id in block_list:
+            d = pair_dists.get(block_id)
+            if d is not None and d.size > 0:
+                all_dists.append(d)
+
+        all_dists_concat = np.concatenate(all_dists)
+
+        # global x-axis range
+        xmin = float(all_dists_concat.min())
+        xmax = float(all_dists_concat.max())
+
+    for ax, block_id in zip(axes, block_list):
+        d = pair_dists.get(block_id)
+
+        if d is None or d.size == 0:
+            ax.text(0.5, 0.5, f"No data\nBlock {block_id}",
+                    ha='center', va='center', fontsize=10)
+            ax.set_axis_off()
+            continue
+
+        # histogram
+        ax.hist(d, bins=bins, density=True, alpha=0.7)
+
+        # vertical threshold line
+        if vline is not None:
+            ax.axvline(vline, **vline_kwargs)
+
+        # titles & labels
+        ax.set_title(f"Block {block_id}")
+        ax.set_xlabel("Distance")
+        ax.set_ylabel("Density")
+
+        if same_xrange:
+            ax.set_xlim(xmin, xmax)
+
+    # Hide unused axes
+    for ax in axes[len(block_list):]:
+        ax.set_axis_off()
+
     plt.tight_layout()
     plt.show()
