@@ -2,10 +2,15 @@ import pandas as pd
 import numpy as np
 import math
 
+from pathlib import Path
+from IPython.display import display
+
 from itertools import combinations
 from collections import Counter, defaultdict
 import pypangraph as pp
 import junction_analysis.pangraph_utils as pu
+from junction_analysis.plotting import plot_junction_pangraph_interactive, plot_pairwise_distance_hist
+from junction_analysis.junction_trees import build_tree_from_block_list, cluster_tree_by_branch_length, compute_pairwise_distances 
 
 
 def find_invertible_ids(paths: dict) -> set:
@@ -23,7 +28,7 @@ def find_invertible_ids(paths: dict) -> set:
 
     return invertible_ids
 
-def make_deduplicated_paths(pangraph, rare_context_thresh=10, include_isolates=None) -> dict:
+def make_deduplicated_paths(pangraph, rare_context_thresh=10) -> dict:
     """
     Convert a dict[isolate -> Path(Node,...)] into dict[isolate -> Path(DeduplicatedNode, ...)],
     where duplicated blocks get a context = closest non-duplicated, never inverted, less rare than rare_context_thresh block (ID) to the left.
@@ -33,10 +38,6 @@ def make_deduplicated_paths(pangraph, rare_context_thresh=10, include_isolates=N
     """
     # create path dictionary of Path objects
     path_dict = pangraph.to_path_dictionary()
-    # filter isolates if requested
-    if include_isolates is not None:
-        include_isolates = set(include_isolates)
-        path_dict = {iso: path for iso, path in path_dict.items() if iso in include_isolates}
     path_dict = {isolate: pu.Path.from_tuple_list(path, 'node') for isolate, path in path_dict.items()}
 
     blockstats_df = pangraph.to_blockstats_df()
@@ -419,3 +420,41 @@ def consensus_paths_and_assignments(consensus_paths_by_cluster, cluster_map):
     assignment_df = assignment_df.rename_axis(None)
 
     return consensus_list, assignment_df, cluster_to_consensus_name
+
+def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, block_freq_thresh = 0.5, plot_consensus = False, plot_pair_dist = False):
+    # create deduplicated paths dict
+    pangraph = pp.Pangraph.from_json(f"../results/junction_pangraphs/{junction_name}.json")
+    path_dict, block_freq = make_deduplicated_paths(pangraph)
+
+    # create tree and do clustering based on core blocks
+    blockstats_df = pangraph.to_blockstats_df()
+    core_block_ids = list(blockstats_df[blockstats_df['core']==True].index)
+    build_tree_from_block_list(pangraph, path_dict, core_block_ids, list(path_dict.keys()), f"../results/consensus_analysis/{junction_name}", "core")
+    tree_path_core = Path(f"../results/consensus_analysis/{junction_name}/core_blocks_aln.newick")
+    cluster_map_core = cluster_tree_by_branch_length(tree_path_core, clustering_bl_thresh)
+
+    # filter blocks that are in less than 50% of isolates in a cluster
+    bf_filtered_paths = filter_cluster_paths_by_block_freq(path_dict, cluster_map_core, freq_threshold=block_freq_thresh)
+
+    # choose majority path per cluster after filtering as consensus path
+    consensus_paths_core = compute_cluster_consensus_paths(bf_filtered_paths, cluster_map_core)
+
+    # visualization results
+    consensus_paths_plotting, assignment_df_plotting, _ = consensus_paths_and_assignments(consensus_paths_core, cluster_map_core)
+
+    if plot_consensus:
+        fig = plot_junction_pangraph_interactive(
+            pangraph,
+            show_consensus=True,
+            consensus_paths=consensus_paths_plotting,
+            assignments=assignment_df_plotting,
+            order="tree",
+            cluster_map=cluster_map_core,
+            title = "Junction Block Structure with Core Block Tree Clustering"
+        )
+        display(fig)
+    if plot_pair_dist:
+        core_distances = compute_pairwise_distances(tree_path_core)
+        plot_pairwise_distance_hist(core_distances, bins=100, vline=clustering_bl_thresh, vline_kwargs={"color": "black", "linestyle": "--"}, title="Core Blocks Pairwise Distance Distribution")
+
+    return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting

@@ -143,12 +143,11 @@ def print_insertions_deletions(insertions, deletions):
         for seg in segs:
             print(isolate, "DELETED:", seg)
 
-def get_insertions_deletions_from_consensus(example_pangraph, assignment_df, consensus_paths, consensus = 1, verbose = True):
+def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, deduplicated_paths, consensus = 1, verbose = True):
     # get isolates belonging to consensus 1
     isolates_1 = assignment_df[assignment_df['best_consensus'] == f"consensus_{consensus}"].index.tolist()
-
-    # deduplicate blocks
-    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(example_pangraph, include_isolates=isolates_1)
+    # only keep deduplicated paths for these isolates
+    deduplicated_paths = {iso: path for iso, path in deduplicated_paths.items() if iso in isolates_1}
 
     # compare deduplicated paths to consensus paths to find deviations, consensus paths are already deduplicated
     insertions, deletions = get_insertions_deletions(deduplicated_paths, consensus_paths[consensus - 1])
