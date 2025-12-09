@@ -1,7 +1,8 @@
 import scipy.cluster.hierarchy as sch
-from Bio import Phylo, SeqIO
 from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
+from Bio import Phylo, SeqIO, Align
+from Bio.motifs import Motif
 import os, re
 import numpy as np
 from sklearn.cluster import AgglomerativeClustering
@@ -252,11 +253,16 @@ def write_shared_nodes_fasta(pangraph, path_dict, shared_nodes, shared_node_isol
 
     fasta_records = []
     for isolate in shared_node_isolates:
+        # skip isolates that do not contain all shared blocks
+        isolate_block_ids = {block.id for block in path_dict[isolate].nodes}
+        if not shared_id_set.issubset(isolate_block_ids):
+            continue
+
         seq = ""
         for block in path_dict[isolate].nodes:
             if block.id in shared_id_set:
                 seq = seq + get_isolate_sequence(pangraph, block.id, block.nid)
-        record = SeqRecord(Seq(seq), id = isolate, description = "")
+        record = SeqRecord(Seq(seq), id = isolate, description = f"blocks{shared_nodes} length{len(seq)}")
         fasta_records.append(record)
 
     SeqIO.write(fasta_records, output_path, "fasta")
@@ -273,3 +279,11 @@ def simplify_cluster_keys(cluster_map):
         simple_key = key.split("__")[0]
         new_map[simple_key] = value
     return new_map
+
+def get_consensus_seq_from_alignment(aln_path, threshold=0.5, ambiguous="N"):
+    alignment = Align.read(aln_path, "fasta")
+    motif = Motif("acgt-", alignment)
+    consensus = motif.counts.calculate_consensus(
+        identity=threshold
+    )
+    return consensus

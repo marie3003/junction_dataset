@@ -14,8 +14,9 @@ from Bio.SeqRecord import SeqRecord
 from pathlib import Path
 
 from junction_analysis.consensus import make_deduplicated_paths
-from junction_analysis.helpers import get_isolate_sequence
+from junction_analysis.helpers import get_isolate_sequence, get_consensus_seq_from_alignment
 from junction_analysis import pangraph_utils as pu
+from junction_analysis.junction_trees import build_tree_from_block_list
 
 
 def write_block_fasta(example_pangraph, example_junction, isolate_name, block_id, single_sequence = True):
@@ -112,7 +113,7 @@ def write_segment_fasta(example_junction, isolate_name, segment_name, consensus,
         id=f"{isolate_name}|{segment_name}",
         description=f"path{path} length{len(sequence)}"
     )
-    output_path = f"../results/atb_lookup/{example_junction}/consensus{consensus}/{isolate_name}_{segment_name}.fasta"
+    output_path = f"../results/atb_lookup/insertions/{example_junction}/consensus{consensus}/{isolate_name}_{segment_name}.fasta"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     SeqIO.write(record, output_path, "fasta")
 
@@ -209,7 +210,7 @@ def find_insertion_hits_own_genome(genome_root, insertions_seq_dir):
             header_main = header.lstrip(">")
             genome_name, segment = header_main.split()[0].split("|")  
 
-            path_match = re.search(r"path\[(.*)\]\s+length", header)
+            path_match = re.search(r"path(\[.*])\s+length", header)
             path_string = path_match.group(1) if path_match else None
 
             # Extract length (integer after 'length')
@@ -317,7 +318,7 @@ def find_insertion_hits_in_plasmids(plasmid_fasta_root, insertions_seq_dir):
                 continue
 
             # Extract metadata from header once per insertion
-            path_match = re.search(r"path\[(.*)\]\s+length", header)
+            path_match = re.search(r"path(\[.*])\s+length", header)
             path_string = path_match.group(1) if path_match else None
             length_match = re.search(r"length(\d+)", header)
             seq_length = int(length_match.group(1)) if length_match else None
@@ -368,3 +369,77 @@ def find_insertion_hits_in_plasmids(plasmid_fasta_root, insertions_seq_dir):
 
     return pd.DataFrame(results)
 
+
+#### Deletions
+
+def summarize_deletions_consensus(deletions, junction_name, pangraph, path_dict, assignment_df, consensus_id, parent_dir, rerun_alignment=True, save_df=False):
+
+    isolates = assignment_df[assignment_df['best_consensus'] == f"consensus_{consensus_id}"].index.tolist()
+
+    # 12 min with tree generattion, doesnt help to not generate trees alignemnt is the long step
+    if rerun_alignment:
+        for iso, paths in deletions.items():
+            for idx, path in enumerate(paths):
+                block_ids = [node.id for node in path.nodes]
+                print(f"Processing {iso} with {path}")
+                build_tree_from_block_list(pangraph, path_dict, block_ids, isolates, f"{parent_dir}/{junction_name}/consensus_{consensus_id}", f"{iso}_deletion{idx}")
+
+
+    results = []
+    for iso, paths in deletions.items():
+        for idx, path in enumerate(paths):
+            consensus_seq = get_consensus_seq_from_alignment(f"{parent_dir}/{junction_name}/consensus_{consensus_id}/{iso}_deletion{idx}_blocks_aln.fa")
+            results.append(
+                    {
+                        "junction_name": junction_name,
+                        "consensus": f"consensus_{consensus_id}",
+                        "genome_name": iso,
+                        "path": str(path),
+                        "deletion": f"deletion{idx}",
+                        "consensus_sequence": str(consensus_seq),
+                        "length": len(consensus_seq),
+                    }
+                )
+    if not results:
+        print(f"No deletions found for consensus_{consensus_id}, nothing saved.")
+        return None
+
+    deletions_df = pd.DataFrame(results)
+
+    if save_df :
+        out_dir = f"{parent_dir}/{junction_name}/consensus_{consensus_id}"
+        os.makedirs(out_dir, exist_ok=True)
+        deletions_df.to_csv(f"{out_dir}/deletions_summary.csv", index=False)
+
+    return deletions_df
+
+def load_all_deletions_summaries(parent_dir, junction_name, save_df=False):
+    """
+    Read and combine all deletions_summary.csv files from
+    {parent_dir}/{junction_name}/consensus_*/deletions_summary.csv
+
+    Returns
+    -------
+    pd.DataFrame
+        One long DataFrame with all deletions combined.
+    """
+    base_dir = os.path.join(parent_dir, junction_name)
+    all_dfs = []
+
+    for subdir in sorted(os.listdir(base_dir)):
+        if not subdir.startswith("consensus_"):
+            continue
+
+        csv_path = os.path.join(base_dir, subdir, "deletions_summary.csv")
+        if os.path.isfile(csv_path):
+            df = pd.read_csv(csv_path)
+            all_dfs.append(df)
+
+    if not all_dfs:
+        return pd.DataFrame()
+    
+    complete_df = pd.concat(all_dfs, ignore_index=True)
+    if save_df:
+        complete_df.to_csv(os.path.join(base_dir, "all_deletions_summary.csv"), index=False)
+
+    return complete_df

@@ -8,17 +8,31 @@ from itertools import combinations
 from collections import defaultdict, deque
 
 def build_tree_from_block_list(pangraph, path_dict, block_list, isolate_list, parent_dir, file_name_prefix,
-                               mafft_bin="mafft", fasttree_bin="fasttree"):
+                               mafft_bin="mafft", fasttree_bin="fasttree", no_tree_gen=False):
     """
-    Build block fasta, alignment, and tree for the given list of blocks.
+    Build block fasta, alignment, and tree for the given list of blocks. If these files already exist, the code is not rerun.
     block_list: list of block IDs
     isolate_list: list of isolate names to include
     """
 
     os.makedirs(parent_dir, exist_ok=True)
 
-    # Write FASTA file of shared blocks for this consensus
     fasta_file = os.path.join(parent_dir, f"{file_name_prefix}_blocks.fa")
+    aln_file = os.path.join(parent_dir, f"{file_name_prefix}_blocks_aln.fa")
+    tree_file = os.path.join(parent_dir, f"{file_name_prefix}_blocks_aln.newick")
+
+    # skip everything if all required outputs already exist
+    fasta_exists = os.path.exists(fasta_file)
+    aln_exists = os.path.exists(aln_file)
+    tree_exists = os.path.exists(tree_file)
+
+    if fasta_exists and aln_exists and (no_tree_gen or tree_exists):
+        print(
+            f"Skipping {file_name_prefix}: FASTA, alignment and tree already exist in {parent_dir}"
+        )
+        return
+
+    # Write FASTA file of shared blocks for this consensus
     write_shared_nodes_fasta(
         pangraph,
         path_dict,
@@ -29,7 +43,6 @@ def build_tree_from_block_list(pangraph, path_dict, block_list, isolate_list, pa
     print(f"Wrote FASTA: {fasta_file}")
 
     # Run MAFFT alignment
-    aln_file = os.path.join(parent_dir, f"{file_name_prefix}_blocks_aln.fa")
     with open(aln_file, "w") as aln_out:
         subprocess.run(
             [mafft_bin, "--quiet", fasta_file],
@@ -39,14 +52,14 @@ def build_tree_from_block_list(pangraph, path_dict, block_list, isolate_list, pa
     print(f"Wrote alignment: {aln_file}")
 
     # Run FastTree to build tree (gaps treated as missing data)
-    tree_file = os.path.join(parent_dir, f"{file_name_prefix}_blocks_aln.newick")
-    with open(tree_file, "w") as tree_out:
-        subprocess.run(
-            [fasttree_bin, "-nt", "-gtr", aln_file],
-            stdout=tree_out,
-            check=True,
-        )
-    print(f"Wrote tree: {tree_file}")
+    if no_tree_gen == False:
+        with open(tree_file, "w") as tree_out:
+            subprocess.run(
+                [fasttree_bin, "-nt", "-gtr", aln_file],
+                stdout=tree_out,
+                check=True,
+            )
+        print(f"Wrote tree: {tree_file}")
 
 def build_trees_for_all_consensus(
     consensus_paths,
