@@ -41,6 +41,53 @@ def create_block_msas(example_junction): # 2 min 14
             check=True
         )
 
+def create_block_msas_for_cluster(example_junction, isolate_list, cl, ambiguous_blocks,
+                                            in_fasta_dir=None, out_base_dir=None,
+                                            mafft_bin="mafft"):
+    """
+    Only (re)align blocks whose block_id appears in ambiguous_blocks.
+    ambiguous_blocks entries look like "[<block_id>|+|...]" -> we only use the first number.
+    """
+
+    isolate_set = set(isolate_list)
+
+    if in_fasta_dir is None:
+        in_fasta_dir = Path(f"../results/block_fastas/{example_junction}")
+
+    if out_base_dir is None:
+        out_base_dir = Path("../results/block_alignments_cluster")
+
+    out_parent = Path(out_base_dir) / str(example_junction) / f"cluster_{cl}"
+    out_fasta_dir = out_parent / "fastas"
+    out_aln_dir = out_parent / "alns"
+    out_fasta_dir.mkdir(parents=True, exist_ok=True)
+    out_aln_dir.mkdir(parents=True, exist_ok=True)
+
+    for block in ambiguous_blocks:
+        fasta_file = Path(in_fasta_dir) / f"block_{block.id}_sequences.fa"
+
+        # skip if already aligned
+        out_aln = out_aln_dir / f"block_{block.id}_sequences_cluster_aln.fa"
+        if out_aln.exists():
+            continue
+
+        # filter records by isolate list
+        records = []
+        for rec in SeqIO.parse(str(fasta_file), "fasta"):
+            iso = rec.id.split("__", 1)[0]
+            if iso in isolate_set:
+                records.append(rec)
+
+        if len(records) < 2:
+            continue
+
+        out_fa = out_fasta_dir / f"block_{block.id}_sequences_cluster.fa"
+        SeqIO.write(records, str(out_fa), "fasta")
+
+        with open(out_aln, "w") as aln_out:
+            subprocess.run([mafft_bin, "--quiet", str(out_fa)],
+                           stdout=aln_out, check=True)
+
 def read_fasta_alignment(path):
     for rec in SeqIO.parse(path, "fasta"):
         yield rec.id, str(rec.seq)
@@ -180,7 +227,7 @@ def analyze_alignment(path, return_pairwise_dists=False):
 
     stats = dict(
         file=path.name,
-        block_id=int(path.stem.replace("_aln","").replace("block_","")),
+        block_id=int(path.name.split("_", 2)[1]),
         n_seqs=len(recs),
         alignment_len=length,
         core_len=core_len,
@@ -197,8 +244,22 @@ def analyze_alignment(path, return_pairwise_dists=False):
     else:
         return stats
     
-def summarize_block_msas(junction_name, save_df=True, return_pairwise_dists=False):
-    aligned_dir = Path(f"../results/block_alignments/{junction_name}")
+def summarize_block_msas(junction_name, cl=None, save_df=True, return_pairwise_dists=False,
+                         base_full="../results/block_alignments",
+                         base_cluster="../results/block_alignments_cluster"):
+    """
+    Creates summary statistics for block alignments.
+    If cl is None: summarize ../results/block_alignments/<junction_name>/block_*_aln.fa
+    If cl is not None: summarize ../results/block_alignments_cluster/<junction_name>/cluster_<cl>/alns/block_*_aln.fa
+    """
+
+    if cl is None:
+        aligned_dir = Path(base_full) / str(junction_name)
+        out_csv = aligned_dir / f"{junction_name}_alignment_stats.csv"
+    else:
+        aligned_dir = Path(base_cluster) / str(junction_name) / f"cluster_{cl}" / "alns"
+        out_csv = aligned_dir / f"{junction_name}_cluster_{cl}_alignment_stats.csv"
+
     results = []
     pairwise_dict = {} if return_pairwise_dists else None
 
@@ -211,21 +272,19 @@ def summarize_block_msas(junction_name, save_df=True, return_pairwise_dists=Fals
             stats = analyze_alignment(p)
             results.append(stats)
 
-    summary_df = pd.DataFrame(results).sort_values("block_id")
+    df = pd.DataFrame(results).sort_values("block_id")
 
     pangraph = pp.Pangraph.from_json(f"../results/junction_pangraphs/{junction_name}.json")
     blockstats_df = pangraph.to_blockstats_df().reset_index()
-    merged_df = summary_df.merge(blockstats_df, on="block_id", how="left")
+    df = df.merge(blockstats_df, on="block_id", how="left")
 
     if save_df:
-        out_csv = Path(f"../results/block_alignments/{junction_name}/{junction_name}_alignment_stats.csv")
-        merged_df.to_csv(out_csv, index=False)
+        df.to_csv(out_csv, index=False)
 
     if return_pairwise_dists:
-        # DataFrame + per-block pairwise distance vectors
-        return merged_df, pairwise_dict
+        return df, pairwise_dict
 
-    return merged_df
+    return df
 
 
 def cluster_alignment(alignment_path):

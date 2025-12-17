@@ -768,3 +768,32 @@ def plot_block_distance_distribution(pair_dists, block_list, bins=30, cols=4,
 
     plt.tight_layout()
     plt.show()
+
+def plot_snp_pos_distribution(snp_pos, cutoff, bins=50, title=None):
+    """
+    Plot histogram of SNP positions and draw a vertical line at `cutoff`.
+
+    Args:
+        snp_pos (list[int]): SNP column positions.
+        cutoff (int): cutoff position between core blocks (same coordinate system as snp_pos).
+        bins (int): histogram bins.
+        title (str|None): optional plot title.
+    """
+    if not snp_pos:
+        raise ValueError("snp_pos is empty")
+
+    xs = snp_pos
+    x_cut = cutoff
+
+    # Plot
+    plt.figure()
+    plt.hist(xs, bins=bins)
+    plt.axvline(x_cut, linewidth=1.5, color = 'black', linestyle='--', label='Core block boundary')
+
+    plt.xlabel("SNP position")
+    plt.ylabel("Count")
+    if title:
+        plt.title(title)
+
+    plt.tight_layout()
+    plt.show()

@@ -6,11 +6,15 @@ from pathlib import Path
 from IPython.display import display
 
 from itertools import combinations
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, OrderedDict
+
+from Bio import Phylo
 import pypangraph as pp
 import junction_analysis.pangraph_utils as pu
-from junction_analysis.plotting import plot_junction_pangraph_interactive, plot_pairwise_distance_hist
-from junction_analysis.junction_trees import build_tree_from_block_list, cluster_tree_by_branch_length, compute_pairwise_distances 
+from junction_analysis.plotting import plot_junction_pangraph_interactive, plot_pairwise_distance_hist, plot_snp_pos_distribution, plot_block_distance_distribution
+from junction_analysis.junction_trees import build_tree_from_block_list, cluster_tree_by_branch_length, compute_pairwise_distances
+from junction_analysis.helpers import get_block_length, snp_positions, build_subtree
+from junction_analysis.block_alignment import create_block_msas_for_cluster, summarize_block_msas
 
 
 def find_invertible_ids(paths: dict) -> set:
@@ -269,101 +273,76 @@ def find_consensus_paths(pangraph, rare_block_threshold = 10, rare_edge_threshol
     return consensus_paths, deduplicated_paths, deduplicated_blog_freq, edge_ji_df, assignment_df
 
 
-def filter_cluster_paths_by_block_freq(paths, cluster_map, freq_threshold = 0.5):
+def filter_paths_by_block_freq(paths, freq_threshold = 0.5):
     """
-    Filter blocks out of all paths that are in less than half of the isolates
-    of their cluster.
+    Filter blocks out of all paths that are in less than half of the isolates.
 
     - paths: dict {isolate_id: pu.Path}
-    - cluster_map_core: dict {isolate_id: cluster_id}
-    - freq_tresh: float, how frequent do blocks need to be per cluster to not be filtered out
+    - freq_tresh: float, how frequent do blocks need to be to not be filtered out
 
     Returns
     -------
     dict {isolate_id: pu.Path} with filtered paths.
     """
-    # Group isolates by cluster
-    cluster_to_isos = defaultdict(list)
-    for iso, cl in cluster_map.items():
-        if iso in paths:  # ignore isolates not in paths
-            cluster_to_isos[cl].append(iso)
 
+    n_isos = len(paths)
     filtered_paths = {}
 
-    for cl, isos in cluster_to_isos.items():
-        n_isos = len(isos)
+    # If only one isolate in the cluster, do not filter anything
+    if n_isos <= 1:
+        for iso in paths.keys():
+            filtered_paths[iso] = paths[iso]
 
-        # If only one isolate in the cluster, do not filter anything
-        if n_isos <= 1:
-            for iso in isos:
-                filtered_paths[iso] = paths[iso]
-            continue
+    # i.e. keep blocks with count >= ceil(n_isos * freq_threshold)
+    threshold = math.ceil(n_isos * freq_threshold)
 
-        # i.e. keep blocks with count >= ceil(n_isos * freq_threshold)
-        threshold = math.ceil(n_isos * freq_threshold)
+    # Count block presence per cluster (after deduplication max. once per isolate)
+    block_counts = defaultdict(int)
+    for iso in paths.keys():
+        for node in paths[iso].nodes:
+            block_counts[node] += 1
 
-        # Count block presence per cluster (after deduplication max. once per isolate)
-        block_counts = defaultdict(int)
-        for iso in isos:
-            for node in paths[iso].nodes:
-                block_counts[node] += 1
-
-        # Blocks to filter in this cluster
-        filter_set = {node for node, cnt in block_counts.items() if cnt < threshold}
-
-        # Apply your helper function on this cluster only
-        cluster_paths = {iso: paths[iso] for iso in isos}
-        filtered_cluster_paths = filter_deduplicated_paths(cluster_paths, filter_set)
-
-        # Collect results
-        filtered_paths.update(filtered_cluster_paths)
-
-    # If there are isolates in `paths` not in cluster_map_core, copy as-is
-    for iso, path in paths.items():
-        if iso not in filtered_paths:
-            filtered_paths[iso] = path
+    # Blocks to filter in this cluster
+    filter_set = {node for node, cnt in block_counts.items() if cnt < threshold}
+    filtered_paths = filter_deduplicated_paths(paths, filter_set)
 
     return filtered_paths
 
 
-def compute_cluster_consensus_paths(paths, cluster_map):
+def compute_majority_path(paths, verbose = True):
     """
-    For each cluster, find the majority path (consensus) among its isolates.
+    Find the majority path (consensus) among its isolates.
 
     - paths: dict {isolate_id: pu.Path}
     - cluster_map: dict {isolate_id: cluster_id}
 
     Returns
     -------
-    dict {cluster_id: pu.Path}  # consensus path per cluster
+    pu.Path: consensus path
     """
-    # group isolates by cluster
-    cluster_to_isos = defaultdict(list)
-    for iso, cl in cluster_map.items():
-        if iso in paths:  # only consider isolates that have a path
-            cluster_to_isos[cl].append(iso)
 
-    consensus_paths = {}
+    n_isos = len(paths)
+    # If only one isolate in cluster, that path *is* the consensus
+    if n_isos == 1:
+        consensus_path = next(iter(paths.values()))
+        if verbose:
+            print(f"1 / 1 (single isolate)")
+        return consensus_path
 
-    for cl, isos in cluster_to_isos.items():
-        # If only one isolate in cluster, that path *is* the consensus
-        if len(isos) == 1:
-            iso = isos[0]
-            consensus_paths[cl] = paths[iso]
-            continue
+    # Count identical paths in this cluster
+    path_counter = Counter(path for path in paths.values())
 
-        # Count identical paths in this cluster
-        path_counter = Counter(paths[iso] for iso in isos)
+    # Pick the majority path
+    # tie-breaker: higher count, then longer path
+    majority_path, majority_count = max(
+        path_counter.items(),
+        key=lambda kv: (kv[1], len(kv[0].nodes))
+    )
 
-        # Pick the majority path
-        # tie-breaker: higher count, then longer path
-        majority_path, _ = max(
-            path_counter.items(),
-            key=lambda kv: (kv[1], len(kv[0].nodes))
-        )
-        consensus_paths[cl] = majority_path
+    if verbose:
+        print(f"{majority_count} / {n_isos} isolates share the majority path")
 
-    return consensus_paths
+    return majority_path
 
 
 def consensus_paths_and_assignments(consensus_paths_by_cluster, cluster_map):
@@ -421,7 +400,90 @@ def consensus_paths_and_assignments(consensus_paths_by_cluster, cluster_map):
 
     return consensus_list, assignment_df, cluster_to_consensus_name
 
-def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, block_freq_thresh = 0.5, plot_consensus = False, plot_pair_dist = False):
+def build_block_index(path_dict):
+    """
+    Returns:
+      blocks: list of blocks in fixed order (index -> block)
+      block2idx: dict mapping block -> index
+    """
+    block2idx = OrderedDict()  # preserves insertion order deterministically
+    for isolate, path in path_dict.items():
+        for block in path.nodes:          # block supports == (and should be hashable)
+            if block not in block2idx:
+                block2idx[block] = len(block2idx)
+    blocks = list(block2idx.keys())
+    return blocks, dict(block2idx)
+
+
+def encode_paths_binary(path_dict, block2idx):
+    """
+    Returns:
+      enc: dict isolate -> list[int] (0/1) with length = number of unique blocks
+    """
+    n_blocks = len(block2idx)
+    enc = {}
+
+    for isolate, path in path_dict.items():
+        vec = [0] * n_blocks
+        for block in path.nodes:
+            vec[block2idx[block]] = 1
+        enc[isolate] = vec
+
+    return enc
+
+def fitch_ancestral_reconstruction(tree, binary_encodings):
+    """
+    Fitch parsimony for binary (0/1) sequences.
+    Adds `clade.sequence` (list of 0/1) to every node.
+    """
+
+    # length of binary encoded sequences
+    L = len(next(iter(binary_encodings.values())))
+
+    # ---------- bottom-up (postorder): compute state sets ----------
+    for clade in tree.find_clades(order="postorder"):
+        if clade.is_terminal():
+            seq = binary_encodings[clade.name]
+            clade._state_sets = [{s} for s in seq]
+        else:
+            child_sets = [child._state_sets for child in clade.clades]
+            clade._state_sets = []
+            for i in range(L):
+                intersection = set.intersection(*(cs[i] for cs in child_sets))
+                if intersection:
+                    clade._state_sets.append(intersection)
+                else:
+                    clade._state_sets.append(set.union(*(cs[i] for cs in child_sets)))
+    
+    # one could add a top down pass to refine ambiguities for lower level sequences but its not needed at the moment
+
+def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, individual_gain_thresh = 0.01, verbose = False):
+    ambiguous_blocks = [block for block, state in zip(blocks, root_states) if len(state) > 1]
+
+    # don't run followig analysis if there are no ambiguous blocks
+    if ambiguous_blocks == []:
+        print("No ambiguous blocks.")
+        return root_states
+    
+    create_block_msas_for_cluster(junction_name, isolate_list, cl, ambiguous_blocks)
+    df, pair_dists = summarize_block_msas(junction_name, cl, return_pairwise_dists=True)
+    if verbose:
+        display(df)
+        plot_block_distance_distribution(pair_dists, [block.id for block in ambiguous_blocks], bins=70, cols=4, figsize=(14, 10), vline=0.01, vline_kwargs={"color": "black", "linestyle": "--"})
+
+    for block in ambiguous_blocks:
+        pos = block2idx[block]
+        # in the case where there is only one sequence within one blog, we can't know whether it is a gain or loss, in the current logic this is defined as a loss
+        # loss: high sequence similarity leads to the assumption that block used to be present and got lost several times
+        if df.loc[df['block_id'] == block.id, 'avg_pairwise_dist'].item() < individual_gain_thresh:
+            root_states[pos] = {1}
+        # gain: high sequence diversity suggests several insertions of a block, in this case we would assume that the block hasn't been present in the ancestor
+        else:
+            root_states[pos] = {0}
+
+    return root_states
+
+def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, consensus_criterium = 'core_genome_tree', tree_path = "../config/polished_tree.nwk", block_freq_thresh = 0.5, plot_consensus = False, plot_pair_dist = False, plot_snp_dist = False, plot_ambiguities = False):
     # create deduplicated paths dict
     pangraph = pp.Pangraph.from_json(f"../results/junction_pangraphs/{junction_name}.json")
     path_dict, block_freq = make_deduplicated_paths(pangraph)
@@ -433,11 +495,55 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, block
     tree_path_core = Path(f"../results/consensus_analysis/{junction_name}/core_blocks_aln.newick")
     cluster_map_core = cluster_tree_by_branch_length(tree_path_core, clustering_bl_thresh)
 
-    # filter blocks that are in less than 50% of isolates in a cluster
-    bf_filtered_paths = filter_cluster_paths_by_block_freq(path_dict, cluster_map_core, freq_threshold=block_freq_thresh)
+    # Group isolates by cluster
+    cluster_to_isos = defaultdict(list)
+    for iso, cl in cluster_map_core.items():
+        if iso in path_dict:  # ignore isolates not in paths
+            cluster_to_isos[cl].append(iso)
 
-    # choose majority path per cluster after filtering as consensus path
-    consensus_paths_core = compute_cluster_consensus_paths(bf_filtered_paths, cluster_map_core)
+    if consensus_criterium == 'block_freq':
+        consensus_paths_core = {}
+        for cl, isos in cluster_to_isos.items():
+            cluster_paths = {iso: path_dict[iso] for iso in isos}
+            # filter blocks that are in less than 50% of isolates in a cluster
+            cluster_bf_filtered_paths = filter_paths_by_block_freq(cluster_paths, freq_threshold=block_freq_thresh)
+
+            # choose majority path per cluster after filtering as consensus path
+            consensus_path = compute_majority_path(cluster_bf_filtered_paths)
+            consensus_paths_core[cl] = consensus_path
+
+    elif consensus_criterium == 'core_genome_tree':
+        tree = Phylo.read(tree_path, "newick")
+        tree.rooted = True
+
+        consensus_paths_core = {}
+        all_root_states = {}
+        all_root_states_unique = {}
+
+        for cl, isolate_list in cluster_to_isos.items():
+
+            path_dict_cluster = {iso: path_dict[iso] for iso in isolate_list}
+
+            blocks, block2idx = build_block_index(path_dict_cluster)
+            binary_encodings = encode_paths_binary(path_dict_cluster, block2idx)
+
+            # build subtree for isolates of one cluster
+            subtree = build_subtree(tree, isolate_list)
+            #Phylo.draw_ascii(subtree)
+
+            # do ancestral sequence reconstruction on subtree and read ancestral sequence from root
+            fitch_ancestral_reconstruction(subtree, binary_encodings)
+            root_states = subtree.root._state_sets  # list of {0}/{1}
+            print(root_states)
+            root_states_unique = decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, individual_gain_thresh=0.01, verbose = plot_ambiguities)
+            
+            filter_set = {block for block, state in zip(blocks, root_states_unique) if 0 in state}
+            filtered_cluster_paths = filter_deduplicated_paths(path_dict_cluster, filter_set)
+            consensus_path = compute_majority_path(filtered_cluster_paths)
+
+            consensus_paths_core[cl] = consensus_path
+            all_root_states[cl] = root_states
+            all_root_states_unique[cl] = root_states_unique
 
     # visualization results
     consensus_paths_plotting, assignment_df_plotting, _ = consensus_paths_and_assignments(consensus_paths_core, cluster_map_core)
@@ -456,5 +562,16 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, block
     if plot_pair_dist:
         core_distances = compute_pairwise_distances(tree_path_core)
         plot_pairwise_distance_hist(core_distances, bins=100, vline=clustering_bl_thresh, vline_kwargs={"color": "black", "linestyle": "--"}, title="Core Blocks Pairwise Distance Distribution")
+
+    if plot_snp_dist:
+        example_isolate, example_path = next(iter(path_dict.items()))
+        left_core_block_id = example_path.nodes[0].id
+        left_core_block_length = get_block_length(f"../results/block_alignments/{junction_name}/block_{left_core_block_id}_aln.fa")
+
+        snp_pos = snp_positions(f"../results/consensus_analysis/{junction_name}/core_blocks_aln.fa")
+        plot_snp_pos_distribution(snp_pos, left_core_block_length, bins=70, title="SNP Position Distribution in Core Block Alignment")
+
+    if consensus_criterium == 'core_genome_tree':
+        return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unique
 
     return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting

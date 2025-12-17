@@ -6,6 +6,7 @@ import pypangraph as pp
 import os
 import subprocess
 import re
+import shutil
 
 from Bio import SeqIO
 from Bio.Seq import Seq
@@ -372,46 +373,92 @@ def find_insertion_hits_in_plasmids(plasmid_fasta_root, insertions_seq_dir):
 
 #### Deletions
 
-def summarize_deletions_consensus(deletions, junction_name, pangraph, path_dict, assignment_df, consensus_id, parent_dir, rerun_alignment=True, save_df=False):
+def summarize_deletions_consensus(
+    deletions,
+    junction_name,
+    pangraph,
+    path_dict,
+    assignment_df,
+    consensus_id,
+    parent_dir,
+    rerun_alignment=True,
+    save_df=False,
+):
 
     isolates = assignment_df[assignment_df['best_consensus'] == f"consensus_{consensus_id}"].index.tolist()
+    out_dir = f"{parent_dir}/{junction_name}/consensus_{consensus_id}"
+    os.makedirs(out_dir, exist_ok=True)
 
-    # 12 min with tree generattion, doesnt help to not generate trees alignemnt is the long step
+    # key: Path -> file_name_prefix used for the first occurrence
+    seen_paths: dict[Path, str] = {}
+
     if rerun_alignment:
         for iso, paths in deletions.items():
             for idx, path in enumerate(paths):
+                file_prefix = f"{iso}_deletion{idx}"
+
+                if path in seen_paths:
+                    # Reuse files from the first time we saw this exact path
+                    src_prefix = seen_paths[path]
+                    print(
+                        f"Reusing alignment/tree for {iso} deletion{idx} "
+                        f"from {src_prefix}"
+                    )
+                    for suffix in ("_blocks.fa", "_blocks_aln.fa", "_blocks_aln.newick"):
+                        src = os.path.join(out_dir, f"{src_prefix}{suffix}")
+                        dst = os.path.join(out_dir, f"{file_prefix}{suffix}")
+                        if os.path.exists(src) and not os.path.exists(dst):
+                            shutil.copyfile(src, dst)
+                    continue
+
+                # First time we see this path → build everything
                 block_ids = [node.id for node in path.nodes]
                 print(f"Processing {iso} with {path}")
-                build_tree_from_block_list(pangraph, path_dict, block_ids, isolates, f"{parent_dir}/{junction_name}/consensus_{consensus_id}", f"{iso}_deletion{idx}")
 
+                build_tree_from_block_list(
+                    pangraph,
+                    path_dict,
+                    block_ids,
+                    isolates,
+                    out_dir,
+                    file_prefix,
+                )
+                seen_paths[path] = file_prefix
 
+    # --- collect consensus sequences ---
     results = []
     for iso, paths in deletions.items():
         for idx, path in enumerate(paths):
-            consensus_seq = get_consensus_seq_from_alignment(f"{parent_dir}/{junction_name}/consensus_{consensus_id}/{iso}_deletion{idx}_blocks_aln.fa")
+            aln_path = os.path.join(out_dir, f"{iso}_deletion{idx}_blocks_aln.fa")
+            if not os.path.exists(aln_path):
+                print(f"Warning: alignment file not found, skipping: {aln_path}")
+                continue
+
+            consensus_seq = get_consensus_seq_from_alignment(aln_path)
             results.append(
-                    {
-                        "junction_name": junction_name,
-                        "consensus": f"consensus_{consensus_id}",
-                        "genome_name": iso,
-                        "path": str(path),
-                        "deletion": f"deletion{idx}",
-                        "consensus_sequence": str(consensus_seq),
-                        "length": len(consensus_seq),
-                    }
-                )
+                {
+                    "junction_name": junction_name,
+                    "consensus": f"consensus_{consensus_id}",
+                    "genome_name": iso,
+                    "path": str(path),
+                    "deletion": f"deletion{idx}",
+                    "consensus_sequence": str(consensus_seq),
+                    "length": len(consensus_seq),
+                }
+            )
+
     if not results:
         print(f"No deletions found for consensus_{consensus_id}, nothing saved.")
         return None
 
     deletions_df = pd.DataFrame(results)
 
-    if save_df :
-        out_dir = f"{parent_dir}/{junction_name}/consensus_{consensus_id}"
-        os.makedirs(out_dir, exist_ok=True)
-        deletions_df.to_csv(f"{out_dir}/deletions_summary.csv", index=False)
+    if save_df:
+        deletions_df.to_csv(os.path.join(out_dir, "deletions_summary.csv"), index=False)
 
     return deletions_df
+
+
 
 def load_all_deletions_summaries(parent_dir, junction_name, save_df=False):
     """

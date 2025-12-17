@@ -1,7 +1,9 @@
 import scipy.cluster.hierarchy as sch
 from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
-from Bio import Phylo, SeqIO, Align
+from Bio import Phylo, SeqIO, Align, AlignIO
+from Bio.Phylo.BaseTree import Tree
+import copy
 from Bio.motifs import Motif
 import os, re
 import numpy as np
@@ -280,10 +282,39 @@ def simplify_cluster_keys(cluster_map):
         new_map[simple_key] = value
     return new_map
 
-def get_consensus_seq_from_alignment(aln_path, threshold=0.5, ambiguous="N"):
+def get_consensus_seq_from_alignment(aln_path, threshold=0.5):
     alignment = Align.read(aln_path, "fasta")
     motif = Motif("acgt-", alignment)
     consensus = motif.counts.calculate_consensus(
         identity=threshold
     )
     return consensus
+
+def snp_positions(alignment_file, fmt="fasta"):
+    alignment = AlignIO.read(alignment_file, fmt)
+    snps = []
+
+    for i in range(alignment.get_alignment_length()):
+        column = set(alignment[:, i]) - {"-"}
+        if len(column) > 1:
+            snps.append(i)
+
+    return snps
+
+def get_block_length(alignment_file, fmt="fasta"):
+    alignment = AlignIO.read(alignment_file, fmt)
+    return alignment.get_alignment_length()
+
+
+def build_subtree(tree, isolate_list):
+    mrca = tree.common_ancestor(isolate_list)
+    subtree = Tree(root=copy.deepcopy(mrca), rooted=True)
+    subtree.root.branch_length = 0.0  # there is no parent anymore
+
+    # prune unwanted tips
+    keep = set(isolate_list)
+    for tip in list(subtree.get_terminals()):
+        if tip.name not in keep:
+            subtree.prune(tip)
+
+    return subtree
