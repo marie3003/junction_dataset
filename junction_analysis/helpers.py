@@ -7,6 +7,7 @@ import copy
 from Bio.motifs import Motif
 import os, re
 import numpy as np
+import pandas as pd
 from sklearn.cluster import AgglomerativeClustering
 
 def get_hierarchical_order(distance_df):
@@ -250,22 +251,38 @@ def get_isolate_sequence(pangraph, block_id, node_id):
     return sequence
 
 def write_shared_nodes_fasta(pangraph, path_dict, shared_nodes, shared_node_isolates, output_path):
-
+    """
+    Docstring for write_shared_nodes_fasta. Blocks are added in the order of shared_nodes list.
+    
+    :param pangraph: Pangraph object
+    :param path_dict: Dictionary of all paths (can be deduplicated)
+    :param shared_nodes: List of Node objects that are shared between isolates
+    :param shared_node_isolates: List of isolates that potentially share all nodes
+    :param output_path: Path where resulting fasta file is stored
+    """
     shared_id_set = {node for node in shared_nodes}
 
     fasta_records = []
     for isolate in shared_node_isolates:
         # skip isolates that do not contain all shared blocks
-        isolate_block_ids = {block.id for block in path_dict[isolate].nodes}
-        if not shared_id_set.issubset(isolate_block_ids):
+        isolate_blocks = {block for block in path_dict[isolate].nodes}
+        if not shared_id_set.issubset(isolate_blocks):
             continue
 
         seq = ""
-        for block in path_dict[isolate].nodes:
-            if block.id in shared_id_set:
-                seq = seq + get_isolate_sequence(pangraph, block.id, block.nid)
+        for shared_block in shared_nodes:
+            for block in path_dict[isolate].nodes:
+                if block == shared_block:
+                    seq = seq + get_isolate_sequence(pangraph, block.id, block.nid)
+                    break # end low level loop once one sequence was added (since blocks are unique should only happen once)
+
         record = SeqRecord(Seq(seq), id = isolate, description = f"blocks{shared_nodes} length{len(seq)}")
         fasta_records.append(record)
+
+    if not fasta_records:
+        raise ValueError(
+            "No isolate contains all shared nodes — FASTA file was not written."
+        )
 
     SeqIO.write(fasta_records, output_path, "fasta")
 
@@ -318,3 +335,43 @@ def build_subtree(tree, isolate_list):
             subtree.prune(tip)
 
     return subtree
+
+def read_gff3_annotations(gff_path: str) -> pd.DataFrame:
+    rows = []
+    with open(gff_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 9:
+                continue
+            seqid, source, ftype, start, end, score, strand, phase, attrs = parts
+            start, end = int(start), int(end)
+
+            # parse attributes into dict
+            ad = {}
+            for item in attrs.split(";"):
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    ad[k] = v
+
+            # IS subtype from ID like: NZ_CP102061.1|IS66|1992
+            is_subtype = None
+            if ftype == "IS":
+                _id = ad.get("ID", "")
+                toks = _id.split("|")
+                if len(toks) >= 2:
+                    is_subtype = toks[1]  # e.g. IS66 / IS3 / ISL3 / new
+
+            rows.append(
+                dict(
+                    seqid=seqid,
+                    feature=ftype,      # "IS", "defense_system", "prophage", ...
+                    start=start,
+                    end=end,
+                    attrs=ad,
+                    is_subtype=is_subtype,
+                )
+            )
+    return pd.DataFrame(rows)

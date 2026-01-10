@@ -7,12 +7,13 @@ import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+import colorsys
 
 import pandas as pd
 import pypangraph as pp
 from scipy.cluster.hierarchy import dendrogram
 
-from junction_analysis.helpers import get_tree_order
+from junction_analysis.helpers import get_tree_order, read_gff3_annotations
 import junction_analysis.pangraph_utils as pu
 
 
@@ -103,6 +104,35 @@ def plot_heatmap_hover(sequence_comparison_df, diff = None, shared = None, show_
     fig.show()
 
 # interactive plotly version
+def _rgb_str(r, g, b):
+    """
+    Convert RGB values to an RGB color string.
+    """
+    return f"rgb({int(r)},{int(g)},{int(b)})"
+
+def _shades_from_base_rgb(base_rgb, n: int):
+    """
+    Creates n shades from a base RGB color by varying lightness.
+    """
+    r, g, b = [x / 255.0 for x in base_rgb]
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    if n <= 1:
+        return [_rgb_str(base_rgb[0], base_rgb[1], base_rgb[2])]
+    ls = [0.85 - i * (0.7 / (n - 1)) for i in range(n)]
+    out = []
+    for li in ls:
+        rr, gg, bb = colorsys.hls_to_rgb(h, max(0.0, min(1.0, li)), s)
+        out.append(_rgb_str(rr * 255, gg * 255, bb * 255))
+    return out
+
+def _rgba(rgb_str: str, alpha: float) -> str:
+    """
+    Convert an RGB color string to RGBA with specified alpha value for transparency.
+    """
+    # rgb(1,2,3) -> rgba(1,2,3,0.4)
+    nums = rgb_str.strip().removeprefix("rgb(").removesuffix(")")
+    return f"rgba({nums},{alpha})"
+
 def plot_junction_pangraph_interactive(
     pan: pp.Pangraph,
     show_consensus: bool = False,
@@ -110,9 +140,37 @@ def plot_junction_pangraph_interactive(
     assignments: pd.DataFrame = None,
     order: str = "tree",
     cluster_map: dict = None,
-    title: str = "", 
+    add_cluster_annotation: bool = True,
+    title: str = "",
+    show_annotations: bool = False,
+    annotations_gff_path: str = None,
+    annotation_alpha: float = 0.70,   # transparency for annotations
 ):
+    """
+    Plots the block structure of a junction pangraph using Plotly.
+    The function can be used in four possible ways:
+        1) Plot all isolates in the pangraph (show_consensus=False, consensus_paths=None, assignments=None)
+        2) Plot isolates grouped by consensus paths (show_consensus=True, consensus_paths provided, assignments provided)
+        3) Plot isolates grouped by consensus paths with cluster annotations that don't necessarily have to match the consensus assignments (add_cluster_annotations = True, cluster_map provided)
+        4) Plot all isolates with prophage, defense_system, IS annotations. This works on top of adding consensus assignments and clustering or without (show_annotations=True, annotations_gff_path provided)
+    
+    :param pan: pp.Pangraph, Pangraph object to plot
+    :param show_consensus: bool, whether to show consensus paths
+    :param consensus_paths: list of consensus paths to plot
+    :param assignments: pd.DataFrame, assignments of isolates to consensus paths
+    :param order: str, order of consensus path, if "tree" use order of core genome tree
+    :param cluster_map: dict, mapping of isolate names to cluster IDs for annotation
+    :param add_cluster_annotation: bool, whether to add cluster annotations
+    :param title: str, Title of the plot
+    :param show_annotations: bool, whether to show prophage, defense_system, IS annotations
+    :param annotations_gff_path: str, path to GFF file with annotations
+    :param annotation_alpha: float, transparency for annotations
+    """
     bdf = pan.to_blockstats_df()
+
+    GREY_CORE = "rgb(220,220,220)"
+    GREY_ACC  = "rgb(190,190,190)"
+
     n_core = int(bdf["core"].sum())
     n_acc = int(len(bdf) - n_core)
     cgen_acc = iter(sns.color_palette("rainbow", n_acc))
@@ -120,6 +178,9 @@ def plot_junction_pangraph_interactive(
     block_colors: dict = {}
 
     def get_block_color(block_id):
+        if show_annotations:
+            return GREY_CORE if bool(bdf.loc[block_id, "core"]) else GREY_ACC
+
         if block_id not in block_colors:
             color = next(cgen_core) if bool(bdf.loc[block_id, "core"]) else next(cgen_acc)
             if isinstance(color, tuple) and len(color) == 3:
@@ -132,7 +193,7 @@ def plot_junction_pangraph_interactive(
     fig = go.Figure()
     y_labels = []
     y_seen = set()
-    max_x = 0  # track max end to pad space for stars
+    max_x = 0
 
     def _add_bar(label: str, left: int, width: int, color: str, strand: bool, block_id, block_pos: int):
         nonlocal max_x
@@ -221,17 +282,14 @@ def plot_junction_pangraph_interactive(
     tickvals = y_labels
     ticktext = [f"<b>{y}</b>" if y.startswith("consensus_") else y for y in y_labels]
 
-    # add a star per isolate based on cluster_map ---
-    if cluster_map:
-        # assign random colors per cluster id
+    # add a star per isolate based on cluster_map
+    if cluster_map and add_cluster_annotation:
         clusters = sorted(set(cluster_map.values()))
         palette = px.colors.qualitative.Plotly + px.colors.qualitative.Pastel + px.colors.qualitative.Bold
         random.shuffle(palette)
         cluster_color = {cid: palette[i % len(palette)] for i, cid in enumerate(clusters)}
 
-        # position stars slightly left of the first base (add small negative pad)
-        star_x = - 800
-
+        star_x = -2000
         xs, ys, cs = [], [], []
         for iso in y_labels:
             if iso.startswith("consensus_"):
@@ -241,21 +299,16 @@ def plot_junction_pangraph_interactive(
                 ys.append(iso)
                 cs.append(cluster_color[cluster_map[iso]])
 
-
         if xs:
             fig.add_trace(go.Scatter(
-                x=xs,
-                y=ys,
-                mode="markers",
+                x=xs, y=ys, mode="markers",
                 marker=dict(symbol="star", size=14, color=cs),
-                hoverinfo="skip",
-                showlegend=False,
+                hoverinfo="skip", showlegend=False,
             ))
 
-        # --- simple legend stars for clusters ---
         for cid, color in cluster_color.items():
             fig.add_trace(go.Scatter(
-                x=[None], y=[None],  # invisible points just for legend
+                x=[None], y=[None],
                 mode="markers",
                 marker=dict(symbol="star", size=14, color=color),
                 name=f"Cluster {cid}",
@@ -264,25 +317,117 @@ def plot_junction_pangraph_interactive(
 
         fig.update_layout(legend_title_text="Clusters")
 
+    # overlay defense system, prophage, IS annotations
+    if show_annotations and annotations_gff_path:
+        ann = read_gff3_annotations(annotations_gff_path)
+
+        DEF_COLOR = "rgb(152,78,163)"  # purple, far from inversion red
+        PROPH_COLOR = "rgb(27,158,119)"
+        IS_BASE = (55, 126, 184)
+
+        # stable IS subtype -> color mapping (computed once from whole file)
+        is_types = sorted(ann.loc[ann["feature"] == "IS", "is_subtype"].dropna().unique())
+        is_shades = _shades_from_base_rgb(IS_BASE, max(1, len(is_types)))
+        is_color = {t: is_shades[i] for i, t in enumerate(is_types)}
+
+        legend_seen = set()
+
+        def _add_anno_bar(x, y, base, color_rgb, name, end):
+            showleg = name not in legend_seen
+            if showleg:
+                legend_seen.add(name)
+
+            fig.add_trace(go.Bar(
+                x=x, # width
+                y=y,
+                base=base, # left start
+                orientation="h",
+                marker=dict(color=_rgba(color_rgb, annotation_alpha), line=dict(width=0)),
+                name=name,
+                showlegend=showleg,
+                hovertemplate=f"{name}<br>start=%{{base:d}}<br>end=%{{customdata:d}}<br>length=%{{x:d}}<extra></extra>",
+                customdata=end,
+            ))
+
+        # add annotation bars for every row label (isolates + consensus), currently not done but one could add annotations to the consensus paths in the dataframe or gff3 file to also color the consensus tracks 
+        for label in y_labels:
+            sub = ann[ann["seqid"] == label]
+            if sub.empty:
+                continue
+            
+            # add defense system annotations
+            ds = sub[sub["feature"] == "defense_system"]
+            if not ds.empty:
+                _add_anno_bar(
+                    x=(ds["end"] - ds["start"]).tolist(),
+                    y=[label] * len(ds),
+                    base=(ds["start"]).tolist(),
+                    color_rgb=DEF_COLOR,
+                    name="Defense system",
+                    end=ds["end"].tolist(),
+                )
+
+            # add prophage annotations
+            ph = sub[sub["feature"] == "prophage"]
+            if not ph.empty:
+                _add_anno_bar(
+                    x=(ph["end"] - ph["start"]).tolist(),
+                    y=[label] * len(ph),
+                    base=(ph["start"]).tolist(),
+                    color_rgb=PROPH_COLOR,
+                    name="Prophage",
+                    end=ph["end"].tolist(),
+                )
+
+            # add IS annotations
+            isdf = sub[sub["feature"] == "IS"].copy()
+            if not isdf.empty:
+                for type, istype_df in isdf.groupby("is_subtype", dropna=False):
+                    type = type if pd.notna(type) else "IS"
+                    name = f"IS:{type}"
+                    col = is_color.get(type, _rgb_str(*IS_BASE))
+                    _add_anno_bar(
+                        x=(istype_df["end"] - istype_df["start"]).tolist(),
+                        y=[label] * len(istype_df),
+                        base=(istype_df["start"]).tolist(),
+                        color_rgb=col,
+                        name=name,
+                        end=istype_df["end"].tolist(),
+                    )
+
+    fig.add_trace(go.Scatter(
+        x=[None],
+        y=[None],
+        mode="markers",
+        marker=dict(
+            symbol="square",
+            size=12,
+            color="rgba(0,0,0,0)",   # transparent fill
+            line=dict(color="red", width=2),
+        ),
+        name="Inversion",
+        showlegend=True,
+        hoverinfo="skip",
+    ))
 
     fig.update_layout(
         title=dict(
             text=title,
-            x=0.05,               # align to the left edge (0 = left, 1 = right)
-            y = 0.99,
-            xanchor="left",    # anchor the title text to its left
+            x=0.05,
+            y=0.99,
+            xanchor="left",
             yanchor="top",
-            yref="container",  # relative to the full container
+            yref="container",
             font=dict(size=18, family="Arial", color="black"),
-            pad=dict(l=10, t=10),  # small left/top padding
+            pad=dict(l=10, t=10),
         ),
-        barmode="stack",
+        barmode=("overlay" if (show_annotations and annotations_gff_path) else "stack"), # if annotations are on we want overlay (not stack) to allow them to be semi-transparent on top of blocks
         bargap=0.08,
         xaxis=dict(
             title="genomic position (bp)",
             showgrid=True,
             gridcolor="rgba(0,0,0,0.2)",
-            range=[-max(1, int(0.05 * max_x)), max_x],  # extend left to show stars
+            range=[-max(1, int(0.05 * max_x)), max_x],
             zeroline=True,
         ),
         yaxis=dict(
@@ -293,7 +438,7 @@ def plot_junction_pangraph_interactive(
             tickvals=tickvals,
             ticktext=ticktext,
         ),
-        margin=dict(l=140, r=20, t=20, b=40),
+        margin=dict(l=140, r=20, t=100, b=40),
         height=max(300, int(len(y_labels) * 22)),
         template="plotly_white",
     )

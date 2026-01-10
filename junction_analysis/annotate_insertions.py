@@ -84,18 +84,37 @@ def get_insertions_deletions(deduplicated_paths, consensus_path):
         # Handle trailing insertion
         flush()
 
-        # --- Find deletions ---
+        # --- Find deletions (strand-aware splitting) ---
         current_deletion = []
+        del_strand = None
         path_nodes_set = set(path.nodes)
+
+        def flush_del():
+            nonlocal current_deletion, del_strand
+            if current_deletion:
+                deletions.setdefault(isolate, []).append(pu.Path(current_deletion))
+                current_deletion = []
+            del_strand = None
+
         for node in consensus_path.nodes:
             if node not in path_nodes_set:
-                current_deletion.append(node)
+                # node is part of a deletion region
+                if del_strand is None:
+                    del_strand = node.strand
+                    current_deletion.append(node)
+                elif node.strand == del_strand:
+                    current_deletion.append(node)
+                else:
+                    # strand changed inside the deletion → split
+                    flush_del()
+                    del_strand = node.strand
+                    current_deletion.append(node)
             else:
-                if current_deletion:
-                    deletions.setdefault(isolate, []).append(pu.Path(current_deletion))
-                    current_deletion = []
-        if current_deletion:  # handle trailing deletion
-            deletions.setdefault(isolate, []).append(pu.Path(current_deletion))
+                # back on a node that exists in isolate path → end deletion block
+                flush_del()
+
+        # trailing deletion even though it should technically not happen
+        flush_del()
     
     return insertions, deletions
 
@@ -384,6 +403,11 @@ def summarize_deletions_consensus(
     rerun_alignment=True,
     save_df=False,
 ):
+    """
+    Summarize information about deletions and find consensus sequence for each deletion.
+    There might be a situation in which the previous deduplication of paths failed and some identical blocks get different contexts.
+    In this case only the isolates with the same context as the consensus path will be used to build the consensus sequence for the deletion. If no isolate matches the context definition, no consensus sequence will be found and a value error is raised.
+    """
 
     isolates = assignment_df[assignment_df['best_consensus'] == f"consensus_{consensus_id}"].index.tolist()
     out_dir = f"{parent_dir}/{junction_name}/consensus_{consensus_id}"
@@ -412,13 +436,18 @@ def summarize_deletions_consensus(
                     continue
 
                 # First time we see this path → build everything
-                block_ids = [node.id for node in path.nodes]
                 print(f"Processing {iso} with {path}")
+
+                
+                # Use reversed node order if deletion is on minus strand (do NOT mutate path.nodes)
+                nodes_for_deletion = list(path.nodes) # shallow copy
+                if nodes_for_deletion and nodes_for_deletion[0].strand is False:
+                    nodes_for_deletion.reverse()
 
                 build_tree_from_block_list(
                     pangraph,
                     path_dict,
-                    block_ids,
+                    nodes_for_deletion,
                     isolates,
                     out_dir,
                     file_prefix,

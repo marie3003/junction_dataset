@@ -11,7 +11,7 @@ def build_tree_from_block_list(pangraph, path_dict, block_list, isolate_list, pa
                                mafft_bin="mafft", fasttree_bin="fasttree", no_tree_gen=False):
     """
     Build block fasta, alignment, and tree for the given list of blocks. If these files already exist, the code is not rerun.
-    block_list: list of block IDs
+    block_list: list of blocks (potentially including context)
     isolate_list: list of isolate names to include
     """
 
