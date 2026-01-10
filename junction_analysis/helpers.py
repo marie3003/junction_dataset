@@ -375,3 +375,40 @@ def read_gff3_annotations(gff_path: str) -> pd.DataFrame:
                 )
             )
     return pd.DataFrame(rows)
+
+def read_gff3_cds_products(gff_path: str) -> pd.DataFrame:
+    rows = []
+    with open(gff_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 9:
+                continue
+
+            seqid, source, ftype, start, end, score, strand, phase, attrs = parts
+            if ftype != "CDS":
+                continue
+
+            start, end = int(start), int(end)
+
+            ad = {}
+            for item in attrs.split(";"):
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    ad[k] = v
+
+            # label: prefer product; fallback to Name/ID
+            label = ad.get("product") or ad.get("Name") or ad.get("ID") or "CDS"
+
+            rows.append(dict(
+                seqid=seqid,
+                start=start,
+                end=end,
+                strand=strand,
+                product=label,
+                attrs=ad,
+            ))
+
+    return pd.DataFrame(rows)

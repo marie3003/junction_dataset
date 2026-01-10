@@ -13,7 +13,7 @@ import pandas as pd
 import pypangraph as pp
 from scipy.cluster.hierarchy import dendrogram
 
-from junction_analysis.helpers import get_tree_order, read_gff3_annotations
+from junction_analysis.helpers import get_tree_order, read_gff3_annotations, read_gff3_cds_products
 import junction_analysis.pangraph_utils as pu
 
 
@@ -142,9 +142,13 @@ def plot_junction_pangraph_interactive(
     cluster_map: dict = None,
     add_cluster_annotation: bool = True,
     title: str = "",
-    show_annotations: bool = False,
+    show_mges_annotations: bool = False,
+    show_int_rec_annotations: bool = False,
+    mges_gff_path: str = None,
+    show_cds_annotations: bool = False,
     annotations_gff_path: str = None,
     annotation_alpha: float = 0.70,   # transparency for annotations
+    cds_annotation_alpha: float = 0.30,  # transparency for CDS annotations
 ):
     """
     Plots the block structure of a junction pangraph using Plotly.
@@ -178,7 +182,7 @@ def plot_junction_pangraph_interactive(
     block_colors: dict = {}
 
     def get_block_color(block_id):
-        if show_annotations:
+        if show_mges_annotations or show_cds_annotations or show_int_rec_annotations:
             return GREY_CORE if bool(bdf.loc[block_id, "core"]) else GREY_ACC
 
         if block_id not in block_colors:
@@ -317,9 +321,46 @@ def plot_junction_pangraph_interactive(
 
         fig.update_layout(legend_title_text="Clusters")
 
+    # overlay Integrase / Recombinase annotations (derived from CDS "product")
+    if show_int_rec_annotations and annotations_gff_path:
+        gdf = read_gff3_cds_products(annotations_gff_path)
+
+        # filter CDS products containing integrase or recombinase (case-insensitive)
+        prod = gdf["product"].fillna("").str.lower()
+        ir = gdf[prod.str.contains("integrase") | prod.str.contains("recombinase")].copy()
+
+        if not ir.empty:
+            legend_added = False
+            for label in y_labels:
+                sub_ir = ir[ir["seqid"] == label]
+                if sub_ir.empty:
+                    continue
+
+                showleg = not legend_added
+                legend_added = True
+
+                fig.add_trace(go.Bar(
+                    x=(sub_ir["end"] - sub_ir["start"]).tolist(),
+                    y=[label] * len(sub_ir),
+                    base=(sub_ir["start"]).tolist(),
+                    orientation="h",
+                    marker=dict(color=_rgba("rgb(166,216,84)", annotation_alpha), line=dict(width=0)),
+                    name="Integrase / Recombinase",
+                    showlegend=showleg,
+                    customdata=list(zip(sub_ir["end"].tolist(), sub_ir["product"].tolist())),
+                    hovertemplate=(
+                        "Integrase / Recombinase"
+                        "<br>%{customdata[1]}"
+                        "<br>start=%{base:d}"
+                        "<br>end=%{customdata[0]:d}"
+                        "<br>length=%{x:d}"
+                        "<extra></extra>"
+                    ),
+                ))
+
     # overlay defense system, prophage, IS annotations
-    if show_annotations and annotations_gff_path:
-        ann = read_gff3_annotations(annotations_gff_path)
+    if show_mges_annotations and mges_gff_path:
+        ann = read_gff3_annotations(mges_gff_path)
 
         DEF_COLOR = "rgb(152,78,163)"  # purple, far from inversion red
         PROPH_COLOR = "rgb(27,158,119)"
@@ -354,18 +395,6 @@ def plot_junction_pangraph_interactive(
             sub = ann[ann["seqid"] == label]
             if sub.empty:
                 continue
-            
-            # add defense system annotations
-            ds = sub[sub["feature"] == "defense_system"]
-            if not ds.empty:
-                _add_anno_bar(
-                    x=(ds["end"] - ds["start"]).tolist(),
-                    y=[label] * len(ds),
-                    base=(ds["start"]).tolist(),
-                    color_rgb=DEF_COLOR,
-                    name="Defense system",
-                    end=ds["end"].tolist(),
-                )
 
             # add prophage annotations
             ph = sub[sub["feature"] == "prophage"]
@@ -377,6 +406,18 @@ def plot_junction_pangraph_interactive(
                     color_rgb=PROPH_COLOR,
                     name="Prophage",
                     end=ph["end"].tolist(),
+                )
+
+            # add defense system annotations
+            ds = sub[sub["feature"] == "defense_system"]
+            if not ds.empty:
+                _add_anno_bar(
+                    x=(ds["end"] - ds["start"]).tolist(),
+                    y=[label] * len(ds),
+                    base=(ds["start"]).tolist(),
+                    color_rgb=DEF_COLOR,
+                    name="Defense system",
+                    end=ds["end"].tolist(),
                 )
 
             # add IS annotations
@@ -394,6 +435,43 @@ def plot_junction_pangraph_interactive(
                         name=name,
                         end=istype_df["end"].tolist(),
                     )
+
+    # overlay gene CDS annotations (product labels)
+    if show_cds_annotations and annotations_gff_path:
+        gdf = read_gff3_cds_products(annotations_gff_path)
+
+        CDS_COLOR = "rgb(240,228,66)"  # orange, distinct from inversion red / IS blue / prophage green / defense purple
+
+        # keep a separate legend guard so "Genes (CDS)" appears once
+        gene_legend_added = False
+
+        for label in y_labels:
+            subg = gdf[gdf["seqid"] == label]
+            if subg.empty:
+                continue
+
+            # show legend only once globally
+            showleg = not gene_legend_added
+            gene_legend_added = True
+
+            fig.add_trace(go.Bar(
+                x=(subg["end"] - subg["start"]).tolist(),
+                y=[label] * len(subg),
+                base=(subg["start"]).tolist(),
+                orientation="h",
+                marker=dict(color=_rgba(CDS_COLOR, cds_annotation_alpha), line=dict(width=0)),
+                name="Coding Sequence (CDS)",
+                showlegend=showleg,
+                customdata=list(zip(subg["end"].tolist(), subg["product"].tolist())),
+                hovertemplate=(
+                    "%{customdata[1]}"
+                    "<br>start=%{base:d}"
+                    "<br>end=%{customdata[0]:d}"
+                    "<br>length=%{x:d}"
+                    "<extra></extra>"
+                ),
+            ))
+
 
     fig.add_trace(go.Scatter(
         x=[None],
@@ -421,7 +499,7 @@ def plot_junction_pangraph_interactive(
             font=dict(size=18, family="Arial", color="black"),
             pad=dict(l=10, t=10),
         ),
-        barmode=("overlay" if (show_annotations and annotations_gff_path) else "stack"), # if annotations are on we want overlay (not stack) to allow them to be semi-transparent on top of blocks
+        barmode=("overlay" if ((show_mges_annotations and mges_gff_path) or (show_cds_annotations and annotations_gff_path)) or (show_int_rec_annotations and annotations_gff_path) else "stack"), # if annotations are on we want overlay (not stack) to allow them to be semi-transparent on top of blocks
         bargap=0.08,
         xaxis=dict(
             title="genomic position (bp)",

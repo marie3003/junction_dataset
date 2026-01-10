@@ -32,7 +32,7 @@ def find_invertible_ids(paths: dict) -> set:
 
     return invertible_ids
 
-def make_deduplicated_paths(pangraph, rare_context_thresh=10) -> dict:
+def make_deduplicated_paths(pangraph, rare_context_thresh=0.1) -> dict:
     """
     Convert a dict[isolate -> Path(Node,...)] into dict[isolate -> Path(DeduplicatedNode, ...)],
     where duplicated blocks get a context = closest non-duplicated, never inverted, less rare than rare_context_thresh block (ID) to the left.
@@ -46,6 +46,7 @@ def make_deduplicated_paths(pangraph, rare_context_thresh=10) -> dict:
 
     blockstats_df = pangraph.to_blockstats_df()
     duplicated_ids = set(blockstats_df.loc[blockstats_df['duplicated'] == True].index)
+    rare_context_thresh = np.floor(rare_context_thresh * len(path_dict))
     rare_ids = set(blockstats_df.loc[blockstats_df['count'] < rare_context_thresh].index)
     invertible_ids = find_invertible_ids(path_dict)
 
@@ -467,31 +468,50 @@ def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, blo
     
     create_block_msas_for_cluster(junction_name, isolate_list, cl, ambiguous_blocks)
     df, pair_dists = summarize_block_msas(junction_name, cl, return_pairwise_dists=True)
+
+    # if all blocks only appear once
+    if df.empty:
+        for block in ambiguous_blocks:
+            pos = block2idx[block]
+            root_states[pos] = {0}
+        return root_states
+
     if verbose:
         display(df)
         plot_block_distance_distribution(pair_dists, [block.id for block in ambiguous_blocks], bins=70, cols=4, figsize=(14, 10), vline=0.01, vline_kwargs={"color": "black", "linestyle": "--"})
 
     for block in ambiguous_blocks:
         pos = block2idx[block]
-        # in the case where there is only one sequence within one blog, we can't know whether it is a gain or loss, in the current logic this is defined as a loss
-        # loss: high sequence similarity leads to the assumption that block used to be present and got lost several times
-        if df.loc[df['block_id'] == block.id, 'avg_pairwise_dist'].item() < individual_gain_thresh:
+
+        row = df.loc[df["block_id"] == block.id, "avg_pairwise_dist"]
+
+        # block not found in df, probably because it only exists once → default to gain (ancestral state 0)
+        if row.empty:
+            root_states[pos] = {0}
+            continue
+
+        # loss: low diversity → block present in ancestor
+        if row.iloc[0] < individual_gain_thresh:
             root_states[pos] = {1}
-        # gain: high sequence diversity suggests several insertions of a block, in this case we would assume that the block hasn't been present in the ancestor
+        # gain: high diversity → block absent in ancestor
         else:
             root_states[pos] = {0}
 
     return root_states
 
-def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, consensus_criterium = 'core_genome_tree', tree_path = "../config/polished_tree.nwk", block_freq_thresh = 0.5, plot_consensus = False, plot_pair_dist = False, plot_snp_dist = False, plot_ambiguities = False):
+def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, consensus_criterium = 'core_genome_tree', tree_path = "../config/polished_tree.nwk", block_freq_thresh = 0.5, plot_consensus = False, plot_annotations = False, plot_pair_dist = False, plot_snp_dist = False, plot_ambiguities = False):
     # create deduplicated paths dict
     pangraph = pp.Pangraph.from_json(f"../results/junction_pangraphs/{junction_name}.json")
     path_dict, block_freq = make_deduplicated_paths(pangraph)
 
     # create tree and do clustering based on core blocks
     blockstats_df = pangraph.to_blockstats_df()
-    core_block_ids = list(blockstats_df[blockstats_df['core']==True].index)
-    build_tree_from_block_list(pangraph, path_dict, core_block_ids, list(path_dict.keys()), f"../results/consensus_analysis/{junction_name}", "core")
+    core_block_ids = set(blockstats_df.loc[blockstats_df["core"] == True].index)
+    _, any_path = next(iter(path_dict.items()))
+    # makes sure that core blocks are also in the order of their appearance within a path
+    core_block_nodes = [node for node in any_path.nodes if node.id in core_block_ids]
+    
+    build_tree_from_block_list(pangraph, path_dict, core_block_nodes, list(path_dict.keys()), f"../results/consensus_analysis/{junction_name}", "core")
     tree_path_core = Path(f"../results/consensus_analysis/{junction_name}/core_blocks_aln.newick")
     cluster_map_core = cluster_tree_by_branch_length(tree_path_core, clustering_bl_thresh)
 
@@ -559,6 +579,27 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
             title = "Junction Block Structure with Core Block Tree Clustering"
         )
         display(fig)
+
+    if plot_annotations:
+        fig = plot_junction_pangraph_interactive(
+            pangraph,
+            show_consensus=True,
+            consensus_paths=consensus_paths_plotting,
+            assignments=assignment_df_plotting,
+            order="tree",
+            cluster_map=cluster_map_core,
+            add_cluster_annotation=False,
+            title = "Junction Block Structure with Core Block Tree Clustering",
+            show_mges_annotations=True,
+            show_int_rec_annotations=True,
+            show_cds_annotations=False,
+            mges_gff_path=f"../results/junction_mges/{junction_name}.gff3",
+            annotations_gff_path=f"../results/junction_annotations/{junction_name}.gff",
+            annotation_alpha=0.7,
+            cds_annotation_alpha=0.3,
+        )
+        display(fig)
+
     if plot_pair_dist:
         core_distances = compute_pairwise_distances(tree_path_core)
         plot_pairwise_distance_hist(core_distances, bins=100, vline=clustering_bl_thresh, vline_kwargs={"color": "black", "linestyle": "--"}, title="Core Blocks Pairwise Distance Distribution")
