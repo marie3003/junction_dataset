@@ -13,7 +13,7 @@ from scipy.spatial.distance import squareform
 import pypangraph as pp
 from Bio import SeqIO
 
-from junction_analysis.helpers import write_isolate_fasta
+from junction_analysis.helpers import write_isolate_fasta, repo_root
 
 
 # create block fasta files
@@ -51,11 +51,13 @@ def create_block_msas_for_cluster(example_junction, isolate_list, cl, ambiguous_
 
     isolate_set = set(isolate_list)
 
+    root = repo_root()
+    results_dir = root / "results"
     if in_fasta_dir is None:
-        in_fasta_dir = Path(f"../results/block_fastas/{example_junction}")
+        in_fasta_dir = results_dir / "block_fastas" / example_junction 
 
     if out_base_dir is None:
-        out_base_dir = Path("../results/block_alignments_cluster")
+        out_base_dir = results_dir / "block_alignments_cluster"
 
     out_parent = Path(out_base_dir) / str(example_junction) / f"cluster_{cl}"
     out_fasta_dir = out_parent / "fastas"
@@ -79,6 +81,7 @@ def create_block_msas_for_cluster(example_junction, isolate_list, cl, ambiguous_
                 records.append(rec)
 
         if len(records) < 2:
+            print("This ambiguous blog only appeared once. Even though we can't know, by default we assume it to be a deletion.")
             continue
 
         out_fa = out_fasta_dir / f"block_{block.id}_sequences_cluster.fa"
@@ -272,7 +275,19 @@ def summarize_block_msas(junction_name, cl=None, save_df=True, return_pairwise_d
             stats = analyze_alignment(p)
             results.append(stats)
 
-    df = pd.DataFrame(results).sort_values("block_id")
+    df = pd.DataFrame(results)
+
+    # if there was no block file found, return empty results and save an empty dataframe
+    if df.empty:
+        df = pd.DataFrame(columns=["block_id", "avg_pairwise_dist"])
+        if save_df:
+            df.to_csv(out_csv, index=False)
+        if return_pairwise_dists:
+            return df, pairwise_dict
+        else:
+            return df
+
+    df = df.sort_values("block_id")
 
     pangraph = pp.Pangraph.from_json(f"../results/junction_pangraphs/{junction_name}.json")
     blockstats_df = pangraph.to_blockstats_df().reset_index()

@@ -13,7 +13,7 @@ import pypangraph as pp
 import junction_analysis.pangraph_utils as pu
 from junction_analysis.plotting import plot_junction_pangraph_interactive, plot_pairwise_distance_hist, plot_snp_pos_distribution, plot_block_distance_distribution
 from junction_analysis.junction_trees import build_tree_from_block_list, cluster_tree_by_branch_length, compute_pairwise_distances
-from junction_analysis.helpers import get_block_length, snp_positions, build_subtree
+from junction_analysis.helpers import get_block_length, snp_positions, build_subtree, repo_root
 from junction_analysis.block_alignment import create_block_msas_for_cluster, summarize_block_msas
 
 
@@ -37,6 +37,7 @@ def make_deduplicated_paths(pangraph, rare_context_thresh=0.1) -> dict:
     Convert a dict[isolate -> Path(Node,...)] into dict[isolate -> Path(DeduplicatedNode, ...)],
     where duplicated blocks get a context = closest non-duplicated, never inverted, less rare than rare_context_thresh block (ID) to the left.
     For non-duplicated blocks, context is set to "".
+    Deduplication is not perfect if there are no suitable context anchors that are seperating to differing block copies because the blocks in between tham are inverted, duplicated or rare.
     @param rare_context_threshold: is a threshold how rare blocks can be to be allowed as context anchors, right now it is hard coded to 10
     Additionally also return deduplicated block count dictionary.
     """
@@ -499,9 +500,15 @@ def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, blo
 
     return root_states
 
-def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, consensus_criterium = 'core_genome_tree', tree_path = "../config/polished_tree.nwk", block_freq_thresh = 0.5, plot_consensus = False, plot_annotations = False, plot_pair_dist = False, plot_snp_dist = False, plot_ambiguities = False):
+def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, consensus_criterium = 'core_genome_tree', tree_path = None, block_freq_thresh = 0.5, plot_consensus = False, plot_annotations = False, plot_pair_dist = False, plot_snp_dist = False, plot_ambiguities = False):
     # create deduplicated paths dict
-    pangraph = pp.Pangraph.from_json(f"../results/junction_pangraphs/{junction_name}.json")
+    root = repo_root()
+    results_dir = root / "results"
+    if tree_path is None:
+        tree_path = str(root / "config" / "polished_tree.nwk")
+
+    pangraph_path = results_dir / "junction_pangraphs" / f"{junction_name}.json"
+    pangraph = pp.Pangraph.from_json(str(pangraph_path))
     path_dict, block_freq = make_deduplicated_paths(pangraph)
 
     # create tree and do clustering based on core blocks
@@ -511,8 +518,9 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
     # makes sure that core blocks are also in the order of their appearance within a path
     core_block_nodes = [node for node in any_path.nodes if node.id in core_block_ids]
     
-    build_tree_from_block_list(pangraph, path_dict, core_block_nodes, list(path_dict.keys()), f"../results/consensus_analysis/{junction_name}", "core")
-    tree_path_core = Path(f"../results/consensus_analysis/{junction_name}/core_blocks_aln.newick")
+    out_dir = results_dir / "consensus_analysis" / junction_name
+    build_tree_from_block_list(pangraph, path_dict, core_block_nodes, list(path_dict.keys()), str(out_dir), "core")
+    tree_path_core = out_dir / "core_blocks_aln.newick"
     cluster_map_core = cluster_tree_by_branch_length(tree_path_core, clustering_bl_thresh)
 
     # Group isolates by cluster
@@ -593,8 +601,8 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
             show_mges_annotations=True,
             show_int_rec_annotations=True,
             show_cds_annotations=False,
-            mges_gff_path=f"../results/junction_mges/{junction_name}.gff3",
-            annotations_gff_path=f"../results/junction_annotations/{junction_name}.gff",
+            mges_gff_path=str(results_dir / "junction_mges" / f"{junction_name}.gff3"),
+            annotations_gff_path=str(results_dir / "junction_annotations" / f"{junction_name}.gff"),
             annotation_alpha=0.7,
             cds_annotation_alpha=0.3,
         )
@@ -607,9 +615,9 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
     if plot_snp_dist:
         example_isolate, example_path = next(iter(path_dict.items()))
         left_core_block_id = example_path.nodes[0].id
-        left_core_block_length = get_block_length(f"../results/block_alignments/{junction_name}/block_{left_core_block_id}_aln.fa")
+        left_core_block_length = get_block_length(str(results_dir / "block_alignments" / junction_name / f"block_{left_core_block_id}_aln.fa"))
 
-        snp_pos = snp_positions(f"../results/consensus_analysis/{junction_name}/core_blocks_aln.fa")
+        snp_pos = snp_positions(str(out_dir / "core_blocks_aln.fa"))
         plot_snp_pos_distribution(snp_pos, left_core_block_length, bins=70, title="SNP Position Distribution in Core Block Alignment")
 
     if consensus_criterium == 'core_genome_tree':

@@ -9,6 +9,22 @@ import os, re
 import numpy as np
 import pandas as pd
 from sklearn.cluster import AgglomerativeClustering
+from pathlib import Path
+
+def repo_root(start: Path | None = None) -> Path:
+    """
+    Walk upwards from `start` (or from this file) until we find the repo root.
+    Repo root is identified by containing: junction_analysis/, results/, data/
+    """
+    if start is None:
+        start = Path(__file__).resolve()
+    start = start.resolve()
+
+    for p in [start] + list(start.parents):
+        if (p / "junction_analysis").is_dir() and (p / "results").is_dir() and (p / "data").is_dir():
+            return p
+
+    raise RuntimeError("Repo root not found (expected junction_analysis/, results/, data/ in a parent dir).")
 
 def get_hierarchical_order(distance_df):
     linkage_matrix = sch.linkage(distance_df, method="ward")
@@ -17,7 +33,8 @@ def get_hierarchical_order(distance_df):
     return order
 
 def get_tree_order():
-    _fname = f"../config/polished_tree.nwk"
+    root = repo_root()
+    _fname = str( root / "config" / "polished_tree.nwk")
     _tree = Phylo.read(_fname, "newick")
     _tree.root_at_midpoint()
     _tree.ladderize()

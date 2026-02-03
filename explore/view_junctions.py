@@ -6,6 +6,11 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    return
+
+
+@app.cell
+def _():
     import marimo as mo
     import pandas as pd
     import seaborn as sns
@@ -31,8 +36,8 @@ def _(pd):
 
 @app.cell
 def _(alt, jdf, mo, np):
-    # _xvar = "nonempty_acc_len"
-    _xvar = "pangenome_len"
+    _xvar = "nonempty_acc_len"
+    #_xvar = "pangenome_len"
     _yvar = "n_categories"
     _cvar = "nonempty_freq"
     _yvar_jiggle = _yvar + "_jiggle"
