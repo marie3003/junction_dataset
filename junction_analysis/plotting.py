@@ -699,7 +699,6 @@ def plot_junction_pangraph_combined(
     return fig, ax
 
 
-
 def plot_junction_pangraph_grouped(
     pan: pp.Pangraph,
     consensus_paths: list,              # list[pu.Path] of DeduplicatedNode (or Node)
@@ -1020,3 +1019,385 @@ def plot_snp_pos_distribution(snp_pos, cutoff, bins=50, title=None):
 
     plt.tight_layout()
     plt.show()
+
+def plot_pangraph_base_for_dash(
+    pan: pp.Pangraph,
+    show_consensus: bool = False,
+    consensus_paths: list = None,
+    assignments: pd.DataFrame = None,
+    order: str = "tree",
+    cluster_map: dict = None,
+    add_cluster_annotation: bool = True,
+    title: str = "",
+    grey_mode: bool = False,
+):
+    """
+    Plots the base block structure of a junction pangraph using Plotly, without annotations.
+    Returns the figure, y_labels, and max_x for potential further processing.
+    """
+    bdf = pan.to_blockstats_df()
+
+    GREY_CORE = "rgb(220,220,220)"
+    GREY_ACC = "rgb(190,190,190)"
+
+    n_core = int(bdf["core"].sum())
+    n_acc = int(len(bdf) - n_core)
+    cgen_acc = iter(sns.color_palette("rainbow", n_acc))
+    cgen_core = iter(sns.color_palette("pastel", n_core))
+    block_colors: dict = {}
+
+    def get_block_color(block_id):
+        if grey_mode:
+            return GREY_CORE if bool(bdf.loc[block_id, "core"]) else GREY_ACC
+
+        if block_id not in block_colors:
+            color = next(cgen_core) if bool(bdf.loc[block_id, "core"]) else next(cgen_acc)
+            if isinstance(color, tuple) and len(color) == 3:
+                color = f"rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})"
+            block_colors[block_id] = color
+        return block_colors[block_id]
+
+    tree_order = get_tree_order() if order == "tree" else None
+    isolates_ordered = tree_order if tree_order else list(pan.paths.keys())
+    fig = go.Figure()
+    y_labels = []
+    y_seen = set()
+    max_x = 0
+
+    def _add_bar(label: str, left: int, width: int, color: str, strand: bool, block_id, block_pos: int):
+        nonlocal max_x
+        max_x = max(max_x, int(left) + int(width))
+        fig.add_bar(
+            x=[width],
+            y=[label],
+            base=[left],
+            orientation="h",
+            marker=dict(color=color, line=dict(color=("black" if strand else "red"), width=1)),
+            customdata=[[left, width, left + width, str(block_id), strand, block_pos]],
+            hovertemplate=(
+                "label: %{y}"
+                "<br>start: %{customdata[0]}"
+                "<br>len: %{customdata[1]}"
+                "<br>end: %{customdata[2]}"
+                "<br>block: %{customdata[3]}"
+                "<br>strand: %{customdata[4]:+, -}"
+                "<br>block position: %{customdata[5]}"
+                "<extra></extra>"
+            ),
+            showlegend=False,
+        )
+
+    def draw_isolate_track(isolate_name: str):
+        if isolate_name not in pan.paths:
+            return
+        p = pan.paths[isolate_name]
+        for block_idx, node_id in enumerate(p.nodes):
+            block, strand, start, end = pan.nodes[node_id][["block_id", "strand", "start", "end"]]
+            _add_bar(
+                label=isolate_name,
+                left=int(start),
+                width=int(end - start),
+                color=get_block_color(block),
+                strand=bool(strand),
+                block_id=block,
+                block_pos=block_idx,
+            )
+        if isolate_name not in y_seen:
+            y_labels.append(isolate_name)
+            y_seen.add(isolate_name)
+
+    def draw_consensus_track(cons_path, label: str):
+        x_left = 0
+        for block_idx, node in enumerate(cons_path):
+            bid = node.id
+            strand = node.strand
+            block_len = int(bdf.loc[bid, "len"])
+            _add_bar(
+                label=label,
+                left=int(x_left),
+                width=block_len,
+                color=get_block_color(bid),
+                strand=bool(strand),
+                block_id=bid,
+                block_pos=block_idx,
+            )
+            x_left += block_len
+        if label not in y_seen:
+            y_labels.append(label)
+            y_seen.add(label)
+
+    if not show_consensus:
+        for iso in isolates_ordered:
+            draw_isolate_track(iso)
+    else:
+        grouped = (
+            assignments.reset_index()
+            .groupby("best_consensus")["index"]
+            .apply(list)
+            .to_dict()
+        )
+        for i, cons_path in enumerate(consensus_paths):
+            cons_label = f"consensus_{i+1}"
+            isolates_for_this = grouped.get(cons_label, [])
+            if tree_order:
+                isolates_for_this = [iso for iso in tree_order if iso in isolates_for_this]
+            for iso in isolates_for_this:
+                draw_isolate_track(iso)
+            draw_consensus_track(cons_path, cons_label)
+        for i, cons_path in enumerate(consensus_paths):
+            cons_label = f"consensus_{i+1}\u200b"
+            draw_consensus_track(cons_path, cons_label)
+
+    tickvals = y_labels
+    ticktext = [f"<b>{y}</b>" if y.startswith("consensus_") else y for y in y_labels]
+
+    # add a star per isolate based on cluster_map
+    if cluster_map and add_cluster_annotation:
+        clusters = sorted(set(cluster_map.values()))
+        palette = px.colors.qualitative.Plotly + px.colors.qualitative.Pastel + px.colors.qualitative.Bold
+        random.shuffle(palette)
+        cluster_color = {cid: palette[i % len(palette)] for i, cid in enumerate(clusters)}
+
+        star_x = -2000
+        xs, ys, cs = [], [], []
+        for iso in y_labels:
+            if iso.startswith("consensus_"):
+                continue
+            if iso in cluster_map:
+                xs.append(star_x)
+                ys.append(iso)
+                cs.append(cluster_color[cluster_map[iso]])
+
+        if xs:
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys, mode="markers",
+                marker=dict(symbol="star", size=14, color=cs),
+                hoverinfo="skip", showlegend=False,
+            ))
+
+        for cid, color in cluster_color.items():
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode="markers",
+                marker=dict(symbol="star", size=14, color=color),
+                name=f"Cluster {cid}",
+                hoverinfo="skip",
+            ))
+
+        fig.update_layout(legend_title_text="Legend")
+
+    fig.add_trace(go.Scatter(
+        x=[None],
+        y=[None],
+        mode="markers",
+        marker=dict(
+            symbol="square",
+            size=12,
+            color="rgba(0,0,0,0)",   # transparent fill
+            line=dict(color="red", width=2),
+        ),
+        name="Inversion",
+        showlegend=True,
+        hoverinfo="skip",
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            x=0.05,
+            y=0.99,
+            xanchor="left",
+            yanchor="top",
+            yref="container",
+            font=dict(size=18, family="Arial", color="black"),
+            pad=dict(l=10, t=10),
+        ),
+        barmode="stack",
+        bargap=0.08,
+        xaxis=dict(
+            title="genomic position (bp)",
+            showgrid=True,
+            gridcolor="rgba(0,0,0,0.2)",
+            range=[-max(1, int(0.05 * max_x)), max_x],
+            zeroline=True,
+        ),
+        yaxis=dict(
+            title="",
+            categoryorder="array",
+            categoryarray=y_labels,
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+        ),
+        margin=dict(l=140, r=20, t=100, b=40),
+        height=max(300, int(len(y_labels) * 22)),
+        template="plotly_white",
+    )
+    return fig, y_labels, max_x
+
+
+def add_annotations_for_dash(
+    fig: go.Figure,
+    y_labels: list,
+    show_mges_annotations: bool = False,
+    show_int_rec_annotations: bool = False,
+    mges_gff_path: str = None,
+    show_cds_annotations: bool = False,
+    annotations_gff_path: str = None,
+    annotation_alpha: float = 0.70,
+    cds_annotation_alpha: float = 0.30,
+):
+    """
+    Adds annotation layers to an existing Plotly figure of a pangraph.
+    """
+    # overlay Integrase / Recombinase annotations (derived from CDS "product")
+    if show_int_rec_annotations and annotations_gff_path:
+        gdf = read_gff3_cds_products(annotations_gff_path)
+
+        # filter CDS products containing integrase or recombinase (case-insensitive)
+        prod = gdf["product"].fillna("").str.lower()
+        ir = gdf[prod.str.contains("integrase") | prod.str.contains("recombinase")].copy()
+
+        if not ir.empty:
+            legend_added = False
+            for label in y_labels:
+                sub_ir = ir[ir["seqid"] == label]
+                if sub_ir.empty:
+                    continue
+
+                showleg = not legend_added
+                legend_added = True
+
+                fig.add_trace(go.Bar(
+                    x=(sub_ir["end"] - sub_ir["start"]).tolist(),
+                    y=[label] * len(sub_ir),
+                    base=(sub_ir["start"]).tolist(),
+                    orientation="h",
+                    marker=dict(color=_rgba("rgb(166,216,84)", annotation_alpha), line=dict(width=0)),
+                    name="Integrase / Recombinase",
+                    showlegend=showleg,
+                    customdata=list(zip(sub_ir["end"].tolist(), sub_ir["product"].tolist())),
+                    hovertemplate=(
+                        "Integrase / Recombinase"
+                        "<br>%{customdata[1]}"
+                        "<br>start=%{base:d}"
+                        "<br>end=%{customdata[0]:d}"
+                        "<br>length=%{x:d}"
+                        "<extra></extra>"
+                    ),
+                ))
+
+    # overlay defense system, prophage, IS annotations
+    if show_mges_annotations and mges_gff_path:
+        ann = read_gff3_annotations(mges_gff_path)
+
+        DEF_COLOR = "rgb(152,78,163)"  # purple, far from inversion red
+        PROPH_COLOR = "rgb(27,158,119)"
+        IS_BASE = (55, 126, 184)
+
+        # stable IS subtype -> color mapping (computed once from whole file)
+        is_types = sorted(ann.loc[ann["feature"] == "IS", "is_subtype"].dropna().unique())
+        is_shades = _shades_from_base_rgb(IS_BASE, max(1, len(is_types)))
+        is_color = {t: is_shades[i] for i, t in enumerate(is_types)}
+
+        legend_seen = set()
+
+        def _add_anno_bar(x, y, base, color_rgb, name, end):
+            showleg = name not in legend_seen
+            if showleg:
+                legend_seen.add(name)
+
+            fig.add_trace(go.Bar(
+                x=x, # width
+                y=y,
+                base=base, # left start
+                orientation="h",
+                marker=dict(color=_rgba(color_rgb, annotation_alpha), line=dict(width=0)),
+                name=name,
+                showlegend=showleg,
+                hovertemplate=f"{name}<br>start=%{{base:d}}<br>end=%{{customdata:d}}<br>length=%{{x:d}}<extra></extra>",
+                customdata=end,
+            ))
+
+        # add annotation bars for every row label (isolates + consensus), currently not done but one could add annotations to the consensus paths in the dataframe or gff3 file to also color the consensus tracks 
+        for label in y_labels:
+            sub = ann[ann["seqid"] == label]
+            if sub.empty:
+                continue
+
+            # add prophage annotations
+            ph = sub[sub["feature"] == "prophage"]
+            if not ph.empty:
+                _add_anno_bar(
+                    x=(ph["end"] - ph["start"]).tolist(),
+                    y=[label] * len(ph),
+                    base=(ph["start"]).tolist(),
+                    color_rgb=PROPH_COLOR,
+                    name="Prophage",
+                    end=ph["end"].tolist(),
+                )
+
+            # add defense system annotations
+            ds = sub[sub["feature"] == "defense_system"]
+            if not ds.empty:
+                _add_anno_bar(
+                    x=(ds["end"] - ds["start"]).tolist(),
+                    y=[label] * len(ds),
+                    base=(ds["start"]).tolist(),
+                    color_rgb=DEF_COLOR,
+                    name="Defense system",
+                    end=ds["end"].tolist(),
+                )
+
+            # add IS annotations
+            isdf = sub[sub["feature"] == "IS"].copy()
+            if not isdf.empty:
+                for type, istype_df in isdf.groupby("is_subtype", dropna=False):
+                    type = type if pd.notna(type) else "IS"
+                    name = f"IS:{type}"
+                    col = is_color.get(type, _rgb_str(*IS_BASE))
+                    _add_anno_bar(
+                        x=(istype_df["end"] - istype_df["start"]).tolist(),
+                        y=[label] * len(istype_df),
+                        base=(istype_df["start"]).tolist(),
+                        color_rgb=col,
+                        name=name,
+                        end=istype_df["end"].tolist(),
+                    )
+
+    # overlay gene CDS annotations (product labels)
+    if show_cds_annotations and annotations_gff_path:
+        gdf = read_gff3_cds_products(annotations_gff_path)
+
+        CDS_COLOR = "rgb(240,228,66)"  # orange, distinct from inversion red / IS blue / prophage green / defense purple
+
+        # keep a separate legend guard so "Genes (CDS)" appears once
+        gene_legend_added = False
+
+        for label in y_labels:
+            subg = gdf[gdf["seqid"] == label]
+            if subg.empty:
+                continue
+
+            # show legend only once globally
+            showleg = not gene_legend_added
+            gene_legend_added = True
+
+            fig.add_trace(go.Bar(
+                x=(subg["end"] - subg["start"]).tolist(),
+                y=[label] * len(subg),
+                base=(subg["start"]).tolist(),
+                orientation="h",
+                marker=dict(color=_rgba(CDS_COLOR, cds_annotation_alpha), line=dict(width=0)),
+                name="Coding Sequence (CDS)",
+                showlegend=showleg,
+                customdata=list(zip(subg["end"].tolist(), subg["product"].tolist())),
+                hovertemplate=(
+                    "%{customdata[1]}"
+                    "<br>start=%{base:d}"
+                    "<br>end=%{customdata[0]:d}"
+                    "<br>length=%{x:d}"
+                    "<extra></extra>"
+                ),
+            ))
+    return fig

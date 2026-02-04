@@ -17,7 +17,7 @@ REPO_ROOT = HERE.parents[1]
 # Make imports work (repo root must be on sys.path so `import junction_analysis` works)
 sys.path.insert(0, str(REPO_ROOT))
 
-from junction_analysis.plotting import plot_junction_pangraph_interactive, _rgb_str, _shades_from_base_rgb, _rgba
+from junction_analysis.plotting import plot_pangraph_base_for_dash, add_annotations_for_dash, _rgb_str, _shades_from_base_rgb, _rgba
 from junction_analysis.consensus import find_consensus_paths_core
 
 import pandas as pd
@@ -99,7 +99,6 @@ def make_junction_dash_app(
     consensus_paths_plotting,
     assignment_df_plotting,
     cluster_map_core,
-    junction_name: str,
     mges_gff_path: str,
     annotations_gff_path: str,
     order: str = "tree",
@@ -107,13 +106,11 @@ def make_junction_dash_app(
     initial_selection=("mges",),  # e.g. ("mges","intrec","cds") or ()
 ):
     """
-    Creates a Dash app using your original plot_junction_pangraph_interactive().
-
-    NOTE: We build the base fig with all annotations present so the UI can toggle them.
+    Creates a Dash app showing the pangraph with annotation toggles.
     """
-    # Build a base figure with ALL annotation traces created
-    base_fig = plot_junction_pangraph_interactive(
-        pan,
+    # 1. Build a base figure with colored blocks (no annotations yet)
+    base_fig, y_labels, max_x = plot_pangraph_base_for_dash(
+        pan=pan,
         show_consensus=True,
         consensus_paths=consensus_paths_plotting,
         assignments=assignment_df_plotting,
@@ -121,6 +118,13 @@ def make_junction_dash_app(
         cluster_map=cluster_map_core,
         add_cluster_annotation=True,
         title=title,
+        grey_mode=False,  # Start with colored blocks
+    )
+
+    # 2. Add all annotation traces to the figure (they will be hidden by default)
+    base_fig = add_annotations_for_dash(
+        fig=base_fig,
+        y_labels=y_labels,
         show_mges_annotations=True,
         show_int_rec_annotations=True,
         show_cds_annotations=True,
@@ -129,6 +133,7 @@ def make_junction_dash_app(
         annotation_alpha=0.70,
         cds_annotation_alpha=0.30,
     )
+
     base_fig.update_layout(
         uirevision="junction-viewer",
         autosize=False,
@@ -159,7 +164,6 @@ def make_junction_dash_app(
                         persistence=True,              # CHANGED: added persistence
                         persistence_type="memory",     # CHANGED: added persistence_type
                     ),
-                    html.Div("(any ON → grey blocks)", style={"color": "#555"}),
                 ],
             ),
             dcc.Graph(id="graph", figure=base_fig),
@@ -199,14 +203,10 @@ def make_junction_dash_app(
     return app
 
 
-# -----------------------
-# Example usage
-# -----------------------
 if __name__ == "__main__":
-    # You should already have these variables in scope from your analysis code:
-    # pangraph, consensus_paths_plotting, assignment_df_plotting, cluster_map_core, junction_name
-    # and paths:
-    junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
+
+    #junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
+    junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
 
     pangraph_path = REPO_ROOT / "results" / "junction_pangraphs" / f"{junction_name}.json"
     pangraph = pp.Pangraph.from_json(str(pangraph_path))
@@ -231,11 +231,10 @@ if __name__ == "__main__":
         consensus_paths_plotting=consensus_paths_plotting,
         assignment_df_plotting=assignment_df_plotting,
         cluster_map_core=cluster_map_core,
-        junction_name=junction_name,
         mges_gff_path=str(mges_gff_path),
         annotations_gff_path=str(annotations_gff_path),
         order="tree",
-        title="Junction Block Structure (Dash)",
+        title=f"Junction Block Structure ({junction_name})",
         initial_selection=("mges",),  # change to () to start with no annotations
     )
 
