@@ -34,8 +34,10 @@ def _trace_groups_from_fig(fig):
       - mges: bar traces named Prophage / Defense system / IS:*
       - intrec: bar traces named 'Integrase / Recombinase'
       - cds: bar traces named 'Coding Sequence (CDS)'
+      - insertions: bar traces named 'Insertion'
+      - deletions: scatter traces named 'Deletion'
     """
-    groups = {"blocks": [], "mges": [], "intrec": [], "cds": []}
+    groups = {"blocks": [], "mges": [], "intrec": [], "cds": [], "insertions": [], "deletions": []}
 
     for i, tr in enumerate(fig.data):
         ttype = getattr(tr, "type", None)
@@ -44,8 +46,8 @@ def _trace_groups_from_fig(fig):
         hover = getattr(tr, "hovertemplate", "") or ""
         cd = getattr(tr, "customdata", None)
 
-        # block traces: your _add_bar sets hovertemplate with "<br>block:" and customdata includes block_id at index 3
-        if ttype == "bar" and ("<br>block:" in hover) and (cd is not None) and len(cd) > 0 and len(cd[0]) >= 4:
+        # block traces: your _add_bar sets hovertemplate with "<br>Block = " and customdata includes block_id at index 3
+        if ttype == "bar" and ("<br>Block = " in hover) and (cd is not None) and len(cd) > 0 and len(cd[0]) >= 4:
             groups["blocks"].append(i)
             continue
 
@@ -56,6 +58,10 @@ def _trace_groups_from_fig(fig):
             groups["cds"].append(i)
         elif name in ("Prophage", "Defense system") or name.startswith("IS:"):
             groups["mges"].append(i)
+        elif name == "Insertion":
+            groups["insertions"].append(i)
+        elif name == "Deletion":
+            groups["deletions"].append(i)
 
     return groups
 
@@ -103,13 +109,16 @@ def make_junction_dash_app(
     annotations_gff_path: str,
     order: str = "tree",
     title: str = "Junction viewer",
-    initial_selection=("mges",),  # e.g. ("mges","intrec","cds") or ()
+    initial_selection=("mges",),  # e.g. ("mges","intrec","cds","indels") or ()
+    show_indels: bool = False,
+    indels_base_path: str = None,
+    junction_name: str = None,
 ):
     """
     Creates a Dash app showing the pangraph with annotation toggles.
     """
     # 1. Build a base figure with colored blocks (no annotations yet)
-    base_fig, y_labels, max_x = plot_pangraph_base_for_dash(
+    base_fig, y_labels, max_x, inversion_rects = plot_pangraph_base_for_dash(
         pan=pan,
         show_consensus=True,
         consensus_paths=consensus_paths_plotting,
@@ -132,6 +141,11 @@ def make_junction_dash_app(
         annotations_gff_path=annotations_gff_path,
         annotation_alpha=0.70,
         cds_annotation_alpha=0.30,
+        show_indels=show_indels,
+        indels_base_path=indels_base_path,
+        junction_name=junction_name,
+        consensus_paths=consensus_paths_plotting,
+        inversion_rects=inversion_rects,
     )
 
     base_fig.update_layout(
@@ -143,6 +157,17 @@ def make_junction_dash_app(
     )
 
     groups, block_colors_colored, block_colors_grey = _compute_block_colors_for_figure(base_fig, pan)
+
+    # Store original hover templates for blocks to be able to restore them
+    original_hovertemplates = [base_fig.data[tidx].hovertemplate for tidx in groups["blocks"]]
+
+    # Store original hover templates for annotations
+    anno_indices = groups["mges"] + groups["intrec"] + groups["cds"]
+    original_anno_hovertemplates = {tidx: base_fig.data[tidx].hovertemplate for tidx in anno_indices}
+
+    # Store original hover templates for indels
+    indel_indices = groups["insertions"] + groups["deletions"]
+    original_indel_hovertemplates = {tidx: base_fig.data[tidx].hovertemplate for tidx in indel_indices}
 
     app = Dash(__name__)
     app.layout = html.Div(
@@ -158,11 +183,25 @@ def make_junction_dash_app(
                             {"label": "MGEs", "value": "mges"},
                             {"label": "Integrase/Recombinase", "value": "intrec"},
                             {"label": "CDS", "value": "cds"},
+                            {"label": "Insertions/Deletions", "value": "indels", "disabled": not show_indels},
                         ],
                         value=list(initial_selection),
                         inline=True,
-                        persistence=True,              # CHANGED: added persistence
-                        persistence_type="memory",     # CHANGED: added persistence_type
+                        persistence=True,
+                        persistence_type="memory",
+                    ),
+                    html.Div("Hover options:", style={"fontWeight": "bold", "marginLeft": "20px"}),
+                    dcc.Checklist(
+                        id="hover-toggle",
+                        options=[
+                            {"label": "Disable block hover", "value": "disable_block_hover"},
+                            {"label": "Disable annotation hover", "value": "disable_anno_hover"},
+                            {"label": "Disable indel hover", "value": "disable_indel_hover"},
+                        ],
+                        value=[],
+                        inline=True,
+                        persistence=True,
+                        persistence_type="memory",
                     ),
                 ],
             ),
@@ -173,11 +212,14 @@ def make_junction_dash_app(
     @app.callback(
         Output("graph", "figure"),
         Input("anno-toggle", "value"),
+        Input("hover-toggle", "value"),
     )
-    def update_figure(selected):
-        # CHANGED: use Patch instead of deepcopy(base_fig)
-        selected = set(selected or [])
-        any_on = len(selected) > 0
+    def update_figure(selected_annos, selected_options):
+        selected_annos = set(selected_annos or [])
+        selected_options = set(selected_options or [])
+        any_on = len(selected_annos) > 0
+        # Only turn blocks grey for non-indel annotations
+        non_indel_annos_on = bool(selected_annos - {"indels"})
 
         patch = Patch()
 
@@ -186,16 +228,49 @@ def make_junction_dash_app(
             for i in idxs:
                 patch["data"][i]["visible"] = bool(on)
 
-        _set_visible(groups["mges"], "mges" in selected)
-        _set_visible(groups["intrec"], "intrec" in selected)
-        _set_visible(groups["cds"], "cds" in selected)
+        _set_visible(groups["mges"], "mges" in selected_annos)
+        _set_visible(groups["intrec"], "intrec" in selected_annos)
+        _set_visible(groups["cds"], "cds" in selected_annos)
+        _set_visible(groups["insertions"], "indels" in selected_annos)
+        _set_visible(groups["deletions"], "indels" in selected_annos)
 
-        # 2) Enforce block colors (grey if any annotation on)
-        colors = block_colors_grey if any_on else block_colors_colored
+        # 2) Enforce block colors (grey only if non-indel annotations are on)
+        colors = block_colors_grey if non_indel_annos_on else block_colors_colored
         for j, tidx in enumerate(groups["blocks"]):
             patch["data"][tidx]["marker"]["color"] = colors[j]
 
-        # 3) barmode: overlay when annotations are on; stack otherwise
+        # 3) Toggle block hover information
+        disable_block_hover = "disable_block_hover" in selected_options
+        if disable_block_hover:
+            for tidx in groups["blocks"]:
+                patch["data"][tidx]["hoverinfo"] = "skip"
+                patch["data"][tidx]["hovertemplate"] = None
+        else:
+            for i, tidx in enumerate(groups["blocks"]):
+                patch["data"][tidx]["hoverinfo"] = "all"
+                patch["data"][tidx]["hovertemplate"] = original_hovertemplates[i]
+
+        # 4) Toggle annotation hover information
+        disable_anno_hover = "disable_anno_hover" in selected_options
+        for tidx in anno_indices:
+            if disable_anno_hover:
+                patch["data"][tidx]["hoverinfo"] = "skip"
+                patch["data"][tidx]["hovertemplate"] = None
+            else:
+                patch["data"][tidx]["hoverinfo"] = "all"
+                patch["data"][tidx]["hovertemplate"] = original_anno_hovertemplates[tidx]
+
+        # 5) Toggle indel hover information
+        disable_indel_hover = "disable_indel_hover" in selected_options
+        for tidx in indel_indices:
+            if disable_indel_hover:
+                patch["data"][tidx]["hoverinfo"] = "skip"
+                patch["data"][tidx]["hovertemplate"] = None
+            else:
+                patch["data"][tidx]["hoverinfo"] = "all"
+                patch["data"][tidx]["hovertemplate"] = original_indel_hovertemplates[tidx]
+
+        # 6) barmode: overlay when annotations are on; stack otherwise
         patch["layout"]["barmode"] = "overlay" if any_on else "stack"
 
         return patch
@@ -205,8 +280,8 @@ def make_junction_dash_app(
 
 if __name__ == "__main__":
 
-    #junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
-    junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
+    junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
+    #junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
 
     pangraph_path = REPO_ROOT / "results" / "junction_pangraphs" / f"{junction_name}.json"
     pangraph = pp.Pangraph.from_json(str(pangraph_path))
@@ -214,6 +289,8 @@ if __name__ == "__main__":
     mges_gff_path = REPO_ROOT / "results" / "junction_mges" / f"{junction_name}.gff3"
     annotations_gff_path = REPO_ROOT / "results" / "junction_annotations" / f"{junction_name}.gff"
     tree_path = REPO_ROOT / "config" / "polished_tree.nwk"
+    in_del_path = REPO_ROOT / "results" / "atb_lookup" 
+
     cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unqiue = find_consensus_paths_core(
         junction_name,
         plot_consensus=False,
@@ -236,6 +313,9 @@ if __name__ == "__main__":
         order="tree",
         title=f"Junction Block Structure ({junction_name})",
         initial_selection=("mges",),  # change to () to start with no annotations
+        indels_base_path=str(in_del_path),
+        show_indels=True,
+        junction_name=junction_name,
     )
 
     app.run(debug=False)  # CHANGED: turn off debug for normal use

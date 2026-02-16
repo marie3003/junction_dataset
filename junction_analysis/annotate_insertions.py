@@ -87,31 +87,36 @@ def get_insertions_deletions(deduplicated_paths, consensus_path):
         # --- Find deletions (strand-aware splitting) ---
         current_deletion = []
         del_strand = None
-        path_nodes_set = set(path.nodes)
+        last_existing_isolate_node = None
+        path_node_lookup = {n: n for n in path.nodes}
 
         def flush_del():
-            nonlocal current_deletion, del_strand
+            nonlocal current_deletion, del_strand, last_existing_isolate_node
             if current_deletion:
-                deletions.setdefault(isolate, []).append(pu.Path(current_deletion))
+                deletions.setdefault(isolate, []).append({
+                    "path": pu.Path(current_deletion),
+                    "left_nid": last_existing_isolate_node.nid if last_existing_isolate_node else None,})
                 current_deletion = []
             del_strand = None
 
-        for node in consensus_path.nodes:
-            if node not in path_nodes_set:
+        for cnode in consensus_path.nodes:
+            isolate_node = path_node_lookup.get(cnode)
+            
+            if isolate_node is None:
                 # node is part of a deletion region
                 if del_strand is None:
-                    del_strand = node.strand
-                    current_deletion.append(node)
-                elif node.strand == del_strand:
-                    current_deletion.append(node)
+                    del_strand = cnode.strand
+                    current_deletion.append(cnode)
+                elif cnode.strand == del_strand:
+                    current_deletion.append(cnode)
                 else:
                     # strand changed inside the deletion → split
                     flush_del()
-                    del_strand = node.strand
-                    current_deletion.append(node)
+                    del_strand = cnode.strand
+                    current_deletion.append(cnode)
             else:
-                # back on a node that exists in isolate path → end deletion block
                 flush_del()
+                last_existing_isolate_node = isolate_node # should always be set because paths start with core block
 
         # trailing deletion even though it should technically not happen
         flush_del()
@@ -136,22 +141,58 @@ def write_segment_fasta(example_junction, isolate_name, segment_name, consensus,
     output_path = f"../results/atb_lookup/insertions/{example_junction}/consensus{consensus}/{isolate_name}_{segment_name}.fasta"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     SeqIO.write(record, output_path, "fasta")
+    return output_path
 
-def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1):
+def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1, save_df = False):
     """
     retrieve sequence of insertion from isolate's block
     insertion sequence should either be all inverted or all non-inverted, otherwise split in two
     for inverted sequences write the last block first and then go to the front (result will be the correct blocks just the other way around)
     """
+    results = []
+
+    out_dir = f"../results/atb_lookup/insertions/{example_junction}/consensus{consensus}"
+    os.makedirs(out_dir, exist_ok=True)
+
     for isolate, inserted_paths in insertions.items():
         for idx, inserted_path in enumerate(inserted_paths):
             seq = ""
+            start_pos = pangraph.nodes[inserted_path.nodes[0].nid].start
+            end_pos = pangraph.nodes[inserted_path.nodes[-1].nid].end
+
             # switch block order if all - strand
             if inserted_path.nodes[0].strand == False:
                 inserted_path.nodes.reverse()
             for block in inserted_path.nodes:
                 seq = seq + get_isolate_sequence(pangraph, block.id, block.nid)
-            write_segment_fasta(example_junction, isolate, f"segment_{idx}", consensus, seq, inserted_path)
+            fasta_path = write_segment_fasta(example_junction, isolate, f"segment_{idx}", consensus, seq, inserted_path)
+
+            results.append(
+                {
+                    "junction_name": example_junction,
+                    "consensus": f"consensus_{consensus}",
+                    "genome_name": isolate,
+                    "path": str(inserted_path),
+                    "insertion": f"segment_{idx}",
+                    "fasta_path": fasta_path,
+                    "length": len(seq),
+                    "strand": "+" if inserted_path.nodes[0].strand else "-",
+                    "start_pos": start_pos,
+                    "end_pos": end_pos,
+                }
+            )
+
+    if not results:
+        print(f"No insertions found for consensus_{consensus}, nothing saved.")
+        return None
+
+    insertions_df = pd.DataFrame(results)
+
+    if save_df:
+        insertions_df.to_csv(os.path.join(out_dir, "insertions_summary.csv"), index=False)
+
+    return insertions_df
+
 
 def print_insertions_deletions(insertions, deletions):
     print("Insertions:")
@@ -417,8 +458,10 @@ def summarize_deletions_consensus(
     seen_paths: dict[Path, str] = {}
 
     if rerun_alignment:
-        for iso, paths in deletions.items():
-            for idx, path in enumerate(paths):
+        for iso, entries in deletions.items():
+            for idx, entry in enumerate(entries):
+                path = entry["path"]
+                left_nid = entry["left_nid"]
                 file_prefix = f"{iso}_deletion{idx}"
 
                 if path in seen_paths:
@@ -456,8 +499,10 @@ def summarize_deletions_consensus(
 
     # --- collect consensus sequences ---
     results = []
-    for iso, paths in deletions.items():
-        for idx, path in enumerate(paths):
+    for iso, entries in deletions.items():
+        for idx, entry in enumerate(entries):
+            path = entry["path"]
+            left_nid = entry["left_nid"]
             aln_path = os.path.join(out_dir, f"{iso}_deletion{idx}_blocks_aln.fa")
             if not os.path.exists(aln_path):
                 print(f"Warning: alignment file not found, skipping: {aln_path}")
@@ -473,6 +518,8 @@ def summarize_deletions_consensus(
                     "deletion": f"deletion{idx}",
                     "consensus_sequence": str(consensus_seq),
                     "length": len(consensus_seq),
+                    "position": pangraph.nodes[left_nid].end if left_nid is not None else None,
+                    "strand": "+" if path.nodes[0].strand else "-",
                 }
             )
 
@@ -519,3 +566,39 @@ def load_all_deletions_summaries(parent_dir, junction_name, save_df=False):
         complete_df.to_csv(os.path.join(base_dir, "all_deletions_summary.csv"), index=False)
 
     return complete_df
+
+def load_all_insertions_summaries(parent_dir, junction_name, save_df=False):
+    """
+    Read and combine all insertions_summary.csv files from
+    {parent_dir}/{junction_name}/consensus*/insertions_summary.csv
+
+    Returns
+    -------
+    pd.DataFrame
+        One long DataFrame with all insertions combined.
+    """
+    base_dir = os.path.join(parent_dir, junction_name)
+    all_dfs = []
+
+    for subdir in sorted(os.listdir(base_dir)):
+        if not subdir.startswith("consensus"):
+            continue
+
+        csv_path = os.path.join(base_dir, subdir, "insertions_summary.csv")
+        if os.path.isfile(csv_path):
+            df = pd.read_csv(csv_path)
+            all_dfs.append(df)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    complete_df = pd.concat(all_dfs, ignore_index=True)
+
+    if save_df:
+        complete_df.to_csv(
+            os.path.join(base_dir, "all_insertions_summary.csv"),
+            index=False,
+        )
+
+    return complete_df
+

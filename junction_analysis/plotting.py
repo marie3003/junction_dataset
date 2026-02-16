@@ -1,6 +1,7 @@
 import numpy as np
 import math
 import random
+import os
 
 import plotly.graph_objects as go
 import plotly.express as px
@@ -149,6 +150,9 @@ def plot_junction_pangraph_interactive(
     annotations_gff_path: str = None,
     annotation_alpha: float = 0.70,   # transparency for annotations
     cds_annotation_alpha: float = 0.30,  # transparency for CDS annotations
+    show_indels: bool = False,
+    indels_base_path: str = None,  # base path (e.g., results/atb_lookup) containing insertions/ and deletions/ subfolders
+    junction_name: str = None,  # junction name for path construction (e.g., CIRMBUYJFK_f__CWCCKOQCWZ_r)
 ):
     """
     Plots the block structure of a junction pangraph using Plotly.
@@ -157,7 +161,8 @@ def plot_junction_pangraph_interactive(
         2) Plot isolates grouped by consensus paths (show_consensus=True, consensus_paths provided, assignments provided)
         3) Plot isolates grouped by consensus paths with cluster annotations that don't necessarily have to match the consensus assignments (add_cluster_annotations = True, cluster_map provided)
         4) Plot all isolates with prophage, defense_system, IS annotations. This works on top of adding consensus assignments and clustering or without (show_annotations=True, annotations_gff_path provided)
-    
+        5) Plot insertions and deletions on top of the block structure (show_indels=True, indels_path provided). Only works when consensus paths are defined.
+
     :param pan: pp.Pangraph, Pangraph object to plot
     :param show_consensus: bool, whether to show consensus paths
     :param consensus_paths: list of consensus paths to plot
@@ -169,6 +174,9 @@ def plot_junction_pangraph_interactive(
     :param show_annotations: bool, whether to show prophage, defense_system, IS annotations
     :param annotations_gff_path: str, path to GFF file with annotations
     :param annotation_alpha: float, transparency for annotations
+    :param show_indels: bool, whether to show insertions and deletions
+    :param indels_base_path: str, base path (e.g., results/atb_lookup) containing insertions/ and deletions/ subfolders
+    :param junction_name: str, junction name for path construction (e.g., CIRMBUYJFK_f__CWCCKOQCWZ_r)
     """
     bdf = pan.to_blockstats_df()
 
@@ -182,6 +190,7 @@ def plot_junction_pangraph_interactive(
     block_colors: dict = {}
 
     def get_block_color(block_id):
+        # Only turn blocks grey for annotation overlays (not for indels alone)
         if show_mges_annotations or show_cds_annotations or show_int_rec_annotations:
             return GREY_CORE if bool(bdf.loc[block_id, "core"]) else GREY_ACC
 
@@ -198,10 +207,13 @@ def plot_junction_pangraph_interactive(
     y_labels = []
     y_seen = set()
     max_x = 0
+    inversion_rects = []  # collect (label, left, width) for inverted blocks
 
     def _add_bar(label: str, left: int, width: int, color: str, strand: bool, block_id, block_pos: int):
         nonlocal max_x
         max_x = max(max_x, int(left) + int(width))
+        if not strand:
+            inversion_rects.append((label, int(left), int(width)))
         fig.add_bar(
             x=[width],
             y=[label],
@@ -210,13 +222,13 @@ def plot_junction_pangraph_interactive(
             marker=dict(color=color, line=dict(color=("black" if strand else "red"), width=1)),
             customdata=[[left, width, left + width, str(block_id), strand, block_pos]],
             hovertemplate=(
-                "label: %{y}"
-                "<br>start: %{customdata[0]}"
-                "<br>len: %{customdata[1]}"
-                "<br>end: %{customdata[2]}"
-                "<br>block: %{customdata[3]}"
-                "<br>strand: %{customdata[4]:+, -}"
-                "<br>block position: %{customdata[5]}"
+                "Label = %{y}"
+                "<br>Start = %{customdata[0]}"
+                "<br>Length = %{customdata[1]}"
+                "<br>End = %{customdata[2]}"
+                "<br>Block = %{customdata[3]}"
+                "<br>Strand = %{customdata[4]:+, -}"
+                "<br>Block position = %{customdata[5]}"
                 "<extra></extra>"
             ),
             showlegend=False,
@@ -349,11 +361,11 @@ def plot_junction_pangraph_interactive(
                     showlegend=showleg,
                     customdata=list(zip(sub_ir["end"].tolist(), sub_ir["product"].tolist())),
                     hovertemplate=(
-                        "Integrase / Recombinase"
+                        "<b>Integrase / Recombinase</b>"
                         "<br>%{customdata[1]}"
-                        "<br>start=%{base:d}"
-                        "<br>end=%{customdata[0]:d}"
-                        "<br>length=%{x:d}"
+                        "<br>Start = %{base:d}"
+                        "<br>End = %{customdata[0]:d}"
+                        "<br>Length = %{x:d}"
                         "<extra></extra>"
                     ),
                 ))
@@ -386,7 +398,7 @@ def plot_junction_pangraph_interactive(
                 marker=dict(color=_rgba(color_rgb, annotation_alpha), line=dict(width=0)),
                 name=name,
                 showlegend=showleg,
-                hovertemplate=f"{name}<br>start=%{{base:d}}<br>end=%{{customdata:d}}<br>length=%{{x:d}}<extra></extra>",
+                hovertemplate=f"<b>{name}</b><br>Start = %{{base:d}}<br>End = %{{customdata:d}}<br>Length = %{{x:d}}<extra></extra>",
                 customdata=end,
             ))
 
@@ -464,14 +476,138 @@ def plot_junction_pangraph_interactive(
                 showlegend=showleg,
                 customdata=list(zip(subg["end"].tolist(), subg["product"].tolist())),
                 hovertemplate=(
-                    "%{customdata[1]}"
-                    "<br>start=%{base:d}"
-                    "<br>end=%{customdata[0]:d}"
-                    "<br>length=%{x:d}"
+                    "<b>CDS:</b> %{customdata[1]}"
+                    "<br>Start = %{base:d}"
+                    "<br>End = %{customdata[0]:d}"
+                    "<br>Length = %{x:d}"
                     "<extra></extra>"
                 ),
             ))
 
+    # overlay insertions and deletions (only when consensus paths are defined)
+    if show_indels and indels_base_path and junction_name and show_consensus and consensus_paths:
+
+        DELETION_COLOR = "rgb(139,0,0)"  # dark red for deletions
+
+        insertion_legend_added = False
+        deletion_legend_added = False
+
+        for i, cons_path in enumerate(consensus_paths):
+            cons_label = f"consensus_{i+1}"
+
+            # Load insertions for this consensus
+            # Path: <indels_base_path>/insertions/<junction_name>/consensus<N>/insertions_summary.csv
+            insertions_file = os.path.join(indels_base_path, "insertions", junction_name, f"consensus{i+1}", "insertions_summary.csv")
+            if os.path.exists(insertions_file):
+                ins_df = pd.read_csv(insertions_file)
+
+                for label in y_labels:
+                    # Match genome_name to isolate label (for isolates) or consensus label
+                    sub_ins = ins_df[ins_df["genome_name"] == label]
+                    if sub_ins.empty:
+                        continue
+
+                    showleg = not insertion_legend_added
+                    insertion_legend_added = True
+
+                    # Extract segment numbers from insertion names (e.g., "segment_0" -> "0")
+                    segment_nums = [s.split("_")[-1] if "_" in s else s.replace("segment", "") for s in sub_ins["insertion"].tolist()]
+
+                    fig.add_trace(go.Bar(
+                        x=(sub_ins["end_pos"] - sub_ins["start_pos"]).tolist(),
+                        y=[label] * len(sub_ins),
+                        base=(sub_ins["start_pos"]).tolist(),
+                        orientation="h",
+                        marker=dict(
+                            color="rgba(0,0,0,0)",  # transparent background
+                            pattern=dict(
+                                shape="/",  # diagonal lines
+                                fgcolor="black",
+                                size=6,
+                                solidity=0.3,
+                            ),
+                            line=dict(width=1, color="black"),
+                        ),
+                        name="Insertion",
+                        showlegend=showleg,
+                        customdata=list(zip(
+                            sub_ins["end_pos"].tolist(),
+                            sub_ins["length"].tolist(),
+                            segment_nums,
+                            sub_ins["strand"].tolist(),
+                        )),
+                        hovertemplate=(
+                            "<b>Insertion (#%{customdata[2]})</b>"
+                            "<br>Start = %{base:d}"
+                            "<br>End = %{customdata[0]:d}"
+                            "<br>Length = %{customdata[1]:d}"
+                            "<br>Strand = %{customdata[3]}"
+                            "<extra></extra>"
+                        ),
+                    ))
+
+        # Load deletions (all deletions are in a single file per junction)
+        # Path: <indels_base_path>/deletions/<junction_name>/all_deletions_summary.csv
+        deletions_file = os.path.join(indels_base_path, "deletions", junction_name, "all_deletions_summary.csv")
+        if os.path.exists(deletions_file):
+            del_df = pd.read_csv(deletions_file)
+
+            # Collect all deletion markers to plot them together
+            del_xs = []
+            del_ys = []
+            del_customdata = []
+
+            for label in y_labels:
+                # Match genome_name to isolate label
+                sub_del = del_df[del_df["genome_name"] == label]
+                if sub_del.empty:
+                    continue
+
+                # Group deletions by position to handle split deletions (inversions)
+                # Multiple deletions at same position will be overlaid
+                for _, row in sub_del.iterrows():
+                    del_xs.append(row["position"])
+                    del_ys.append(label)
+                    # Extract deletion number from name (e.g., "deletion0" -> "0")
+                    del_name = row["deletion"]
+                    del_num = del_name.replace("deletion", "") if "deletion" in del_name else del_name
+                    del_customdata.append([row["position"], row["length"], del_num, row["consensus"], row.get("strand", "")])
+
+            if del_xs:
+                # Draw deletions as markers with a vertical line marker symbol
+                fig.add_trace(go.Scatter(
+                    x=del_xs,
+                    y=del_ys,
+                    mode="markers",
+                    marker=dict(
+                        symbol="line-ns",  # vertical line marker
+                        size=20,  # height of the line
+                        line=dict(color=_rgba(DELETION_COLOR, annotation_alpha), width=4),
+                        color=_rgba(DELETION_COLOR, annotation_alpha),
+                    ),
+                    name="Deletion",
+                    showlegend=True,
+                    customdata=del_customdata,
+                    hovertemplate=(
+                        "<b>Deletion (#%{customdata[2]})</b>"
+                        "<br>Position = %{customdata[0]:d}"
+                        "<br>Length = %{customdata[1]:d}"
+                        "<br>Strand = %{customdata[4]}"
+                        "<extra></extra>"
+                    ),
+                ))
+
+    # Redraw inversion borders on top of overlays only when indels are shown
+    if inversion_rects and show_indels and indels_base_path:
+        fig.add_bar(
+            x=[w for _, _, w in inversion_rects],
+            y=[lbl for lbl, _, _ in inversion_rects],
+            base=[l for _, l, _ in inversion_rects],
+            orientation="h",
+            marker=dict(color="rgba(0,0,0,0)", line=dict(color="red", width=1)),
+            hoverinfo="skip",
+            showlegend=False,
+        )
 
     fig.add_trace(go.Scatter(
         x=[None],
@@ -499,7 +635,7 @@ def plot_junction_pangraph_interactive(
             font=dict(size=18, family="Arial", color="black"),
             pad=dict(l=10, t=10),
         ),
-        barmode=("overlay" if ((show_mges_annotations and mges_gff_path) or (show_cds_annotations and annotations_gff_path)) or (show_int_rec_annotations and annotations_gff_path) else "stack"), # if annotations are on we want overlay (not stack) to allow them to be semi-transparent on top of blocks
+        barmode=("overlay" if ((show_mges_annotations and mges_gff_path) or (show_cds_annotations and annotations_gff_path) or (show_int_rec_annotations and annotations_gff_path) or (show_indels and indels_base_path)) else "stack"), # if annotations or indels are on we want overlay (not stack) to allow them to be semi-transparent on top of blocks
         bargap=0.08,
         xaxis=dict(
             title="genomic position (bp)",
@@ -1063,10 +1199,13 @@ def plot_pangraph_base_for_dash(
     y_labels = []
     y_seen = set()
     max_x = 0
+    inversion_rects = []  # collect (label, left, width) for inverted blocks
 
     def _add_bar(label: str, left: int, width: int, color: str, strand: bool, block_id, block_pos: int):
         nonlocal max_x
         max_x = max(max_x, int(left) + int(width))
+        if not strand:
+            inversion_rects.append((label, int(left), int(width)))
         fig.add_bar(
             x=[width],
             y=[label],
@@ -1075,13 +1214,13 @@ def plot_pangraph_base_for_dash(
             marker=dict(color=color, line=dict(color=("black" if strand else "red"), width=1)),
             customdata=[[left, width, left + width, str(block_id), strand, block_pos]],
             hovertemplate=(
-                "label: %{y}"
-                "<br>start: %{customdata[0]}"
-                "<br>len: %{customdata[1]}"
-                "<br>end: %{customdata[2]}"
-                "<br>block: %{customdata[3]}"
-                "<br>strand: %{customdata[4]:+, -}"
-                "<br>block position: %{customdata[5]}"
+                "Label = %{y}"
+                "<br>Start = %{customdata[0]}"
+                "<br>Length = %{customdata[1]}"
+                "<br>End = %{customdata[2]}"
+                "<br>Block = %{customdata[3]}"
+                "<br>Strand = %{customdata[4]:+, -}"
+                "<br>Block position = %{customdata[5]}"
                 "<extra></extra>"
             ),
             showlegend=False,
@@ -1233,7 +1372,7 @@ def plot_pangraph_base_for_dash(
         height=max(300, int(len(y_labels) * 22)),
         template="plotly_white",
     )
-    return fig, y_labels, max_x
+    return fig, y_labels, max_x, inversion_rects
 
 
 def add_annotations_for_dash(
@@ -1246,6 +1385,11 @@ def add_annotations_for_dash(
     annotations_gff_path: str = None,
     annotation_alpha: float = 0.70,
     cds_annotation_alpha: float = 0.30,
+    show_indels: bool = False,
+    indels_base_path: str = None,
+    junction_name: str = None,
+    consensus_paths: list = None,
+    inversion_rects: list = None,
 ):
     """
     Adds annotation layers to an existing Plotly figure of a pangraph.
@@ -1278,11 +1422,11 @@ def add_annotations_for_dash(
                     showlegend=showleg,
                     customdata=list(zip(sub_ir["end"].tolist(), sub_ir["product"].tolist())),
                     hovertemplate=(
-                        "Integrase / Recombinase"
+                        "<b>Integrase / Recombinase</b>"
                         "<br>%{customdata[1]}"
-                        "<br>start=%{base:d}"
-                        "<br>end=%{customdata[0]:d}"
-                        "<br>length=%{x:d}"
+                        "<br>Start = %{base:d}"
+                        "<br>End = %{customdata[0]:d}"
+                        "<br>Length = %{x:d}"
                         "<extra></extra>"
                     ),
                 ))
@@ -1315,7 +1459,7 @@ def add_annotations_for_dash(
                 marker=dict(color=_rgba(color_rgb, annotation_alpha), line=dict(width=0)),
                 name=name,
                 showlegend=showleg,
-                hovertemplate=f"{name}<br>start=%{{base:d}}<br>end=%{{customdata:d}}<br>length=%{{x:d}}<extra></extra>",
+                hovertemplate=f"<b>{name}</b><br>Start = %{{base:d}}<br>End = %{{customdata:d}}<br>Length = %{{x:d}}<extra></extra>",
                 customdata=end,
             ))
 
@@ -1393,11 +1537,129 @@ def add_annotations_for_dash(
                 showlegend=showleg,
                 customdata=list(zip(subg["end"].tolist(), subg["product"].tolist())),
                 hovertemplate=(
-                    "%{customdata[1]}"
-                    "<br>start=%{base:d}"
-                    "<br>end=%{customdata[0]:d}"
-                    "<br>length=%{x:d}"
+                    "<b>CDS:</b> %{customdata[1]}"
+                    "<br>Start = %{base:d}"
+                    "<br>End = %{customdata[0]:d}"
+                    "<br>Length = %{x:d}"
                     "<extra></extra>"
                 ),
             ))
+
+    # overlay insertions and deletions (only when consensus paths are defined)
+    if show_indels and indels_base_path and junction_name and consensus_paths:
+        import os
+
+        DELETION_COLOR = "rgb(139,0,0)"  # dark red for deletions
+
+        insertion_legend_added = False
+
+        for i, cons_path in enumerate(consensus_paths):
+            # Load insertions for this consensus
+            # Path: <indels_base_path>/insertions/<junction_name>/consensus<N>/insertions_summary.csv
+            insertions_file = os.path.join(indels_base_path, "insertions", junction_name, f"consensus{i+1}", "insertions_summary.csv")
+            if os.path.exists(insertions_file):
+                ins_df = pd.read_csv(insertions_file)
+
+                for label in y_labels:
+                    sub_ins = ins_df[ins_df["genome_name"] == label]
+                    if sub_ins.empty:
+                        continue
+
+                    showleg = not insertion_legend_added
+                    insertion_legend_added = True
+
+                    # Extract segment numbers from insertion names (e.g., "segment_0" -> "0")
+                    segment_nums = [s.split("_")[-1] if "_" in s else s.replace("segment", "") for s in sub_ins["insertion"].tolist()]
+
+                    fig.add_trace(go.Bar(
+                        x=(sub_ins["end_pos"] - sub_ins["start_pos"]).tolist(),
+                        y=[label] * len(sub_ins),
+                        base=(sub_ins["start_pos"]).tolist(),
+                        orientation="h",
+                        marker=dict(
+                            color="rgba(0,0,0,0)",  # transparent background
+                            pattern=dict(
+                                shape="/",  # diagonal lines
+                                fgcolor="black",
+                                size=6,
+                                solidity=0.3,
+                            ),
+                            line=dict(width=1, color="black"),
+                        ),
+                        name="Insertion",
+                        showlegend=showleg,
+                        customdata=list(zip(
+                            sub_ins["end_pos"].tolist(),
+                            sub_ins["length"].tolist(),
+                            segment_nums,
+                            sub_ins["strand"].tolist(),
+                        )),
+                        hovertemplate=(
+                            "<b>Insertion (#%{customdata[2]})</b>"
+                            "<br>Start = %{base:d}"
+                            "<br>End = %{customdata[0]:d}"
+                            "<br>Length = %{customdata[1]:d}"
+                            "<br>Strand = %{customdata[3]}"
+                            "<extra></extra>"
+                        ),
+                    ))
+
+        # Load deletions (all deletions are in a single file per junction)
+        # Path: <indels_base_path>/deletions/<junction_name>/all_deletions_summary.csv
+        deletions_file = os.path.join(indels_base_path, "deletions", junction_name, "all_deletions_summary.csv")
+        if os.path.exists(deletions_file):
+            del_df = pd.read_csv(deletions_file)
+
+            # Collect all deletion markers to plot them together
+            del_xs = []
+            del_ys = []
+            del_customdata = []
+
+            for label in y_labels:
+                sub_del = del_df[del_df["genome_name"] == label]
+                if sub_del.empty:
+                    continue
+
+                for _, row in sub_del.iterrows():
+                    del_xs.append(row["position"])
+                    del_ys.append(label)
+                    del_name = row["deletion"]
+                    del_num = del_name.replace("deletion", "") if "deletion" in str(del_name) else del_name
+                    del_customdata.append([row["position"], row["length"], del_num, row["consensus"], row.get("strand", "")])
+
+            if del_xs:
+                fig.add_trace(go.Scatter(
+                    x=del_xs,
+                    y=del_ys,
+                    mode="markers",
+                    marker=dict(
+                        symbol="line-ns",  # vertical line marker
+                        size=20,  # height of the line
+                        line=dict(color=DELETION_COLOR, width=4),
+                        color=DELETION_COLOR,
+                    ),
+                    name="Deletion",
+                    showlegend=True,
+                    customdata=del_customdata,
+                    hovertemplate=(
+                        "<b>Deletion (#%{customdata[2]})</b>"
+                        "<br>Position = %{customdata[0]:d}"
+                        "<br>Length = %{customdata[1]:d}"
+                        "<br>Strand = %{customdata[4]}"
+                        "<extra></extra>"
+                    ),
+                ))
+
+    # Redraw inversion borders on top of overlays only when indels are shown
+    if inversion_rects and show_indels and indels_base_path:
+        fig.add_bar(
+            x=[w for _, _, w in inversion_rects],
+            y=[lbl for lbl, _, _ in inversion_rects],
+            base=[l for _, l, _ in inversion_rects],
+            orientation="h",
+            marker=dict(color="rgba(0,0,0,0)", line=dict(color="red", width=1)),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+
     return fig
