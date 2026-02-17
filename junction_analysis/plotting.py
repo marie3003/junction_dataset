@@ -512,6 +512,7 @@ def plot_junction_pangraph_interactive(
 
                     # Extract segment numbers from insertion names (e.g., "segment_0" -> "0")
                     segment_nums = [s.split("_")[-1] if "_" in s else s.replace("segment", "") for s in sub_ins["insertion"].tolist()]
+                    block_counts = [str(p).count("[") for p in sub_ins["path"].tolist()]
 
                     fig.add_trace(go.Bar(
                         x=(sub_ins["end_pos"] - sub_ins["start_pos"]).tolist(),
@@ -535,6 +536,7 @@ def plot_junction_pangraph_interactive(
                             sub_ins["length"].tolist(),
                             segment_nums,
                             sub_ins["strand"].tolist(),
+                            block_counts,
                         )),
                         hovertemplate=(
                             "<b>Insertion (#%{customdata[2]})</b>"
@@ -542,6 +544,7 @@ def plot_junction_pangraph_interactive(
                             "<br>End = %{customdata[0]:d}"
                             "<br>Length = %{customdata[1]:d}"
                             "<br>Strand = %{customdata[3]}"
+                            "<br>Blocks = %{customdata[4]}"
                             "<extra></extra>"
                         ),
                     ))
@@ -552,49 +555,49 @@ def plot_junction_pangraph_interactive(
         if os.path.exists(deletions_file):
             del_df = pd.read_csv(deletions_file)
 
-            # Collect all deletion markers to plot them together
-            del_xs = []
-            del_ys = []
-            del_customdata = []
+            # Collect all deletion markers, grouping by (label, position)
+            del_grouped = {}  # (label, position) -> list of row dicts
 
             for label in y_labels:
-                # Match genome_name to isolate label
                 sub_del = del_df[del_df["genome_name"] == label]
                 if sub_del.empty:
                     continue
 
-                # Group deletions by position to handle split deletions (inversions)
-                # Multiple deletions at same position will be overlaid
                 for _, row in sub_del.iterrows():
-                    del_xs.append(row["position"])
-                    del_ys.append(label)
-                    # Extract deletion number from name (e.g., "deletion0" -> "0")
+                    key = (label, row["position"])
                     del_name = row["deletion"]
                     del_num = del_name.replace("deletion", "") if "deletion" in del_name else del_name
-                    del_customdata.append([row["position"], row["length"], del_num, row["consensus"], row.get("strand", "")])
+                    n_blocks = str(row.get("path", "")).count("[")
+                    del_grouped.setdefault(key, []).append({
+                        "num": del_num, "length": row["length"], "strand": row.get("strand", ""), "blocks": n_blocks,
+                    })
 
-            if del_xs:
-                # Draw deletions as markers with a vertical line marker symbol
+            if del_grouped:
+                del_xs = []
+                del_ys = []
+                del_hovertexts = []
+
+                for (label, pos), entries in del_grouped.items():
+                    del_xs.append(pos)
+                    del_ys.append(label)
+                    lines = [f"<b>Deletion (#{e['num']})</b> Length={e['length']:g} Strand={e['strand']} Blocks={e['blocks']}" for e in entries]
+                    hover = f"Position = {int(pos)}<br>" + "<br>".join(lines)
+                    del_hovertexts.append(hover)
+
                 fig.add_trace(go.Scatter(
                     x=del_xs,
                     y=del_ys,
                     mode="markers",
                     marker=dict(
-                        symbol="line-ns",  # vertical line marker
-                        size=20,  # height of the line
+                        symbol="line-ns",
+                        size=20,
                         line=dict(color=_rgba(DELETION_COLOR, annotation_alpha), width=4),
                         color=_rgba(DELETION_COLOR, annotation_alpha),
                     ),
                     name="Deletion",
                     showlegend=True,
-                    customdata=del_customdata,
-                    hovertemplate=(
-                        "<b>Deletion (#%{customdata[2]})</b>"
-                        "<br>Position = %{customdata[0]:d}"
-                        "<br>Length = %{customdata[1]:d}"
-                        "<br>Strand = %{customdata[4]}"
-                        "<extra></extra>"
-                    ),
+                    hovertemplate="%{text}<extra></extra>",
+                    text=del_hovertexts,
                 ))
 
     # Redraw inversion borders on top of overlays only when indels are shown
@@ -1570,6 +1573,7 @@ def add_annotations_for_dash(
 
                     # Extract segment numbers from insertion names (e.g., "segment_0" -> "0")
                     segment_nums = [s.split("_")[-1] if "_" in s else s.replace("segment", "") for s in sub_ins["insertion"].tolist()]
+                    block_counts = [str(p).count("[") for p in sub_ins["path"].tolist()]
 
                     fig.add_trace(go.Bar(
                         x=(sub_ins["end_pos"] - sub_ins["start_pos"]).tolist(),
@@ -1593,6 +1597,7 @@ def add_annotations_for_dash(
                             sub_ins["length"].tolist(),
                             segment_nums,
                             sub_ins["strand"].tolist(),
+                            block_counts,
                         )),
                         hovertemplate=(
                             "<b>Insertion (#%{customdata[2]})</b>"
@@ -1600,6 +1605,7 @@ def add_annotations_for_dash(
                             "<br>End = %{customdata[0]:d}"
                             "<br>Length = %{customdata[1]:d}"
                             "<br>Strand = %{customdata[3]}"
+                            "<br>Blocks = %{customdata[4]}"
                             "<extra></extra>"
                         ),
                     ))
@@ -1610,10 +1616,8 @@ def add_annotations_for_dash(
         if os.path.exists(deletions_file):
             del_df = pd.read_csv(deletions_file)
 
-            # Collect all deletion markers to plot them together
-            del_xs = []
-            del_ys = []
-            del_customdata = []
+            # Collect all deletion markers, grouping by (label, position)
+            del_grouped = {}  # (label, position) -> list of row dicts
 
             for label in y_labels:
                 sub_del = del_df[del_df["genome_name"] == label]
@@ -1621,33 +1625,40 @@ def add_annotations_for_dash(
                     continue
 
                 for _, row in sub_del.iterrows():
-                    del_xs.append(row["position"])
-                    del_ys.append(label)
+                    key = (label, row["position"])
                     del_name = row["deletion"]
                     del_num = del_name.replace("deletion", "") if "deletion" in str(del_name) else del_name
-                    del_customdata.append([row["position"], row["length"], del_num, row["consensus"], row.get("strand", "")])
+                    n_blocks = str(row.get("path", "")).count("[")
+                    del_grouped.setdefault(key, []).append({
+                        "num": del_num, "length": row["length"], "strand": row.get("strand", ""), "blocks": n_blocks,
+                    })
 
-            if del_xs:
+            if del_grouped:
+                del_xs = []
+                del_ys = []
+                del_hovertexts = []
+
+                for (label, pos), entries in del_grouped.items():
+                    del_xs.append(pos)
+                    del_ys.append(label)
+                    lines = [f"<b>Deletion (#{e['num']})</b> Length={e['length']:g} Strand={e['strand']} Blocks={e['blocks']}" for e in entries]
+                    hover = f"Position = {int(pos)}<br>" + "<br>".join(lines)
+                    del_hovertexts.append(hover)
+
                 fig.add_trace(go.Scatter(
                     x=del_xs,
                     y=del_ys,
                     mode="markers",
                     marker=dict(
-                        symbol="line-ns",  # vertical line marker
-                        size=20,  # height of the line
+                        symbol="line-ns",
+                        size=20,
                         line=dict(color=DELETION_COLOR, width=4),
                         color=DELETION_COLOR,
                     ),
                     name="Deletion",
                     showlegend=True,
-                    customdata=del_customdata,
-                    hovertemplate=(
-                        "<b>Deletion (#%{customdata[2]})</b>"
-                        "<br>Position = %{customdata[0]:d}"
-                        "<br>Length = %{customdata[1]:d}"
-                        "<br>Strand = %{customdata[4]}"
-                        "<extra></extra>"
-                    ),
+                    hovertemplate="%{text}<extra></extra>",
+                    text=del_hovertexts,
                 ))
 
     # Redraw inversion borders on top of overlays only when indels are shown
