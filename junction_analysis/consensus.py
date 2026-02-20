@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import math
+import re
 
 from pathlib import Path
 from IPython.display import display
@@ -624,3 +625,184 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
         return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unique
 
     return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting
+
+
+def renumber_context_numbering(consensus_paths, path_dict, assignment_df):
+    """
+    Renumber context suffixes (_N) in consensus paths and isolate paths consistently.
+
+    Step 1 — Consensus: For each consensus path, renumber duplicated blocks
+    (context != "") left-to-right as _1, _2, _3, ... per (block_id, ctx_base) group.
+
+    Step 2 — Isolates: For each isolate, match its duplicated blocks to the
+    corresponding consensus blocks using the closest non-duplicated anchor to the
+    left. Anchors are non-duplicated blocks (context == "") shared by both the
+    consensus and the isolate (same block id and strand).
+
+    Matching rules per (consensus duplicated block, isolate):
+      - Exactly one isolate candidate with same block id, strand, ctx_base and
+        same left anchor → assign the same number as the consensus block.
+      - No candidate → block absent in isolate, leave untouched.
+      - Multiple candidates → warn and pick the first (leftmost).
+
+    Unmatched isolate duplicated blocks are renumbered starting after the
+    highest consensus number for that (block_id, ctx_base) group (or from 1 if
+    the group does not appear in the consensus), in left-to-right order.
+
+    Parameters
+    ----------
+    consensus_paths : list of pu.Path
+        Typically consensus_paths_plotting from find_consensus_paths_core.
+    path_dict : dict {isolate_name: pu.Path}
+        Deduplicated paths for all isolates.
+    assignment_df : pd.DataFrame
+        Index: isolate name. Must have column 'best_consensus' with values
+        like 'consensus_1', 'consensus_2', etc.
+
+    Returns
+    -------
+    new_consensus_paths : list of pu.Path
+    new_path_dict : dict {isolate_name: pu.Path}
+    """
+
+    def _ctx_base(ctx):
+        """Return (ctx_base, number) if context has _N suffix, else None."""
+        m = re.match(r'^(.+)_(\d+)$', ctx)
+        if m:
+            return m.group(1), int(m.group(2))
+        return None
+
+    def _find_left_anchor(nodes, pos, anchor_set):
+        """Return block_id of the closest anchor to the left of pos."""
+        for i in range(pos - 1, -1, -1):
+            n = nodes[i]
+            if n.id in anchor_set:
+                return n.id
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Step 1: renumber consensus paths sequentially, record max per group #
+    # ------------------------------------------------------------------ #
+    consensus_label_to_idx = {f"consensus_{i + 1}": i for i in range(len(consensus_paths))}
+
+    new_consensus_paths = []
+    consensus_ctx_max = []  # list of dicts: {(block_id, ctx_base): max_number}
+
+    for path in consensus_paths:
+        counter = defaultdict(int)
+        new_nodes = []
+        for node in path.nodes:
+            parsed = _ctx_base(node.context)
+            if parsed:
+                ctx_base, _ = parsed
+                key = (node.id, ctx_base)
+                counter[key] += 1
+                new_nodes.append(pu.DeduplicatedNode(node.id, node.strand, f"{ctx_base}_{counter[key]}", node.nid))
+            else:
+                new_nodes.append(node)
+        new_consensus_paths.append(pu.Path(new_nodes))
+        consensus_ctx_max.append(dict(counter))
+
+    # ------------------------------------------------------------------ #
+    # Step 2: renumber isolate paths to match consensus numbering         #
+    # ------------------------------------------------------------------ #
+    new_path_dict = {}
+
+    for iso, row in assignment_df.iterrows():
+        consensus_label = row.get('best_consensus')
+        if consensus_label not in consensus_label_to_idx:
+            new_path_dict[iso] = path_dict[iso]
+            continue
+
+        c_idx = consensus_label_to_idx[consensus_label]
+        c_path = new_consensus_paths[c_idx]
+        ctx_max = consensus_ctx_max[c_idx]  # {(block_id, ctx_base): max consensus number}
+
+        if iso not in path_dict:
+            continue
+        iso_path = path_dict[iso]
+        c_nodes = c_path.nodes
+        iso_nodes = iso_path.nodes
+
+        # Anchors: blocks that appear exactly once (with any strand) in BOTH the
+        # consensus and the isolate path. Recomputed fresh per isolate.
+        # Counting by id only (strand-agnostic) so that blocks appearing once
+        # but on different strands still qualify as anchors.
+        c_counts   = Counter(n.id for n in c_nodes)
+        iso_counts = Counter(n.id for n in iso_nodes)
+        anchor_set = {bid for bid in c_counts if c_counts[bid] == 1 and iso_counts.get(bid, 0) == 1}
+
+        # Collect info on every duplicated node in the isolate
+        # iso_dup[pos] = (block_id, strand, ctx_base)
+        iso_dup = {}
+        for pos, node in enumerate(iso_nodes):
+            parsed = _ctx_base(node.context)
+            if parsed:
+                ctx_base, _ = parsed
+                iso_dup[pos] = (node.id, node.strand, ctx_base)
+
+        iso_left_anchors = {pos: _find_left_anchor(iso_nodes, pos, anchor_set)
+                            for pos in iso_dup}
+
+        # Match each duplicated consensus block to isolate candidates
+        new_ctx_for_pos = {}   # {iso_pos: new_context_string}
+        assigned_positions = set()
+
+        for c_pos, c_node in enumerate(c_nodes):
+            parsed = _ctx_base(c_node.context)
+            if not parsed:
+                continue
+            ctx_base, c_number = parsed
+            c_anchor = _find_left_anchor(c_nodes, c_pos, anchor_set)
+
+            print
+            candidates = [
+                pos for pos, (bid, strand, cb) in iso_dup.items()
+                if bid == c_node.id
+                and strand == c_node.strand
+                and cb == ctx_base
+                and iso_left_anchors[pos] == c_anchor
+                and pos not in assigned_positions
+            ]
+
+            if len(candidates) == 0:
+                pass  # block absent in isolate
+            elif len(candidates) == 1:
+                pos = candidates[0]
+                new_ctx_for_pos[pos] = f"{ctx_base}_{c_number}"
+                assigned_positions.add(pos)
+            else:
+                print(f"Warning: {len(candidates)} matches for block {c_node.id} "
+                      f"(ctx_base={ctx_base}, anchor={c_anchor}) in isolate {iso}. "
+                      f"Picking first (leftmost).")
+                pos = candidates[0]
+                new_ctx_for_pos[pos] = f"{ctx_base}_{c_number}"
+                assigned_positions.add(pos)
+
+        # Renumber unmatched isolate duplicated blocks left-to-right
+        next_number = {}  # (block_id, ctx_base) -> next free number
+        for pos in sorted(iso_dup):
+            if pos in assigned_positions:
+                continue
+            bid, strand, ctx_base = iso_dup[pos]
+            key = (bid, ctx_base)
+            if key not in next_number:
+                next_number[key] = ctx_max.get(key, 0) + 1
+            new_ctx_for_pos[pos] = f"{ctx_base}_{next_number[key]}"
+            next_number[key] += 1
+
+        # Reconstruct isolate path
+        new_iso_nodes = []
+        for pos, node in enumerate(iso_nodes):
+            if pos in new_ctx_for_pos:
+                new_iso_nodes.append(pu.DeduplicatedNode(node.id, node.strand, new_ctx_for_pos[pos], node.nid))
+            else:
+                new_iso_nodes.append(node)
+        new_path_dict[iso] = pu.Path(new_iso_nodes)
+
+    # Isolates not in assignment_df are passed through unchanged
+    for iso in path_dict:
+        if iso not in new_path_dict:
+            new_path_dict[iso] = path_dict[iso]
+
+    return new_consensus_paths, new_path_dict

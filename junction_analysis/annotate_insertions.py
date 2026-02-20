@@ -1,3 +1,5 @@
+from collections import Counter
+
 import numpy as np
 import pandas as pd
 
@@ -35,22 +37,34 @@ def write_block_fasta(example_pangraph, example_junction, isolate_name, block_id
     SeqIO.write(record, output_path, "fasta")
 
 def get_insertions_deletions(deduplicated_paths, consensus_path):
-    """Identify insertions and deletions in each isolate's path compared to the matching consensus path.
+    """Identify insertions, deletions, and inversions in each isolate's path compared to the matching consensus path.
     Arguments:
         deduplicated_paths: dict of isolate -> Path object (prefiltered to only contain isolates matching the consensus path)
         consensus_path: Path object representing the consensus path
     Returns:
         insertions: dict of isolate -> list of inserted segments (each is a Path object)
+            insertions are defined as blocks that do not exist in the consensus path but in an isolate path dependent on block id and in case of duplicated blocks on context (regardless of strand)
         deletions: dict of isolate -> list of deleted segments (each is a list of nodes)
+        inversions: dict of isolate -> list of inverted segments (each is a Path object with isolate nodes),
+            inversions are defined as blocks that exist in both consensus and isolate but have different strand,
+            this means that inverted insertions will not be reported as inversions but as insertions, and inverted deletions will not be reported as inversions but as deletions
+        translocations: dict of isolate -> list of pu.Path objects (each Path contains isolate nodes),
+            translocations are blocks present in both consensus and isolate but whose left anchor differs.
+            Anchors are blocks matching by (id, strand, context) in both consensus and isolate.
+            Each block is assigned its rightmost anchor to the left; mismatched anchors indicate translocation.
     """
 
     insertions = {}  # isolate -> list of inserted segments (each is a list of nodes)
     deletions = {}   # isolate -> list of deleted segments (each is a list of nodes)
+    inversions = {}  # isolate -> list of inverted segments (each is a Path of isolate nodes)
+    translocations = {}  # isolate -> list of translocated segments (each is a Path of isolate nodes)
 
-    consensus_nodes = set(consensus_path.nodes)
+    # Strand-agnostic lookup: (id, context) for consensus membership
+    consensus_id_context = {(n.id, n.context) for n in consensus_path.nodes}
+
     for isolate, path in deduplicated_paths.items():
 
-        # --- Find insertions ---
+        # --- Find insertions (strand-agnostic consensus check) ---
         current_insertion = []
         strand = None
 
@@ -61,8 +75,8 @@ def get_insertions_deletions(deduplicated_paths, consensus_path):
                 current_insertion = []
 
         for node in path.nodes:
-            if node in consensus_nodes:
-                # Finish any ongoing insertion at a consensus boundary
+            if (node.id, node.context) in consensus_id_context:
+                # Block exists in consensus (regardless of strand) — not an insertion
                 flush()
                 strand = None
                 continue
@@ -84,11 +98,12 @@ def get_insertions_deletions(deduplicated_paths, consensus_path):
         # Handle trailing insertion
         flush()
 
-        # --- Find deletions (strand-aware splitting) ---
+        # --- Find deletions (strand-agnostic isolate check) ---
         current_deletion = []
         del_strand = None
         last_existing_isolate_node = None
-        path_node_lookup = {n: n for n in path.nodes}
+        # Strand-agnostic lookup: (id, context) -> isolate node
+        path_node_lookup = {(n.id, n.context): n for n in path.nodes}
 
         def flush_del():
             nonlocal current_deletion, del_strand, last_existing_isolate_node
@@ -100,10 +115,10 @@ def get_insertions_deletions(deduplicated_paths, consensus_path):
             del_strand = None
 
         for cnode in consensus_path.nodes:
-            isolate_node = path_node_lookup.get(cnode)
-            
+            isolate_node = path_node_lookup.get((cnode.id, cnode.context))
+
             if isolate_node is None:
-                # node is part of a deletion region
+                # node is truly absent from isolate — part of a deletion region
                 if del_strand is None:
                     del_strand = cnode.strand
                     current_deletion.append(cnode)
@@ -120,8 +135,102 @@ def get_insertions_deletions(deduplicated_paths, consensus_path):
 
         # trailing deletion even though it should technically not happen
         flush_del()
-    
-    return insertions, deletions
+
+        # --- Find inversions ---
+        # Build lookup: (id, context) -> consensus node strand
+        consensus_strand_lookup = {}
+        for cnode in consensus_path.nodes:
+            consensus_strand_lookup[(cnode.id, cnode.context)] = cnode.strand
+
+        current_inversion = []
+
+        def flush_inv():
+            nonlocal current_inversion
+            if current_inversion:
+                inversions.setdefault(isolate, []).append(pu.Path(current_inversion))
+                current_inversion = []
+
+        for node in path.nodes:
+            cons_strand = consensus_strand_lookup.get((node.id, node.context))
+            if cons_strand is None:
+                # Insertion node (not in consensus) — don't interrupt an ongoing inversion
+                continue
+            elif node.strand != cons_strand:
+                # Block exists in both but with different strand — inverted
+                current_inversion.append(node)
+            else:
+                # Block exists with correct strand — end any ongoing inversion
+                flush_inv()
+
+        flush_inv()
+
+        # --- Find translocations ---
+        # Anchors are blocks present in both consensus and isolate with matching
+        # (id, strand, context) — i.e. full node equality. Only anchors can serve
+        # as left context for translocation detection.
+        #
+        # Assign each block a "left anchor" = the rightmost anchor to the left of
+        # the current position. Then for each block present in both consensus and
+        # isolate (by id and context, strand-agnostic), check if left anchors match.
+        # If not, that block is part of a translocation.
+
+        # Anchors: blocks that (1) appear exactly once by id in both consensus and
+        # isolate (strand-agnostic count) AND (2) have an exact (id, strand, context)
+        # match between the two paths. Condition (1) prevents duplicated blocks from
+        # serving as anchors; condition (2) ensures the anchor position is unambiguous.
+        c_id_counts   = Counter(n.id for n in consensus_path.nodes)
+        iso_id_counts = Counter(n.id for n in path.nodes)
+        unique_ids = {bid for bid in c_id_counts
+                      if c_id_counts[bid] == 1 and iso_id_counts.get(bid, 0) == 1}
+        consensus_node_set = set(consensus_path.nodes)  # __hash__ = (id, strand, context)
+        isolate_node_set   = set(path.nodes)
+        exact_match_ids = {n.id for n in consensus_node_set & isolate_node_set}
+        anchor_ids = unique_ids & exact_match_ids
+
+        # Assign left anchor (block id) to each block in consensus (keyed by id, context)
+        consensus_left_anchor = {}
+        current_anchor = None
+        for cnode in consensus_path.nodes:
+            if cnode.id in anchor_ids:
+                current_anchor = cnode.id
+            consensus_left_anchor[(cnode.id, cnode.context)] = current_anchor
+
+        # Assign left anchor (block id) to each block in isolate (keyed by id, context)
+        isolate_left_anchor = {}
+        current_anchor = None
+        for node in path.nodes:
+            if node.id in anchor_ids:
+                current_anchor = node.id
+            isolate_left_anchor[(node.id, node.context)] = current_anchor
+
+        # Walk through isolate left to right, detect translocations among shared blocks
+        current_translocation = []
+
+        def flush_trans():
+            nonlocal current_translocation
+            if current_translocation:
+                translocations.setdefault(isolate, []).append(pu.Path(current_translocation))
+                current_translocation = []
+
+        for node in path.nodes:
+            if (node.id, node.context) not in consensus_id_context:
+                # Insertion — skip, don't interrupt ongoing translocation
+                continue
+
+            iso_anchor = isolate_left_anchor[(node.id, node.context)]
+            cons_anchor = consensus_left_anchor[(node.id, node.context)]
+
+            if iso_anchor != cons_anchor:
+                print(f"Isolate {isolate} block {node} has mismatched anchors: iso {iso_anchor} vs cons {cons_anchor}")
+                # Mismatched left anchor — part of a translocation
+                current_translocation.append(node)
+            else:
+                # Matching left anchor — end any ongoing translocation
+                flush_trans()
+
+        flush_trans()
+
+    return insertions, deletions, inversions, translocations
 
 def get_isolate_sequence_from_fasta(fasta_path, isolate_name):
     """
@@ -194,16 +303,30 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
     return insertions_df
 
 
-def print_insertions_deletions(insertions, deletions):
-    print("Insertions:")
-    for isolate, segs in insertions.items():
-        for seg in segs:
-            print(isolate, "INSERTED:", seg)
+def print_insertions_deletions(insertions, deletions, inversions=None, translocations=None):
+    if insertions:
+        print("Insertions:")
+        for isolate, segs in insertions.items():
+            for seg in segs:
+                print(isolate, "INSERTED:", seg)
 
-    print("\nDeletions:")
-    for isolate, segs in deletions.items():
-        for seg in segs:
-            print(isolate, "DELETED:", seg)
+    if deletions:
+        print("\nDeletions:")
+        for isolate, segs in deletions.items():
+            for seg in segs:
+                print(isolate, "DELETED:", seg)
+
+    if inversions:
+        print("\nInversions:")
+        for isolate, segs in inversions.items():
+            for seg in segs:
+                print(isolate, "INVERTED:", seg)
+
+    if translocations:
+        print("\nTranslocations:")
+        for isolate, segs in translocations.items():
+            for seg in segs:
+                print(isolate, "TRANSLOCATED:", seg)
 
 def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, deduplicated_paths, consensus = 1, verbose = True):
     # get isolates belonging to consensus 1
@@ -212,13 +335,13 @@ def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, dedu
     deduplicated_paths = {iso: path for iso, path in deduplicated_paths.items() if iso in isolates_1}
 
     # compare deduplicated paths to consensus paths to find deviations, consensus paths are already deduplicated
-    insertions, deletions = get_insertions_deletions(deduplicated_paths, consensus_paths[consensus - 1])
+    insertions, deletions, inversions, translocations = get_insertions_deletions(deduplicated_paths, consensus_paths[consensus - 1])
 
     # Print results
     if verbose:
-        print_insertions_deletions(insertions, deletions)
+        print_insertions_deletions(insertions, deletions, inversions, translocations)
 
-    return insertions, deletions
+    return insertions, deletions, inversions, translocations
 
 def write_sgenome_ids(atb_hits_df, output_file):
     sgenome_ids = atb_hits_df.sgenome.to_list()
@@ -535,6 +658,84 @@ def summarize_deletions_consensus(
     return deletions_df
 
 
+def summarize_inversions_consensus(
+    inversions,
+    junction_name,
+    pangraph,
+    consensus_id,
+    parent_dir,
+    save_df=False,
+):
+    """
+    Summarize information about inversions for one consensus path.
+    Each inversion is a contiguous run of blocks that exist in both
+    consensus and isolate but with flipped strand.
+
+    Parameters
+    ----------
+    inversions : dict
+        isolate -> list of pu.Path objects (each Path contains isolate nodes with .nid)
+    junction_name : str
+    pangraph : pp.Pangraph
+    consensus_id : int
+    parent_dir : str
+        Base output directory (e.g. results/atb_lookup/inversions)
+    save_df : bool
+        Whether to write the summary CSV to disk.
+
+    Returns
+    -------
+    pd.DataFrame or None
+    """
+    out_dir = os.path.join(parent_dir, junction_name, f"consensus_{consensus_id}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    results = []
+    for iso, inv_paths in inversions.items():
+        for idx, inv_path in enumerate(inv_paths):
+            nodes = inv_path.nodes
+            if not nodes:
+                continue
+
+            # Compute total length from pangraph node coordinates
+            total_length = sum(
+                int(pangraph.nodes[n.nid].end - pangraph.nodes[n.nid].start)
+                for n in nodes
+            )
+
+            # Start and end positions from the first and last node
+            starts = [int(pangraph.nodes[n.nid].start) for n in nodes]
+            ends = [int(pangraph.nodes[n.nid].end) for n in nodes]
+            start_pos = min(starts)
+            end_pos = max(ends)
+
+            # Majority strand among the isolate's inverted nodes
+            plus_count = sum(1 for n in nodes if n.strand)
+            majority_strand = "+" if plus_count >= len(nodes) / 2 else "-"
+
+            results.append({
+                "junction_name": junction_name,
+                "consensus": f"consensus_{consensus_id}",
+                "genome_name": iso,
+                "path": str(inv_path),
+                "inversion": f"inversion{idx}",
+                "length": total_length,
+                "start_pos": start_pos,
+                "end_pos": end_pos,
+                "strand": majority_strand,
+            })
+
+    if not results:
+        print(f"No inversions found for consensus_{consensus_id}, nothing saved.")
+        return None
+
+    inversions_df = pd.DataFrame(results)
+
+    if save_df:
+        inversions_df.to_csv(os.path.join(out_dir, "inversions_summary.csv"), index=False)
+
+    return inversions_df
+
 
 def load_all_deletions_summaries(parent_dir, junction_name, save_df=False):
     """
@@ -597,6 +798,138 @@ def load_all_insertions_summaries(parent_dir, junction_name, save_df=False):
     if save_df:
         complete_df.to_csv(
             os.path.join(base_dir, "all_insertions_summary.csv"),
+            index=False,
+        )
+
+    return complete_df
+
+
+def summarize_translocations_consensus(
+    translocations,
+    junction_name,
+    pangraph,
+    consensus_id,
+    parent_dir,
+    save_df=False,
+):
+    """
+    Summarize information about translocations for one consensus path.
+
+    Parameters
+    ----------
+    translocations : dict
+        isolate -> list of pu.Path objects (each Path contains isolate nodes with .nid)
+    junction_name : str
+    pangraph : pp.Pangraph
+    consensus_id : int
+    parent_dir : str
+        Base output directory (e.g. results/atb_lookup/translocations)
+    save_df : bool
+
+    Returns
+    -------
+    pd.DataFrame or None
+    """
+    out_dir = os.path.join(parent_dir, junction_name, f"consensus_{consensus_id}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    results = []
+    for iso, trans_paths in translocations.items():
+        for idx, trans_path in enumerate(trans_paths):
+            nodes = trans_path.nodes
+            if not nodes:
+                continue
+
+            starts = [int(pangraph.nodes[n.nid].start) for n in nodes]
+            ends = [int(pangraph.nodes[n.nid].end) for n in nodes]
+            start_pos = min(starts)
+            end_pos = max(ends)
+            total_length = end_pos - start_pos
+
+            results.append({
+                "junction_name": junction_name,
+                "consensus": f"consensus_{consensus_id}",
+                "genome_name": iso,
+                "path": str(trans_path),
+                "translocation": f"translocation{idx}",
+                "length": total_length,
+                "start_pos": start_pos,
+                "end_pos": end_pos,
+            })
+
+    if not results:
+        print(f"No translocations found for consensus_{consensus_id}, nothing saved.")
+        return None
+
+    translocations_df = pd.DataFrame(results)
+
+    if save_df:
+        translocations_df.to_csv(os.path.join(out_dir, "translocations_summary.csv"), index=False)
+
+    return translocations_df
+
+
+def load_all_translocations_summaries(parent_dir, junction_name, save_df=False):
+    """
+    Read and combine all translocations_summary.csv files from
+    {parent_dir}/{junction_name}/consensus_*/translocations_summary.csv
+    """
+    base_dir = os.path.join(parent_dir, junction_name)
+    all_dfs = []
+
+    for subdir in sorted(os.listdir(base_dir)):
+        if not subdir.startswith("consensus_"):
+            continue
+
+        csv_path = os.path.join(base_dir, subdir, "translocations_summary.csv")
+        if os.path.isfile(csv_path):
+            df = pd.read_csv(csv_path)
+            all_dfs.append(df)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    complete_df = pd.concat(all_dfs, ignore_index=True)
+
+    if save_df:
+        complete_df.to_csv(
+            os.path.join(base_dir, "all_translocations_summary.csv"),
+            index=False,
+        )
+
+    return complete_df
+
+
+def load_all_inversions_summaries(parent_dir, junction_name, save_df=False):
+    """
+    Read and combine all inversions_summary.csv files from
+    {parent_dir}/{junction_name}/consensus_*/inversions_summary.csv
+
+    Returns
+    -------
+    pd.DataFrame
+        One long DataFrame with all inversions combined.
+    """
+    base_dir = os.path.join(parent_dir, junction_name)
+    all_dfs = []
+
+    for subdir in sorted(os.listdir(base_dir)):
+        if not subdir.startswith("consensus_"):
+            continue
+
+        csv_path = os.path.join(base_dir, subdir, "inversions_summary.csv")
+        if os.path.isfile(csv_path):
+            df = pd.read_csv(csv_path)
+            all_dfs.append(df)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    complete_df = pd.concat(all_dfs, ignore_index=True)
+
+    if save_df:
+        complete_df.to_csv(
+            os.path.join(base_dir, "all_inversions_summary.csv"),
             index=False,
         )
 

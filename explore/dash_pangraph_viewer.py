@@ -37,13 +37,15 @@ def _trace_groups_from_fig(fig):
       - insertions: bar traces named 'Insertion'
       - deletions: scatter traces named 'Deletion'
     """
-    groups = {"blocks": [], "mges": [], "intrec": [], "cds": [], "insertions": [], "deletions": []}
+    groups = {"blocks": [], "mges": [], "intrec": [], "cds": [], "insertions": [], "deletions": [], "inversions": [], "translocations": []}
 
     for i, tr in enumerate(fig.data):
         ttype = getattr(tr, "type", None)
 
         name = getattr(tr, "name", "") or ""
         hover = getattr(tr, "hovertemplate", "") or ""
+        if isinstance(hover, (list, tuple)):
+            hover = hover[0] if hover else ""
         cd = getattr(tr, "customdata", None)
 
         # block traces: your _add_bar sets hovertemplate with "<br>Block = " and customdata includes block_id at index 3
@@ -62,6 +64,10 @@ def _trace_groups_from_fig(fig):
             groups["insertions"].append(i)
         elif name == "Deletion":
             groups["deletions"].append(i)
+        elif name == "Inversion":
+            groups["inversions"].append(i)
+        elif name == "Translocation":
+            groups["translocations"].append(i)
 
     return groups
 
@@ -166,8 +172,25 @@ def make_junction_dash_app(
     original_anno_hovertemplates = {tidx: base_fig.data[tidx].hovertemplate for tidx in anno_indices}
 
     # Store original hover templates for indels
-    indel_indices = groups["insertions"] + groups["deletions"]
+    indel_indices = groups["insertions"] + groups["deletions"] + groups["inversions"] + groups["translocations"]
     original_indel_hovertemplates = {tidx: base_fig.data[tidx].hovertemplate for tidx in indel_indices}
+
+    # Build lookup: block_id -> set of trace indices for highlighting
+    block_id_to_traces = {}
+    for tidx in groups["blocks"]:
+        tr = base_fig.data[tidx]
+        for row in tr.customdata:
+            bid_str = str(row[3])
+            block_id_to_traces.setdefault(bid_str, set()).add(tidx)
+
+    # Store original line colors/widths for block traces to restore when search is cleared
+    original_block_lines = {}
+    for tidx in groups["blocks"]:
+        tr = base_fig.data[tidx]
+        original_block_lines[tidx] = {
+            "color": tr.marker.line.color,
+            "width": tr.marker.line.width,
+        }
 
     app = Dash(__name__)
     app.layout = html.Div(
@@ -203,6 +226,17 @@ def make_junction_dash_app(
                         persistence=True,
                         persistence_type="memory",
                     ),
+                    html.Div("Search block ID:", style={"fontWeight": "bold", "marginLeft": "20px"}),
+                    dcc.Input(
+                        id="block-search",
+                        type="text",
+                        placeholder="Enter block ID...",
+                        debounce=True,
+                        style={"width": "220px"},
+                        persistence=True,
+                        persistence_type="memory",
+                    ),
+                    html.Span(id="search-count", style={"marginLeft": "8px", "color": "grey"}),
                 ],
             ),
             dcc.Graph(id="graph", figure=base_fig),
@@ -211,15 +245,25 @@ def make_junction_dash_app(
 
     @app.callback(
         Output("graph", "figure"),
+        Output("search-count", "children"),
         Input("anno-toggle", "value"),
         Input("hover-toggle", "value"),
+        Input("block-search", "value"),
     )
-    def update_figure(selected_annos, selected_options):
+    def update_figure(selected_annos, selected_options, search_query):
         selected_annos = set(selected_annos or [])
         selected_options = set(selected_options or [])
         any_on = len(selected_annos) > 0
         # Only turn blocks grey for non-indel annotations
         non_indel_annos_on = bool(selected_annos - {"indels"})
+
+        # Determine which traces to highlight based on block ID search
+        search_query = (search_query or "").strip()
+        highlighted_traces = set()
+        if search_query:
+            for bid, tidxs in block_id_to_traces.items():
+                if search_query in bid:
+                    highlighted_traces.update(tidxs)
 
         patch = Patch()
 
@@ -233,11 +277,27 @@ def make_junction_dash_app(
         _set_visible(groups["cds"], "cds" in selected_annos)
         _set_visible(groups["insertions"], "indels" in selected_annos)
         _set_visible(groups["deletions"], "indels" in selected_annos)
+        _set_visible(groups["inversions"], "indels" in selected_annos)
+        _set_visible(groups["translocations"], "indels" in selected_annos)
+
+        # Toggle translocation arrow annotations
+        n_annotations = len(base_fig.layout.annotations or [])
+        for ai in range(n_annotations):
+            patch["layout"]["annotations"][ai]["visible"] = ("indels" in selected_annos)
 
         # 2) Enforce block colors (grey only if non-indel annotations are on)
         colors = block_colors_grey if non_indel_annos_on else block_colors_colored
         for j, tidx in enumerate(groups["blocks"]):
             patch["data"][tidx]["marker"]["color"] = colors[j]
+
+        # 2b) Highlight blocks matching search query
+        for tidx in groups["blocks"]:
+            if tidx in highlighted_traces:
+                patch["data"][tidx]["marker"]["line"]["color"] = "magenta"
+                patch["data"][tidx]["marker"]["line"]["width"] = 3
+            else:
+                patch["data"][tidx]["marker"]["line"]["color"] = original_block_lines[tidx]["color"]
+                patch["data"][tidx]["marker"]["line"]["width"] = original_block_lines[tidx]["width"]
 
         # 3) Toggle block hover information
         disable_block_hover = "disable_block_hover" in selected_options
@@ -273,7 +333,12 @@ def make_junction_dash_app(
         # 6) barmode: overlay when annotations are on; stack otherwise
         patch["layout"]["barmode"] = "overlay" if any_on else "stack"
 
-        return patch
+        # Search result count
+        search_msg = ""
+        if search_query:
+            search_msg = f"{len(highlighted_traces)} traces matched"
+
+        return patch, search_msg
 
     return app
 
@@ -312,7 +377,7 @@ if __name__ == "__main__":
         annotations_gff_path=str(annotations_gff_path),
         order="tree",
         title=f"Junction Block Structure ({junction_name})",
-        initial_selection=("mges",),  # change to () to start with no annotations
+        initial_selection=("mges", "indels"),  # change to () to start with no annotations
         indels_base_path=str(in_del_path),
         show_indels=True,
         junction_name=junction_name,

@@ -55,7 +55,7 @@ def build_tree_from_block_list(pangraph, path_dict, block_list, isolate_list, pa
     if no_tree_gen == False:
         with open(tree_file, "w") as tree_out:
             subprocess.run(
-                [fasttree_bin, "-nt", "-gtr", aln_file],
+                [fasttree_bin, "-nt", "-gtr", "-seed", "42", aln_file],
                 stdout=tree_out,
                 check=True,
             )

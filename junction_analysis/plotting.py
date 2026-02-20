@@ -600,6 +600,130 @@ def plot_junction_pangraph_interactive(
                     text=del_hovertexts,
                 ))
 
+        # Load inversions
+        INVERSION_COLOR = "red"
+
+        inversion_legend_added = False
+
+        for i, cons_path in enumerate(consensus_paths):
+            inversions_file = os.path.join(indels_base_path, "inversions", junction_name, f"consensus_{i+1}", "inversions_summary.csv")
+            if not os.path.exists(inversions_file):
+                continue
+            inv_df = pd.read_csv(inversions_file)
+
+            for label in y_labels:
+                sub_inv = inv_df[inv_df["genome_name"] == label]
+                if sub_inv.empty:
+                    continue
+
+                showleg = not inversion_legend_added
+                inversion_legend_added = True
+
+                inv_nums = [str(name).replace("inversion", "") for name in sub_inv["inversion"].tolist()]
+                block_counts = [str(p).count("[") for p in sub_inv["path"].tolist()]
+
+                fig.add_trace(go.Bar(
+                    x=(sub_inv["end_pos"] - sub_inv["start_pos"]).tolist(),
+                    y=[label] * len(sub_inv),
+                    base=(sub_inv["start_pos"]).tolist(),
+                    orientation="h",
+                    marker=dict(
+                        color="rgba(0,0,0,0)",
+                        pattern=dict(
+                            shape="\\",
+                            fgcolor=INVERSION_COLOR,
+                            size=6,
+                            solidity=0.3,
+                        ),
+                        line=dict(width=1, color=INVERSION_COLOR),
+                    ),
+                    name="Inversion",
+                    showlegend=showleg,
+                    customdata=list(zip(
+                        sub_inv["end_pos"].tolist(),
+                        sub_inv["length"].tolist(),
+                        inv_nums,
+                        sub_inv["strand"].tolist(),
+                        block_counts,
+                    )),
+                    hovertemplate=(
+                        "<b>Inversion (#%{customdata[2]})</b>"
+                        "<br>Start = %{base:d}"
+                        "<br>End = %{customdata[0]:d}"
+                        "<br>Length = %{customdata[1]:d}"
+                        "<br>Strand = %{customdata[3]}"
+                        "<br>Blocks = %{customdata[4]}"
+                        "<extra></extra>"
+                    ),
+                ))
+
+        # Load translocations — draw arrows from start to end of translocated region
+        TRANSLOCATION_COLOR = "rgb(0,0,255)"  # blue
+
+        for i, cons_path in enumerate(consensus_paths):
+            trans_file = os.path.join(indels_base_path, "translocations", junction_name, f"consensus_{i+1}", "translocations_summary.csv")
+            if not os.path.exists(trans_file):
+                continue
+            trans_df = pd.read_csv(trans_file)
+
+            hover_x, hover_y, hover_custom = [], [], []
+
+            for _, row in trans_df.iterrows():
+                label = row["genome_name"]
+                if label not in y_labels:
+                    continue
+
+                fig.add_annotation(
+                    x=row["end_pos"], y=label,
+                    ax=row["start_pos"], ay=label,
+                    xref="x", yref="y",
+                    axref="x", ayref="y",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1.5,
+                    arrowwidth=2,
+                    arrowcolor=TRANSLOCATION_COLOR,
+                    text="",
+                )
+
+                hover_x.append((row["start_pos"] + row["end_pos"]) / 2)
+                hover_y.append(label)
+                hover_custom.append([
+                    row["translocation"],
+                    row["start_pos"],
+                    row["end_pos"],
+                    row["length"],
+                ])
+
+            if hover_x:
+                fig.add_trace(go.Scatter(
+                    x=hover_x,
+                    y=hover_y,
+                    mode="markers",
+                    marker=dict(size=10, color="rgba(0,0,0,0)"),
+                    customdata=hover_custom,
+                    hovertemplate=(
+                        "<b>Translocation</b><br>"
+                        "Name: %{customdata[0]}<br>"
+                        "Start: %{customdata[1]:d}<br>"
+                        "End: %{customdata[2]:d}<br>"
+                        "Length: %{customdata[3]:d}"
+                        "<extra></extra>"
+                    ),
+                    name="Translocation",
+                    showlegend=False,
+                ))
+
+        # Add translocation legend entry
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(symbol="arrow-right", size=14, color=TRANSLOCATION_COLOR, angle=0),
+            name="Translocation",
+            showlegend=True,
+            hoverinfo="skip",
+        ))
+
     # Redraw inversion borders on top of overlays only when indels are shown
     if inversion_rects and show_indels and indels_base_path:
         fig.add_bar(
@@ -622,7 +746,7 @@ def plot_junction_pangraph_interactive(
             color="rgba(0,0,0,0)",   # transparent fill
             line=dict(color="red", width=2),
         ),
-        name="Inversion",
+        name="Negative strand",
         showlegend=True,
         hoverinfo="skip",
     ))
@@ -1338,7 +1462,7 @@ def plot_pangraph_base_for_dash(
             color="rgba(0,0,0,0)",   # transparent fill
             line=dict(color="red", width=2),
         ),
-        name="Inversion",
+        name="Negative strand",
         showlegend=True,
         hoverinfo="skip",
     ))
@@ -1396,6 +1520,7 @@ def add_annotations_for_dash(
 ):
     """
     Adds annotation layers to an existing Plotly figure of a pangraph.
+    - Inversions: plotted with diagonal red lines (might be interrupted by insertions, in this case the insertion is also plotted within the inversion with red lines but not part of the length of the inversion)
     """
     # overlay Integrase / Recombinase annotations (derived from CDS "product")
     if show_int_rec_annotations and annotations_gff_path:
@@ -1660,6 +1785,130 @@ def add_annotations_for_dash(
                     hovertemplate="%{text}<extra></extra>",
                     text=del_hovertexts,
                 ))
+
+        # Load inversions
+        INVERSION_COLOR = "red"
+
+        inversion_legend_added = False
+
+        for i, cons_path in enumerate(consensus_paths):
+            inversions_file = os.path.join(indels_base_path, "inversions", junction_name, f"consensus_{i+1}", "inversions_summary.csv")
+            if not os.path.exists(inversions_file):
+                continue
+            inv_df = pd.read_csv(inversions_file)
+
+            for label in y_labels:
+                sub_inv = inv_df[inv_df["genome_name"] == label]
+                if sub_inv.empty:
+                    continue
+
+                showleg = not inversion_legend_added
+                inversion_legend_added = True
+
+                inv_nums = [str(name).replace("inversion", "") for name in sub_inv["inversion"].tolist()]
+                block_counts = [str(p).count("[") for p in sub_inv["path"].tolist()]
+
+                fig.add_trace(go.Bar(
+                    x=(sub_inv["end_pos"] - sub_inv["start_pos"]).tolist(),
+                    y=[label] * len(sub_inv),
+                    base=(sub_inv["start_pos"]).tolist(),
+                    orientation="h",
+                    marker=dict(
+                        color="rgba(0,0,0,0)",
+                        pattern=dict(
+                            shape="\\",
+                            fgcolor=INVERSION_COLOR,
+                            size=6,
+                            solidity=0.3,
+                        ),
+                        line=dict(width=1, color=INVERSION_COLOR),
+                    ),
+                    name="Inversion",
+                    showlegend=showleg,
+                    customdata=list(zip(
+                        sub_inv["end_pos"].tolist(),
+                        sub_inv["length"].tolist(),
+                        inv_nums,
+                        sub_inv["strand"].tolist(),
+                        block_counts,
+                    )),
+                    hovertemplate=(
+                        "<b>Inversion (#%{customdata[2]})</b>"
+                        "<br>Start = %{base:d}"
+                        "<br>End = %{customdata[0]:d}"
+                        "<br>Length = %{customdata[1]:d}"
+                        "<br>Strand = %{customdata[3]}"
+                        "<br>Blocks = %{customdata[4]}"
+                        "<extra></extra>"
+                    ),
+                ))
+
+        # Load translocations — draw arrows from start to end of translocated region
+        TRANSLOCATION_COLOR = "rgb(0,0,255)"
+
+        for i, cons_path in enumerate(consensus_paths):
+            trans_file = os.path.join(indels_base_path, "translocations", junction_name, f"consensus_{i+1}", "translocations_summary.csv")
+            if not os.path.exists(trans_file):
+                continue
+            trans_df = pd.read_csv(trans_file)
+
+            hover_x, hover_y, hover_custom = [], [], []
+
+            for _, row in trans_df.iterrows():
+                label = row["genome_name"]
+                if label not in y_labels:
+                    continue
+
+                fig.add_annotation(
+                    x=row["end_pos"], y=label,
+                    ax=row["start_pos"], ay=label,
+                    xref="x", yref="y",
+                    axref="x", ayref="y",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1.5,
+                    arrowwidth=2,
+                    arrowcolor=TRANSLOCATION_COLOR,
+                    text="",
+                )
+
+                hover_x.append((row["start_pos"] + row["end_pos"]) / 2)
+                hover_y.append(label)
+                hover_custom.append([
+                    row["translocation"],
+                    row["start_pos"],
+                    row["end_pos"],
+                    row["length"],
+                ])
+
+            if hover_x:
+                fig.add_trace(go.Scatter(
+                    x=hover_x,
+                    y=hover_y,
+                    mode="markers",
+                    marker=dict(size=10, color="rgba(0,0,0,0)"),
+                    customdata=hover_custom,
+                    hovertemplate=(
+                        "<b>Translocation</b><br>"
+                        "Name: %{customdata[0]}<br>"
+                        "Start: %{customdata[1]:d}<br>"
+                        "End: %{customdata[2]:d}<br>"
+                        "Length: %{customdata[3]:d}"
+                        "<extra></extra>"
+                    ),
+                    name="Translocation",
+                    showlegend=False,
+                ))
+
+        # Add translocation legend entry
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(symbol="arrow-right", size=14, color=TRANSLOCATION_COLOR, angle=0),
+            name="Translocation",
+            showlegend=True,
+            hoverinfo="skip",
+        ))
 
     # Redraw inversion borders on top of overlays only when indels are shown
     if inversion_rects and show_indels and indels_base_path:

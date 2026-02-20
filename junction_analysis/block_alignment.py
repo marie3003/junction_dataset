@@ -248,13 +248,19 @@ def analyze_alignment(path, return_pairwise_dists=False):
         return stats
     
 def summarize_block_msas(junction_name, cl=None, save_df=True, return_pairwise_dists=False,
-                         base_full="../results/block_alignments",
-                         base_cluster="../results/block_alignments_cluster"):
+                         base_full=None,
+                         base_cluster=None):
     """
     Creates summary statistics for block alignments.
     If cl is None: summarize ../results/block_alignments/<junction_name>/block_*_aln.fa
     If cl is not None: summarize ../results/block_alignments_cluster/<junction_name>/cluster_<cl>/alns/block_*_aln.fa
     """
+
+    results_dir = repo_root() / "results"
+    if base_full is None:
+        base_full = results_dir / "block_alignments"
+    if base_cluster is None:
+        base_cluster = results_dir / "block_alignments_cluster"
 
     if cl is None:
         aligned_dir = Path(base_full) / str(junction_name)
@@ -289,7 +295,7 @@ def summarize_block_msas(junction_name, cl=None, save_df=True, return_pairwise_d
 
     df = df.sort_values("block_id")
 
-    pangraph = pp.Pangraph.from_json(f"../results/junction_pangraphs/{junction_name}.json")
+    pangraph = pp.Pangraph.from_json(str(repo_root() / "results" / "junction_pangraphs" / f"{junction_name}.json"))
     blockstats_df = pangraph.to_blockstats_df().reset_index()
     df = df.merge(blockstats_df, on="block_id", how="left")
 
@@ -351,7 +357,7 @@ def build_block_trees(
     min_core_len : int, optional
         Minimum core alignment length (core_len) required to run FastTree.
     """
-    aligned_dir = Path(f"../results/block_alignments/{junction_name}")
+    aligned_dir = repo_root() / "results" / "block_alignments" / junction_name
     aln_files = sorted(aligned_dir.glob("block_*_aln.fa"))
 
     if not aln_files:
