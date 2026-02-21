@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
@@ -232,6 +232,252 @@ def get_insertions_deletions(deduplicated_paths, consensus_path):
 
     return insertions, deletions, inversions, translocations
 
+def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C901
+    """Identify insertions, deletions, inversions, and translocations.
+
+    For each (consensus, isolate) pair, context is recomputed locally:
+    each block gets the id of the nearest anchor block to its left as context.
+    Anchors are block ids that appear exactly once in both paths with the same
+    strand. If an anchor id equals the block id being assigned context, "_1" is
+    appended to keep (block_id, context) unique. The first block always gets
+    empty context.
+
+    Detection (three passes):
+      Pass 1 (isolate):   insertions and translocations
+      Pass 2 (consensus): deletions
+      Pass 3 (isolate):   inversions
+
+    Arguments:
+        deduplicated_paths: dict of isolate -> Path object
+        consensus_path: Path object representing the consensus path
+
+    Returns:
+        insertions:     dict of isolate -> list of pu.Path objects
+        deletions:      dict of isolate -> list of dicts {"path": pu.Path, "left_nid": ...}
+        inversions:     dict of isolate -> list of pu.Path objects
+        translocations: dict of isolate -> list of pu.Path objects
+    """
+    insertions     = {}
+    deletions      = {}
+    inversions     = {}
+    translocations = {}
+
+    for isolate, path in deduplicated_paths.items():
+        c_nodes   = list(consensus_path.nodes)
+        iso_nodes = list(path.nodes)
+
+        # ------------------------------------------------------------------ #
+        # Step 1: anchor-based context assignment                             #
+        # Anchors: block ids appearing exactly once in both paths, same strand #
+        # Context of each node = id of nearest anchor to its left             #
+        # Special case: if anchor id == node id, use f"{anchor_id}_1"        #
+        # First node always gets empty context ""                             #
+        # ------------------------------------------------------------------ #
+        c_id_counts   = Counter(n.id for n in c_nodes)
+        iso_id_counts = Counter(n.id for n in iso_nodes)
+        c_id_to_strand   = {n.id: n.strand for n in c_nodes   if c_id_counts[n.id]   == 1}
+        iso_id_to_strand = {n.id: n.strand for n in iso_nodes if iso_id_counts[n.id] == 1}
+
+        anchor_ids = {
+            bid for bid in c_id_counts
+            if c_id_counts[bid] == 1
+            and iso_id_counts.get(bid, 0) == 1
+            and c_id_to_strand.get(bid) == iso_id_to_strand.get(bid)
+        }
+
+        def _assign_ctx(nodes):
+            """Return list of context strings, one per node.
+
+            Within each anchor region (between two anchor updates), track which
+            block ids have already received a context assignment. If the same
+            block id would receive the same (id, base_ctx) combination again,
+            append an increasing counter (_2, _3, ...) to make it unique.
+            The counter resets whenever the anchor (cur) changes.
+            """
+            cur = None
+            ctxs = []
+            region_counts = Counter()  # block_id -> times seen in current anchor region
+
+            for i, n in enumerate(nodes):
+                # Derive base context from current anchor
+                if i == 0 or cur is None:
+                    base_ctx = ""
+                else:
+                    base_ctx = str(cur)
+
+                # Number duplicate (id, base_ctx) combinations within this region
+                region_counts[n.id] += 1
+                count = region_counts[n.id]
+                ctx = base_ctx if count == 1 else f"{base_ctx}_{count}"
+
+                ctxs.append(ctx)
+
+                # Update anchor AFTER assigning context; reset region counter on change
+                if n.id in anchor_ids:
+                    if cur != n.id:
+                        region_counts = Counter()
+                    cur = n.id
+
+            return ctxs
+
+        c_ctxs   = _assign_ctx(c_nodes)
+        iso_ctxs = _assign_ctx(iso_nodes)
+
+        # ------------------------------------------------------------------ #
+        # Step 2: build the perfect-match pool                                #
+        # Perfect match: same (id, ctx, strand) in both paths.               #
+        # Tag each node greedily left-to-right.                              #
+        # ------------------------------------------------------------------ #
+        # Lookups over both paths                                             #
+        # ------------------------------------------------------------------ #
+        c_id_ctx_strand   = {(n.id, ctx): n.strand for n, ctx in zip(c_nodes,   c_ctxs)}
+        iso_id_ctx_strand = {(n.id, ctx): n.strand for n, ctx in zip(iso_nodes, iso_ctxs)}
+
+        # matched: set of (id, ctx) tuples already accounted for.
+        # Starts with perfect matches (same id, ctx, strand in both paths).
+        # Grows as insertions and translocations are identified in pass 1.
+        # Used by passes 2 and 3 to skip already-handled nodes.
+        matched = {
+            key for key in c_id_ctx_strand
+            if key in iso_id_ctx_strand
+            #and c_id_ctx_strand[key] == iso_id_ctx_strand[key]
+        }
+
+
+        # For translocation lookup: id -> list of unmatched consensus ctx values.
+        # Exclude ids that already have a perfect match.
+        c_ctx_by_id = defaultdict(list)
+        for n, ctx in zip(c_nodes, c_ctxs):
+            if (n.id, ctx) not in matched:
+                c_ctx_by_id[n.id].append(ctx)
+
+        # iso (id, ctx) -> node, for position tracking in pass 2
+        iso_id_ctx_to_node = {(n.id, ctx): n for n, ctx in zip(iso_nodes, iso_ctxs)}
+
+        # ------------------------------------------------------------------ #
+        # Pass 1: walk isolate — insertions and translocations               #
+        # ------------------------------------------------------------------ #
+        current_insertion     = []
+        current_translocation = []
+        ins_strand = None
+
+        def flush_ins():
+            nonlocal current_insertion, ins_strand
+            if current_insertion:
+                insertions.setdefault(isolate, []).append(pu.Path(list(current_insertion)))
+                current_insertion = []
+            ins_strand = None
+
+        def flush_trans():
+            nonlocal current_translocation
+            if current_translocation:
+                translocations.setdefault(isolate, []).append(pu.Path(list(current_translocation)))
+                current_translocation = []
+
+        for n, ctx in zip(iso_nodes, iso_ctxs):
+            if (n.id, ctx) in matched:
+                flush_ins()
+                flush_trans()
+                continue
+
+            # Inversion: (id, ctx) exists in consensus but strand differs → skip here
+            #c_strand = c_id_ctx_strand.get((n.id, ctx))
+            #if c_strand is not None and (n.id, ctx) not in matched and n.strand != c_strand:
+            #    flush_ins()
+            #    flush_trans()
+            #    continue
+
+            # Translocation: same id exists in unmatched consensus (different ctx)
+            avail = c_ctx_by_id.get(n.id, [])
+            if isolate == "NZ_CP035516.1":
+                print(f"Checking isolate {isolate} node {n} with ctx {ctx}: available consensus ctxs for id {n.id} are {avail}")
+            if avail:
+                c_ctx = avail.pop(0)
+                matched.add((n.id, c_ctx))   # mark consensus side as dealt with
+                matched.add((n.id, ctx))      # mark iso side as dealt with
+                flush_ins()
+                current_translocation.append(n)
+            else:
+                # No consensus counterpart → insertion
+                matched.add((n.id, ctx))
+                flush_trans()
+                if ins_strand is None:
+                    ins_strand = n.strand
+                    current_insertion.append(n)
+                elif n.strand == ins_strand:
+                    current_insertion.append(n)
+                else:
+                    flush_ins()
+                    ins_strand = n.strand
+                    current_insertion.append(n)
+
+        flush_ins()
+        flush_trans()
+
+        # ------------------------------------------------------------------ #
+        # Pass 2: walk consensus — deletions                                  #
+        # Matched nodes update last-seen iso node for position tracking.     #
+        # ------------------------------------------------------------------ #
+        last_iso_node    = None
+        current_deletion = []
+        del_strand       = None
+
+        def flush_del():
+            nonlocal current_deletion, del_strand, last_iso_node
+            if current_deletion:
+                deletions.setdefault(isolate, []).append({
+                    "path": pu.Path(list(current_deletion)),
+                    "left_nid": last_iso_node.nid if last_iso_node else None,
+                })
+                current_deletion = []
+            del_strand = None
+
+        for n, ctx in zip(c_nodes, c_ctxs):
+            if (n.id, ctx) in matched:
+                iso_n = iso_id_ctx_to_node.get((n.id, ctx))
+                if iso_n is not None:
+                    flush_del()
+                    last_iso_node = iso_n
+                continue
+
+            # Unmatched consensus node → deletion
+            if del_strand is None:
+                del_strand = n.strand
+                current_deletion.append(n)
+            elif n.strand == del_strand:
+                current_deletion.append(n)
+            else:
+                flush_del()
+                del_strand = n.strand
+                current_deletion.append(n)
+
+        flush_del()
+
+        # ------------------------------------------------------------------ #
+        # Pass 3: walk isolate again — inversions                             #
+        # Inversion: exact (id, ctx) match in consensus but opposite strand. #
+        # No matched-set check needed.                                        #
+        # ------------------------------------------------------------------ #
+        current_inversion = []
+
+        def flush_inv():
+            nonlocal current_inversion
+            if current_inversion:
+                inversions.setdefault(isolate, []).append(pu.Path(list(current_inversion)))
+                current_inversion = []
+
+        for n, ctx in zip(iso_nodes, iso_ctxs):
+            c_strand = c_id_ctx_strand.get((n.id, ctx))
+            if c_strand is not None and n.strand != c_strand:
+                current_inversion.append(n)
+            else:
+                flush_inv()
+
+        flush_inv()
+
+    return insertions, deletions, inversions, translocations
+
+
 def get_isolate_sequence_from_fasta(fasta_path, isolate_name):
     """
     Reads a FASTA file and returns the sequence for the given isolate name.
@@ -335,7 +581,7 @@ def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, dedu
     deduplicated_paths = {iso: path for iso, path in deduplicated_paths.items() if iso in isolates_1}
 
     # compare deduplicated paths to consensus paths to find deviations, consensus paths are already deduplicated
-    insertions, deletions, inversions, translocations = get_insertions_deletions(deduplicated_paths, consensus_paths[consensus - 1])
+    insertions, deletions, inversions, translocations = get_insertions_deletions_v2(deduplicated_paths, consensus_paths[consensus - 1])
 
     # Print results
     if verbose:

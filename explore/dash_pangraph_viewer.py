@@ -368,6 +368,8 @@ if __name__ == "__main__":
         tree_path=str(tree_path),
     )
 
+    print(path_dict['NZ_LS992168.1'])
+
     app = make_junction_dash_app(
         pan=pangraph,
         consensus_paths_plotting=consensus_paths_plotting,

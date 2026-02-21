@@ -581,7 +581,8 @@ def plot_junction_pangraph_interactive(
                     del_xs.append(pos)
                     del_ys.append(label)
                     lines = [f"<b>Deletion (#{e['num']})</b> Length={e['length']:g} Strand={e['strand']} Blocks={e['blocks']}" for e in entries]
-                    hover = f"Position = {int(pos)}<br>" + "<br>".join(lines)
+                    pos_str = "N/A" if (pos != pos) else str(int(pos))  # NaN check
+                    hover = f"Position = {pos_str}<br>" + "<br>".join(lines)
                     del_hovertexts.append(hover)
 
                 fig.add_trace(go.Scatter(
@@ -659,6 +660,7 @@ def plot_junction_pangraph_interactive(
 
         # Load translocations — draw arrows from start to end of translocated region
         TRANSLOCATION_COLOR = "rgb(0,0,255)"  # blue
+        MIN_ARROW_SPAN = max_x * 0.01  # 1 % of total x range keeps arrowhead always visible
 
         for i, cons_path in enumerate(consensus_paths):
             trans_file = os.path.join(indels_base_path, "translocations", junction_name, f"consensus_{i+1}", "translocations_summary.csv")
@@ -673,9 +675,16 @@ def plot_junction_pangraph_interactive(
                 if label not in y_labels:
                     continue
 
+                start = row["start_pos"]
+                end   = row["end_pos"]
+                if abs(end - start) < MIN_ARROW_SPAN:
+                    mid   = (start + end) / 2
+                    start = mid - MIN_ARROW_SPAN / 2
+                    end   = mid + MIN_ARROW_SPAN / 2
+
                 fig.add_annotation(
-                    x=row["end_pos"], y=label,
-                    ax=row["start_pos"], ay=label,
+                    x=end, y=label,
+                    ax=start, ay=label,
                     xref="x", yref="y",
                     axref="x", ayref="y",
                     showarrow=True,
@@ -714,10 +723,11 @@ def plot_junction_pangraph_interactive(
                     showlegend=False,
                 ))
 
-        # Add translocation legend entry
+        # Add translocation legend entry — lines+markers gives a tail + arrowhead icon
         fig.add_trace(go.Scatter(
             x=[None], y=[None],
-            mode="markers",
+            mode="lines+markers",
+            line=dict(color=TRANSLOCATION_COLOR, width=2),
             marker=dict(symbol="arrow-right", size=14, color=TRANSLOCATION_COLOR, angle=0),
             name="Translocation",
             showlegend=True,
@@ -1767,7 +1777,8 @@ def add_annotations_for_dash(
                     del_xs.append(pos)
                     del_ys.append(label)
                     lines = [f"<b>Deletion (#{e['num']})</b> Length={e['length']:g} Strand={e['strand']} Blocks={e['blocks']}" for e in entries]
-                    hover = f"Position = {int(pos)}<br>" + "<br>".join(lines)
+                    pos_str = "N/A" if (pos != pos) else str(int(pos))  # NaN check
+                    hover = f"Position = {pos_str}<br>" + "<br>".join(lines)
                     del_hovertexts.append(hover)
 
                 fig.add_trace(go.Scatter(
@@ -1845,6 +1856,7 @@ def add_annotations_for_dash(
 
         # Load translocations — draw arrows from start to end of translocated region
         TRANSLOCATION_COLOR = "rgb(0,0,255)"
+        MIN_ARROW_SPAN = max_x * 0.01
 
         for i, cons_path in enumerate(consensus_paths):
             trans_file = os.path.join(indels_base_path, "translocations", junction_name, f"consensus_{i+1}", "translocations_summary.csv")
@@ -1859,9 +1871,16 @@ def add_annotations_for_dash(
                 if label not in y_labels:
                     continue
 
+                start = row["start_pos"]
+                end   = row["end_pos"]
+                if abs(end - start) < MIN_ARROW_SPAN:
+                    mid   = (start + end) / 2
+                    start = mid - MIN_ARROW_SPAN / 2
+                    end   = mid + MIN_ARROW_SPAN / 2
+
                 fig.add_annotation(
-                    x=row["end_pos"], y=label,
-                    ax=row["start_pos"], ay=label,
+                    x=end, y=label,
+                    ax=start, ay=label,
                     xref="x", yref="y",
                     axref="x", ayref="y",
                     showarrow=True,
@@ -1900,10 +1919,11 @@ def add_annotations_for_dash(
                     showlegend=False,
                 ))
 
-        # Add translocation legend entry
+        # Add translocation legend entry — lines+markers gives a tail + arrowhead icon
         fig.add_trace(go.Scatter(
             x=[None], y=[None],
-            mode="markers",
+            mode="lines+markers",
+            line=dict(color=TRANSLOCATION_COLOR, width=2),
             marker=dict(symbol="arrow-right", size=14, color=TRANSLOCATION_COLOR, angle=0),
             name="Translocation",
             showlegend=True,
