@@ -267,108 +267,88 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         iso_nodes = list(path.nodes)
 
         # ------------------------------------------------------------------ #
-        # Step 1: anchor-based context assignment                             #
-        # Anchors: block ids appearing exactly once in both paths, same strand #
-        # Context of each node = id of nearest anchor to its left             #
-        # Special case: if anchor id == node id, use f"{anchor_id}_1"        #
-        # First node always gets empty context ""                             #
+        # Compute candidate anchor ids (blocks appearing exactly once in both #
+        # paths with the same strand). Translocated block ids will be removed #
+        # after a preliminary detection run.                                  #
         # ------------------------------------------------------------------ #
         c_id_counts   = Counter(n.id for n in c_nodes)
         iso_id_counts = Counter(n.id for n in iso_nodes)
         c_id_to_strand   = {n.id: n.strand for n in c_nodes   if c_id_counts[n.id]   == 1}
         iso_id_to_strand = {n.id: n.strand for n in iso_nodes if iso_id_counts[n.id] == 1}
 
-        anchor_ids = {
-            bid for bid in c_id_counts
-            if c_id_counts[bid] == 1
-            and iso_id_counts.get(bid, 0) == 1
-            and c_id_to_strand.get(bid) == iso_id_to_strand.get(bid)
-        }
+        def _candidate_anchor_ids(excluded=frozenset()):
+            return {
+                bid for bid in c_id_counts
+                if c_id_counts[bid] == 1
+                and iso_id_counts.get(bid, 0) == 1
+                and c_id_to_strand.get(bid) == iso_id_to_strand.get(bid)
+                and bid not in excluded
+            }
 
-        def _assign_ctx(nodes):
-            """Return list of context strings, one per node.
-
-            Within each anchor region (between two anchor updates), track which
-            block ids have already received a context assignment. If the same
-            block id would receive the same (id, base_ctx) combination again,
-            append an increasing counter (_2, _3, ...) to make it unique.
-            The counter resets whenever the anchor (cur) changes.
-            """
+        def _assign_ctx(nodes, anchor_ids):
             cur = None
             ctxs = []
-            region_counts = Counter()  # block_id -> times seen in current anchor region
-
+            region_counts = Counter()
             for i, n in enumerate(nodes):
-                # Derive base context from current anchor
-                if i == 0 or cur is None:
-                    base_ctx = ""
-                else:
-                    base_ctx = str(cur)
-
-                # Number duplicate (id, base_ctx) combinations within this region
+                base_ctx = "" if (i == 0 or cur is None) else str(cur)
                 region_counts[n.id] += 1
                 count = region_counts[n.id]
                 ctx = base_ctx if count == 1 else f"{base_ctx}_{count}"
-
                 ctxs.append(ctx)
-
-                # Update anchor AFTER assigning context; reset region counter on change
                 if n.id in anchor_ids:
                     if cur != n.id:
                         region_counts = Counter()
                     cur = n.id
-
             return ctxs
 
-        c_ctxs   = _assign_ctx(c_nodes)
-        iso_ctxs = _assign_ctx(iso_nodes)
+        def _detect_translocations(anchor_ids):
+            """Preliminary pass: return the set of translocated block ids."""
+            c_ctxs   = _assign_ctx(c_nodes, anchor_ids)
+            iso_ctxs = _assign_ctx(iso_nodes, anchor_ids)
+            c_id_ctx_strand = {(n.id, ctx): n.strand for n, ctx in zip(c_nodes, c_ctxs)}
+            iso_id_ctx_strand = {(n.id, ctx): n.strand for n, ctx in zip(iso_nodes, iso_ctxs)}
+            matched = {key for key in c_id_ctx_strand if key in iso_id_ctx_strand}
+            c_ctx_by_id = defaultdict(list)
+            for n, ctx in zip(c_nodes, c_ctxs):
+                if (n.id, ctx) not in matched:
+                    c_ctx_by_id[n.id].append(ctx)
+            translocated_ids = set()
+            for n, ctx in zip(iso_nodes, iso_ctxs):
+                if (n.id, ctx) in matched:
+                    continue
+                if c_ctx_by_id.get(n.id):
+                    c_ctx_by_id[n.id].pop(0)
+                    translocated_ids.add(n.id)
+            return translocated_ids
+
+        # Preliminary run to find translocated ids, then exclude them as anchors
+        preliminary_trans_ids = _detect_translocations(_candidate_anchor_ids())
+        anchor_ids = _candidate_anchor_ids(excluded=preliminary_trans_ids)
 
         # ------------------------------------------------------------------ #
-        # Step 2: build the perfect-match pool                                #
-        # Perfect match: same (id, ctx, strand) in both paths.               #
-        # Tag each node greedily left-to-right.                              #
+        # Build final contexts with translocated ids excluded from anchors    #
         # ------------------------------------------------------------------ #
-        # Lookups over both paths                                             #
-        # ------------------------------------------------------------------ #
+        c_ctxs   = _assign_ctx(c_nodes,   anchor_ids)
+        iso_ctxs = _assign_ctx(iso_nodes, anchor_ids)
+
         c_id_ctx_strand   = {(n.id, ctx): n.strand for n, ctx in zip(c_nodes,   c_ctxs)}
         iso_id_ctx_strand = {(n.id, ctx): n.strand for n, ctx in zip(iso_nodes, iso_ctxs)}
+        matched = {key for key in c_id_ctx_strand if key in iso_id_ctx_strand}
 
-        # matched: set of (id, ctx) tuples already accounted for.
-        # Starts with perfect matches (same id, ctx, strand in both paths).
-        # Grows as insertions and translocations are identified in pass 1.
-        # Used by passes 2 and 3 to skip already-handled nodes.
-        matched = {
-            key for key in c_id_ctx_strand
-            if key in iso_id_ctx_strand
-            #and c_id_ctx_strand[key] == iso_id_ctx_strand[key]
-        }
-
-
-        # For translocation lookup: id -> list of unmatched consensus ctx values.
-        # Exclude ids that already have a perfect match.
         c_ctx_by_id = defaultdict(list)
         for n, ctx in zip(c_nodes, c_ctxs):
             if (n.id, ctx) not in matched:
                 c_ctx_by_id[n.id].append(ctx)
 
-        # iso (id, ctx) -> node, for position tracking in pass 2
         iso_id_ctx_to_node = {(n.id, ctx): n for n, ctx in zip(iso_nodes, iso_ctxs)}
-
-        # id -> its own context (for anchor-chain lookup during pass 1)
-        c_id_to_ctx   = {n.id: ctx for n, ctx in zip(c_nodes,   c_ctxs)}
-        iso_id_to_ctx = {n.id: ctx for n, ctx in zip(iso_nodes, iso_ctxs)}
 
         # ------------------------------------------------------------------ #
         # Pass 1: walk isolate — insertions and translocations               #
         # ------------------------------------------------------------------ #
         current_insertion     = []
         current_translocation = []
-        current_trans_first_iso_ctx = None  # iso ctx of first block in current translocation
-        current_trans_first_c_ctx   = None  # consensus ctx of first block in current translocation
         ins_strand = None
-
-        # parallel list to translocations[isolate]: stores (iso_ctx, c_ctx) of first block
-        trans_first_ctxs = []
+        trans_first_ctxs = []  # parallel to translocations[isolate]: (iso_ctx, c_ctx) of first block
 
         def flush_ins():
             nonlocal current_insertion, ins_strand
@@ -378,35 +358,27 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
             ins_strand = None
 
         def flush_trans():
-            nonlocal current_translocation, current_trans_first_iso_ctx, current_trans_first_c_ctx
+            nonlocal current_translocation
             if current_translocation:
                 translocations.setdefault(isolate, []).append(pu.Path(list(current_translocation)))
-                trans_first_ctxs.append((current_trans_first_iso_ctx, current_trans_first_c_ctx))
                 current_translocation = []
-                current_trans_first_iso_ctx = None
-                current_trans_first_c_ctx   = None
 
-        translocated_blocks = set()
         for n, ctx in zip(iso_nodes, iso_ctxs):
             if (n.id, ctx) in matched:
                 flush_ins()
                 flush_trans()
                 continue
 
-            # Translocation: same id exists in unmatched consensus (different ctx)
             avail = c_ctx_by_id.get(n.id, [])
             if avail:
                 c_ctx = avail.pop(0)
-                matched.add((n.id, c_ctx))   # mark consensus side as dealt with
-                matched.add((n.id, ctx))      # mark iso side as dealt with
-                translocated_blocks.add(str(n.id))
+                matched.add((n.id, c_ctx))
+                matched.add((n.id, ctx))
                 flush_ins()
                 if not current_translocation:
-                    current_trans_first_iso_ctx = ctx
-                    current_trans_first_c_ctx   = c_ctx
+                    trans_first_ctxs.append((ctx, c_ctx))
                 current_translocation.append(n)
             else:
-                # No consensus counterpart → insertion
                 matched.add((n.id, ctx))
                 flush_trans()
                 if ins_strand is None:
@@ -422,78 +394,34 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         flush_ins()
         flush_trans()
 
-        # Update contexts that reference a translocated block id as their anchor.
-        # Replace the base (before any _N suffix) with the translocated block's
-        # own context, keeping the _N numbering intact.
-        if translocated_blocks:
-            c_ctx_of_trans   = {str(n.id): ctx for n, ctx in zip(c_nodes,   c_ctxs)   if str(n.id) in translocated_blocks}
-            iso_ctx_of_trans = {str(n.id): ctx for n, ctx in zip(iso_nodes, iso_ctxs) if str(n.id) in translocated_blocks}
-
-            def _update_ctx(ctx, ctx_of_trans):
-                parts = ctx.split("_", 1)
-                base  = parts[0]
-                suffix = ("_" + parts[1]) if len(parts) > 1 else ""
-                if base in ctx_of_trans:
-                    return str(ctx_of_trans[base]) + suffix
-                return ctx
-
-            old_c_ctxs   = c_ctxs
-            old_iso_ctxs = iso_ctxs
-            c_ctxs   = [_update_ctx(ctx, c_ctx_of_trans)   for ctx in c_ctxs]
-            iso_ctxs = [_update_ctx(ctx, iso_ctx_of_trans) for ctx in iso_ctxs]
-
-            # Rebuild lookups used in passes 2 and 3 with the updated contexts
-            old_to_new_c   = {(n.id, old): (n.id, new) for n, old, new in zip(c_nodes,   old_c_ctxs,   c_ctxs)}
-            old_to_new_iso = {(n.id, old): (n.id, new) for n, old, new in zip(iso_nodes, old_iso_ctxs, iso_ctxs)}
-            matched = {old_to_new_c.get(key, old_to_new_iso.get(key, key)) for key in matched}
-            c_id_ctx_strand   = {(n.id, ctx): n.strand for n, ctx in zip(c_nodes,   c_ctxs)}
-            iso_id_ctx_strand = {(n.id, ctx): n.strand for n, ctx in zip(iso_nodes, iso_ctxs)}
-            iso_id_ctx_to_node = {(n.id, ctx): n for n, ctx in zip(iso_nodes, iso_ctxs)}
-
-        # Post-process: remove translocations whose anchors were themselves
-        # translocated. Use the stored first-block contexts (no id lookup needed).
-        # For real translocations, extend by walking forward in both paths as long
-        # as the next block id matches.
-        def _resolve_ctx(ctx, id_to_ctx):
-            anchor = ctx.split("_", 1)[0]
-            if anchor in translocated_blocks:
-                return id_to_ctx.get(int(anchor), ctx)
-            return ctx
-
+        # Extend each translocation forward as long as the next block id matches
+        # in both paths, then drop any that is fully contained in another.
         iso_id_ctx_to_pos = {(n.id, ctx): i for i, (n, ctx) in enumerate(zip(iso_nodes, iso_ctxs))}
         c_id_ctx_to_pos   = {(n.id, ctx): i for i, (n, ctx) in enumerate(zip(c_nodes,   c_ctxs))}
 
-        real_translocations = []
         for trans_path, (iso_ctx, c_ctx) in zip(translocations.get(isolate, []), trans_first_ctxs):
-            new_iso_ctx = _resolve_ctx(iso_ctx, iso_id_to_ctx)
-            new_c_ctx   = _resolve_ctx(c_ctx,   c_id_to_ctx)
-            if new_iso_ctx != new_c_ctx:
-                # Find positions of the first block in both paths
-                first_node = trans_path.nodes[0]
-                iso_pos = iso_id_ctx_to_pos.get((first_node.id, iso_ctx))
-                c_pos   = c_id_ctx_to_pos  .get((first_node.id, c_ctx))
-                # Advance to position after the last already-detected block
-                if iso_pos is not None and c_pos is not None:
-                    iso_pos += len(trans_path.nodes)
-                    c_pos   += len(trans_path.nodes)
-                    while iso_pos < len(iso_nodes) and c_pos < len(c_nodes):
-                        if iso_nodes[iso_pos].id != c_nodes[c_pos].id:
-                            break
-                        trans_path.nodes.append(iso_nodes[iso_pos])
-                        iso_pos += 1
-                        c_pos   += 1
-                real_translocations.append(trans_path)
-        # Drop translocations whose first block appears inside another translocation.
-        # Use the original node definitions (n.id, n.context) which are unique.
+            first_node = trans_path.nodes[0]
+            iso_pos = iso_id_ctx_to_pos.get((first_node.id, iso_ctx))
+            c_pos   = c_id_ctx_to_pos  .get((first_node.id, c_ctx))
+            if iso_pos is not None and c_pos is not None:
+                iso_pos += len(trans_path.nodes)
+                c_pos   += len(trans_path.nodes)
+                while iso_pos < len(iso_nodes) and c_pos < len(c_nodes):
+                    if iso_nodes[iso_pos].id != c_nodes[c_pos].id:
+                        break
+                    trans_path.nodes.append(iso_nodes[iso_pos])
+                    iso_pos += 1
+                    c_pos   += 1
+
+        all_trans = translocations.get(isolate, [])
         filtered_translocations = [
-            tp for tp in real_translocations
+            tp for tp in all_trans
             if not any(
                 (tp.nodes[0].id, tp.nodes[0].context) == (n.id, n.context)
-                for other in real_translocations if other is not tp
+                for other in all_trans if other is not tp
                 for n in other.nodes
             )
         ]
-
         if filtered_translocations:
             translocations[isolate] = filtered_translocations
         elif isolate in translocations:
@@ -501,7 +429,6 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
 
         # ------------------------------------------------------------------ #
         # Pass 2: walk consensus — deletions                                  #
-        # Matched nodes update last-seen iso node for position tracking.     #
         # ------------------------------------------------------------------ #
         last_iso_node    = None
         current_deletion = []
@@ -525,7 +452,6 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                     last_iso_node = iso_n
                 continue
 
-            # Unmatched consensus node → deletion
             if del_strand is None:
                 del_strand = n.strand
                 current_deletion.append(n)
@@ -553,6 +479,8 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         for n, ctx in zip(iso_nodes, iso_ctxs):
             c_strand = c_id_ctx_strand.get((n.id, ctx))
             if c_strand is not None and n.strand != c_strand:
+                if isolate == "NZ_CP124471.1":
+                    print(f"Isolate {isolate} block {n} with context {ctx} is inverted: iso strand {n.strand} vs cons strand {c_strand}")
                 current_inversion.append(n)
             else:
                 flush_inv()
