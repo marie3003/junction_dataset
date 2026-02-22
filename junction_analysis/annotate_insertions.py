@@ -354,6 +354,10 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         # iso (id, ctx) -> node, for position tracking in pass 2
         iso_id_ctx_to_node = {(n.id, ctx): n for n, ctx in zip(iso_nodes, iso_ctxs)}
 
+        # id -> its own context (for anchor-chain lookup during pass 1)
+        c_id_to_ctx   = {n.id: ctx for n, ctx in zip(c_nodes,   c_ctxs)}
+        iso_id_to_ctx = {n.id: ctx for n, ctx in zip(iso_nodes, iso_ctxs)}
+
         # ------------------------------------------------------------------ #
         # Pass 1: walk isolate — insertions and translocations               #
         # ------------------------------------------------------------------ #
@@ -374,6 +378,7 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 translocations.setdefault(isolate, []).append(pu.Path(list(current_translocation)))
                 current_translocation = []
 
+        translocated_blocks = set()
         for n, ctx in zip(iso_nodes, iso_ctxs):
             if (n.id, ctx) in matched:
                 flush_ins()
@@ -388,13 +393,34 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
             #    continue
 
             # Translocation: same id exists in unmatched consensus (different ctx)
+
             avail = c_ctx_by_id.get(n.id, [])
             if isolate == "NZ_CP035516.1":
                 print(f"Checking isolate {isolate} node {n} with ctx {ctx}: available consensus ctxs for id {n.id} are {avail}")
             if avail:
+
                 c_ctx = avail.pop(0)
+                if c_ctx.split("_", 1)[0] in translocated_blocks or ctx.split("_", 1)[0] in translocated_blocks:
+                    # One of the anchors is moving --> might not actually be a translocation
+                    if c_ctx.split("_", 1)[0] in translocated_blocks:
+                        new_c_ctx = c_id_to_ctx.get(int(c_ctx.split("_", 1)[0]), c_ctx)
+                    else:
+                        new_c_ctx = c_ctx
+                    if ctx.split("_", 1)[0] in translocated_blocks:
+                        new_ctx = iso_id_to_ctx.get(int(ctx.split("_", 1)[0]), ctx)
+                    else:
+                        new_ctx = ctx
+                    print(new_c_ctx, new_ctx)
+                    if new_c_ctx == new_ctx:
+                        flush_ins()
+                        flush_trans()
+                        matched.add((n.id, c_ctx))   # mark consensus side as dealt with
+                        matched.add((n.id, ctx))      # mark iso side as dealt with
+                        continue
+
                 matched.add((n.id, c_ctx))   # mark consensus side as dealt with
                 matched.add((n.id, ctx))      # mark iso side as dealt with
+                translocated_blocks.add(str(n.id))
                 flush_ins()
                 current_translocation.append(n)
             else:

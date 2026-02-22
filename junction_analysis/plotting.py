@@ -1527,6 +1527,7 @@ def add_annotations_for_dash(
     junction_name: str = None,
     consensus_paths: list = None,
     inversion_rects: list = None,
+    max_x: float = None,
 ):
     """
     Adds annotation layers to an existing Plotly figure of a pangraph.
@@ -1856,7 +1857,7 @@ def add_annotations_for_dash(
 
         # Load translocations — draw arrows from start to end of translocated region
         TRANSLOCATION_COLOR = "rgb(0,0,255)"
-        MIN_ARROW_SPAN = max_x * 0.01
+        MIN_ARROW_SPAN = (max_x or 1) * 0.01
 
         for i, cons_path in enumerate(consensus_paths):
             trans_file = os.path.join(indels_base_path, "translocations", junction_name, f"consensus_{i+1}", "translocations_summary.csv")

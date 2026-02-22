@@ -152,6 +152,7 @@ def make_junction_dash_app(
         junction_name=junction_name,
         consensus_paths=consensus_paths_plotting,
         inversion_rects=inversion_rects,
+        max_x=max_x,
     )
 
     base_fig.update_layout(
