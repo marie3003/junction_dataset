@@ -347,15 +347,13 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         # ------------------------------------------------------------------ #
         current_insertion     = []
         current_translocation = []
-        ins_strand = None
         trans_first_ctxs = []  # parallel to translocations[isolate]: (iso_ctx, c_ctx) of first block
 
         def flush_ins():
-            nonlocal current_insertion, ins_strand
+            nonlocal current_insertion
             if current_insertion:
                 insertions.setdefault(isolate, []).append(pu.Path(list(current_insertion)))
                 current_insertion = []
-            ins_strand = None
 
         def flush_trans():
             nonlocal current_translocation
@@ -381,15 +379,7 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
             else:
                 matched.add((n.id, ctx))
                 flush_trans()
-                if ins_strand is None:
-                    ins_strand = n.strand
-                    current_insertion.append(n)
-                elif n.strand == ins_strand:
-                    current_insertion.append(n)
-                else:
-                    flush_ins()
-                    ins_strand = n.strand
-                    current_insertion.append(n)
+                current_insertion.append(n)
 
         flush_ins()
         flush_trans()
@@ -432,17 +422,15 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         # ------------------------------------------------------------------ #
         last_iso_node    = None
         current_deletion = []
-        del_strand       = None
 
         def flush_del():
-            nonlocal current_deletion, del_strand, last_iso_node
+            nonlocal current_deletion, last_iso_node
             if current_deletion:
                 deletions.setdefault(isolate, []).append({
                     "path": pu.Path(list(current_deletion)),
                     "left_nid": last_iso_node.nid if last_iso_node else None,
                 })
                 current_deletion = []
-            del_strand = None
 
         for n, ctx in zip(c_nodes, c_ctxs):
             if (n.id, ctx) in matched:
@@ -452,15 +440,7 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                     last_iso_node = iso_n
                 continue
 
-            if del_strand is None:
-                del_strand = n.strand
-                current_deletion.append(n)
-            elif n.strand == del_strand:
-                current_deletion.append(n)
-            else:
-                flush_del()
-                del_strand = n.strand
-                current_deletion.append(n)
+            current_deletion.append(n)
 
         flush_del()
 
@@ -476,11 +456,22 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 inversions.setdefault(isolate, []).append(pu.Path(list(current_inversion)))
                 current_inversion = []
 
+        insertion_id_ctxs = {
+            (n.id, n.context)
+            for ins_path in insertions.get(isolate, [])
+            for n in ins_path.nodes
+        } | {
+            (n.id, n.context)
+            for trans_path in translocations.get(isolate, [])
+            for n in trans_path.nodes
+        }
+
         for n, ctx in zip(iso_nodes, iso_ctxs):
+            if (n.id, n.context) in insertion_id_ctxs:
+                # Part of an insertion or translocation— skip without flushing the inversion to not interrupt it
+                continue
             c_strand = c_id_ctx_strand.get((n.id, ctx))
             if c_strand is not None and n.strand != c_strand:
-                if isolate == "NZ_CP124471.1":
-                    print(f"Isolate {isolate} block {n} with context {ctx} is inverted: iso strand {n.strand} vs cons strand {c_strand}")
                 current_inversion.append(n)
             else:
                 flush_inv()
@@ -512,9 +503,9 @@ def write_segment_fasta(example_junction, isolate_name, segment_name, consensus,
 
 def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1, save_df = False):
     """
-    retrieve sequence of insertion from isolate's block
-    insertion sequence should either be all inverted or all non-inverted, otherwise split in two
-    for inverted sequences write the last block first and then go to the front (result will be the correct blocks just the other way around)
+    Retrieve sequence of insertion from isolate's blocks.
+    Blocks are kept in their original order; minus-strand blocks have their
+    sequence reverse-complemented because they are stored as positive strand.
     """
     results = []
 
@@ -523,15 +514,16 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
 
     for isolate, inserted_paths in insertions.items():
         for idx, inserted_path in enumerate(inserted_paths):
-            seq = ""
             start_pos = pangraph.nodes[inserted_path.nodes[0].nid].start
             end_pos = pangraph.nodes[inserted_path.nodes[-1].nid].end
 
-            # switch block order if all - strand
-            if inserted_path.nodes[0].strand == False:
-                inserted_path.nodes.reverse()
+            parts = []
             for block in inserted_path.nodes:
-                seq = seq + get_isolate_sequence(pangraph, block.id, block.nid)
+                block_seq = get_isolate_sequence(pangraph, block.id, block.nid)
+                if not block.strand:
+                    block_seq = str(Seq(block_seq).reverse_complement())
+                parts.append(block_seq)
+            seq = "".join(parts)
             fasta_path = write_segment_fasta(example_junction, isolate, f"segment_{idx}", consensus, seq, inserted_path)
 
             results.append(
@@ -863,15 +855,10 @@ def summarize_deletions_consensus(
                 print(f"Processing {iso} with {path}")
 
                 
-                # Use reversed node order if deletion is on minus strand (do NOT mutate path.nodes)
-                nodes_for_deletion = list(path.nodes) # shallow copy
-                if nodes_for_deletion and nodes_for_deletion[0].strand is False:
-                    nodes_for_deletion.reverse()
-
                 build_tree_from_block_list(
                     pangraph,
                     path_dict,
-                    nodes_for_deletion,
+                    path.nodes,
                     isolates,
                     out_dir,
                     file_prefix,
@@ -885,11 +872,18 @@ def summarize_deletions_consensus(
             path = entry["path"]
             left_nid = entry["left_nid"]
             aln_path = os.path.join(out_dir, f"{iso}_deletion{idx}_blocks_aln.fa")
-            if not os.path.exists(aln_path):
-                print(f"Warning: alignment file not found, skipping: {aln_path}")
-                continue
+            if os.path.exists(aln_path):
+                consensus_seq = get_consensus_seq_from_alignment(aln_path)
+                consensus_sequence = str(consensus_seq)
+                length = len(consensus_seq)
+            else:
+                print(f"Warning: alignment file not found, consensus_sequence will be None: {aln_path}")
+                consensus_sequence = None
+                length = sum(
+                    int(pangraph.nodes[n.nid].end - pangraph.nodes[n.nid].start)
+                    for n in path.nodes
+                )
 
-            consensus_seq = get_consensus_seq_from_alignment(aln_path)
             results.append(
                 {
                     "junction_name": junction_name,
@@ -897,8 +891,8 @@ def summarize_deletions_consensus(
                     "genome_name": iso,
                     "path": str(path),
                     "deletion": f"deletion{idx}",
-                    "consensus_sequence": str(consensus_seq),
-                    "length": len(consensus_seq),
+                    "consensus_sequence": consensus_sequence,
+                    "length": length,
                     "position": pangraph.nodes[left_nid].end if left_nid is not None else None,
                     "strand": "+" if path.nodes[0].strand else "-",
                 }
@@ -1008,6 +1002,11 @@ def load_all_deletions_summaries(parent_dir, junction_name, save_df=False):
     base_dir = os.path.join(parent_dir, junction_name)
     all_dfs = []
 
+    if not os.path.isdir(base_dir):
+        print(f"No deletions directory found for {junction_name}, skipping.")
+        return pd.DataFrame(columns=["junction_name", "consensus", "genome_name", "path",
+                                     "deletion", "consensus_sequence", "length", "position", "strand"])
+
     for subdir in sorted(os.listdir(base_dir)):
         if not subdir.startswith("consensus_"):
             continue
@@ -1018,8 +1017,9 @@ def load_all_deletions_summaries(parent_dir, junction_name, save_df=False):
             all_dfs.append(df)
 
     if not all_dfs:
-        return pd.DataFrame()
-    
+        return pd.DataFrame(columns=["junction_name", "consensus", "genome_name", "path",
+                                     "deletion", "consensus_sequence", "length", "position", "strand"])
+
     complete_df = pd.concat(all_dfs, ignore_index=True)
     if save_df:
         complete_df.to_csv(os.path.join(base_dir, "all_deletions_summary.csv"), index=False)
@@ -1038,6 +1038,10 @@ def load_all_insertions_summaries(parent_dir, junction_name, save_df=False):
     """
     base_dir = os.path.join(parent_dir, junction_name)
     all_dfs = []
+
+    if not os.path.isdir(base_dir):
+        print(f"No insertions directory found for {junction_name}, skipping.")
+        return pd.DataFrame()
 
     for subdir in sorted(os.listdir(base_dir)):
         if not subdir.startswith("consensus"):
@@ -1135,6 +1139,10 @@ def load_all_translocations_summaries(parent_dir, junction_name, save_df=False):
     base_dir = os.path.join(parent_dir, junction_name)
     all_dfs = []
 
+    if not os.path.isdir(base_dir):
+        print(f"No translocations directory found for {junction_name}, skipping.")
+        return pd.DataFrame()
+
     for subdir in sorted(os.listdir(base_dir)):
         if not subdir.startswith("consensus_"):
             continue
@@ -1171,6 +1179,10 @@ def load_all_inversions_summaries(parent_dir, junction_name, save_df=False):
     base_dir = os.path.join(parent_dir, junction_name)
     all_dfs = []
 
+    if not os.path.isdir(base_dir):
+        print(f"No inversions directory found for {junction_name}, skipping.")
+        return pd.DataFrame()
+
     for subdir in sorted(os.listdir(base_dir)):
         if not subdir.startswith("consensus_"):
             continue
@@ -1192,4 +1204,73 @@ def load_all_inversions_summaries(parent_dir, junction_name, save_df=False):
         )
 
     return complete_df
+
+
+def combine_all_junctions_summaries(parent_dir, save_df=False):
+    """
+    Combine per-junction summary CSVs for insertions, deletions, translocations,
+    and inversions across all junctions found under parent_dir.
+
+    Expected directory structure:
+        parent_dir/
+            insertions/{junction_name}/consensus{n}/insertions_summary.csv
+            deletions/{junction_name}/consensus_{n}/deletions_summary.csv
+            translocations/{junction_name}/consensus_{n}/translocations_summary.csv
+            inversions/{junction_name}/consensus_{n}/inversions_summary.csv
+
+    Parameters
+    ----------
+    parent_dir : str
+        Root results directory, e.g. "../results/atb_lookup".
+    save_df : bool
+        If True, write one combined CSV per type into the respective type
+        directory, e.g. parent_dir/insertions/all_junctions_insertions.csv.
+
+    Returns
+    -------
+    dict with keys "insertions", "deletions", "translocations", "inversions",
+    each mapping to a pd.DataFrame (empty if nothing was found).
+    """
+    type_cfg = {
+        "insertions":     load_all_insertions_summaries,
+        "deletions":      load_all_deletions_summaries,
+        "translocations": load_all_translocations_summaries,
+        "inversions":     load_all_inversions_summaries,
+    }
+
+    results = {}
+
+    for dtype, loader in type_cfg.items():
+        type_dir = os.path.join(parent_dir, dtype)
+        all_dfs = []
+
+        if not os.path.isdir(type_dir):
+            print(f"No {dtype} directory found at {type_dir}, skipping.")
+            results[dtype] = pd.DataFrame()
+            continue
+
+        for junction_name in sorted(os.listdir(type_dir)):
+            junction_dir = os.path.join(type_dir, junction_name)
+            if not os.path.isdir(junction_dir):
+                continue
+
+            df = loader(type_dir, junction_name, save_df=False)
+            if df is not None and not df.empty:
+                all_dfs.append(df)
+
+        if not all_dfs:
+            print(f"No {dtype} found across any junction.")
+            results[dtype] = pd.DataFrame()
+            continue
+
+        combined = pd.concat(all_dfs, ignore_index=True)
+
+        if save_df:
+            out_path = os.path.join(type_dir, f"all_junctions_{dtype}.csv")
+            combined.to_csv(out_path, index=False)
+            print(f"Saved {dtype} summary to {out_path}")
+
+        results[dtype] = combined
+
+    return results
 

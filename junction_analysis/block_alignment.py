@@ -41,12 +41,21 @@ def create_block_msas(example_junction): # 2 min 14
             check=True
         )
 
+def _context_to_filename(context: str) -> str:
+    """Convert a block context string to a safe filename component."""
+    return context if context else "nocontext"
+
+
 def create_block_msas_for_cluster(example_junction, isolate_list, cl, ambiguous_blocks,
+                                            path_dict_cluster_dedup=None,
                                             in_fasta_dir=None, out_base_dir=None,
                                             mafft_bin="mafft"):
     """
     Only (re)align blocks whose block_id appears in ambiguous_blocks.
-    ambiguous_blocks entries look like "[<block_id>|+|...]" -> we only use the first number.
+    When path_dict_cluster_dedup is provided, sequences are filtered by the nid
+    corresponding to each block's specific context copy, so different context copies
+    of the same duplicated block get separate alignment files.
+    File naming: block_{block_id}_ctx_{context}_sequences_cluster_aln.fa
     """
 
     isolate_set = set(isolate_list)
@@ -54,7 +63,7 @@ def create_block_msas_for_cluster(example_junction, isolate_list, cl, ambiguous_
     root = repo_root()
     results_dir = root / "results"
     if in_fasta_dir is None:
-        in_fasta_dir = results_dir / "block_fastas" / example_junction 
+        in_fasta_dir = results_dir / "block_fastas" / example_junction
 
     if out_base_dir is None:
         out_base_dir = results_dir / "block_alignments_cluster"
@@ -67,24 +76,38 @@ def create_block_msas_for_cluster(example_junction, isolate_list, cl, ambiguous_
 
     for block in ambiguous_blocks:
         fasta_file = Path(in_fasta_dir) / f"block_{block.id}_sequences.fa"
+        ctx_tag = _context_to_filename(block.context)
 
-        # skip if already aligned
-        out_aln = out_aln_dir / f"block_{block.id}_sequences_cluster_aln.fa"
+        out_aln = out_aln_dir / f"block_{block.id}_ctx_{ctx_tag}_sequences_cluster_aln.fa"
         if out_aln.exists():
             continue
 
-        # filter records by isolate list
+        # Build the set of nids that correspond to this (block_id, context) copy
+        if path_dict_cluster_dedup is not None:
+            valid_nids = {
+                str(node.nid)
+                for path in path_dict_cluster_dedup.values()
+                for node in path.nodes
+                if node.id == block.id and node.context == block.context and node.nid is not None
+            }
+
+        # Filter records: by isolate, and by nid when path_dict is available
         records = []
         for rec in SeqIO.parse(str(fasta_file), "fasta"):
-            iso = rec.id.split("__", 1)[0]
-            if iso in isolate_set:
-                records.append(rec)
+            parts = rec.id.split("__", 1)
+            iso = parts[0]
+            nid = parts[1] if len(parts) > 1 else None
+            if iso not in isolate_set:
+                continue
+            if path_dict_cluster_dedup is not None and nid not in valid_nids:
+                continue
+            records.append(rec)
 
         if len(records) < 2:
-            print("This ambiguous blog only appeared once. Even though we can't know, by default we assume it to be a deletion.")
+            print(f"Block {block.id} ctx={block.context} only appeared once in cluster. Assuming gain with ancestral state 0.")
             continue
 
-        out_fa = out_fasta_dir / f"block_{block.id}_sequences_cluster.fa"
+        out_fa = out_fasta_dir / f"block_{block.id}_ctx_{ctx_tag}_sequences_cluster.fa"
         SeqIO.write(records, str(out_fa), "fasta")
 
         with open(out_aln, "w") as aln_out:
@@ -99,15 +122,23 @@ def core_bounds(records):
     """Return (start, end) of intersection of non-gap spans across sequences.
     - start: position of first non-gap character
     - end : position of last non-gap character
+    Returns (0, 0) if records is empty or all sequences are gap-only.
     """
     seqs = [s for _, s in records]
+    if not seqs:
+        return (0, 0)
+
     L = len(seqs[0])
 
-    firsts = [s.find(s.replace('-', '')[0]) if '-' in s else 0 for s in seqs if set(s) != {'-'}] #s.find finds first occurrence of substring, s.replace delets all '-', [0] gives first character
-    lasts  = [s.rfind(s.replace('-', '')[-1]) if '-' in s else L-1 for s in seqs if set(s) != {'-'}]
+    non_gap_seqs = [s for s in seqs if set(s) != {'-'}]
+    if not non_gap_seqs:
+        return (0, L - 1)
+
+    firsts = [s.find(s.replace('-', '')[0]) if '-' in s else 0 for s in non_gap_seqs]
+    lasts  = [s.rfind(s.replace('-', '')[-1]) if '-' in s else L-1 for s in non_gap_seqs]
 
     start, end = max(firsts), min(lasts)
-    return (start,end)
+    return (start, end)
 
 def avg_pairwise_distance(arr):
     # ignores gap positions
@@ -204,10 +235,22 @@ def avg_distance_to_consensus(arr, consensus):
 
 def analyze_alignment(path, return_pairwise_dists=False):
     recs = list(read_fasta_alignment(path))
+    seqs = [s for _, s in recs]
+
+    if not seqs:
+        empty_stats = dict(
+            file=path.name, block_id=int(path.name.split("_", 2)[1]), context="",
+            n_seqs=0, alignment_len=0, core_len=0,
+            left_overhang=0, right_overhang=0,
+            mismatch_columns=0, mismatch_fraction=0.0,
+            avg_pairwise_dist=0.0, avg_consensus_dist=0.0,
+        )
+        if return_pairwise_dists:
+            return empty_stats, np.array([])
+        return empty_stats
 
     start, end = core_bounds(recs)
 
-    seqs = [s for _, s in recs]
     length = len(seqs[0])
 
     left_overhang = start
@@ -228,9 +271,19 @@ def analyze_alignment(path, return_pairwise_dists=False):
     consensus_seq = calc_consensus_seq(seqs_arr)
     avg_cons_dist = avg_distance_to_consensus(seqs_arr, consensus_seq)
 
+    # filename: block_{block_id}_ctx_{context}_sequences_cluster_aln.fa
+    # or legacy: block_{block_id}_sequences_cluster_aln.fa
+    fname = path.name
+    block_id = int(fname.split("_", 2)[1])
+    ctx_match = re.search(r"_ctx_(.+?)_sequences", fname)
+    context = ctx_match.group(1) if ctx_match else ""
+    if context == "nocontext":
+        context = ""
+
     stats = dict(
-        file=path.name,
-        block_id=int(path.name.split("_", 2)[1]),
+        file=fname,
+        block_id=block_id,
+        context=context,
         n_seqs=len(recs),
         alignment_len=length,
         core_len=core_len,
@@ -248,12 +301,20 @@ def analyze_alignment(path, return_pairwise_dists=False):
         return stats
     
 def summarize_block_msas(junction_name, cl=None, save_df=True, return_pairwise_dists=False,
+                         context_sensitive=False,
                          base_full=None,
                          base_cluster=None):
     """
     Creates summary statistics for block alignments.
     If cl is None: summarize ../results/block_alignments/<junction_name>/block_*_aln.fa
     If cl is not None: summarize ../results/block_alignments_cluster/<junction_name>/cluster_<cl>/alns/block_*_aln.fa
+
+    context_sensitive : bool
+        If False (default), pairwise_dict is keyed by block_id only — old behaviour,
+        suitable when each block appears at most once per alignment directory.
+        If True, pairwise_dict is keyed by (block_id, context) — use this when the
+        directory contains separate alignment files per context copy of a duplicated block.
+        The returned DataFrame always contains a 'context' column regardless of this flag.
     """
 
     results_dir = repo_root() / "results"
@@ -275,10 +336,15 @@ def summarize_block_msas(junction_name, cl=None, save_df=True, return_pairwise_d
     for p in sorted(aligned_dir.glob("block_*_aln.fa")):
         if return_pairwise_dists:
             stats, dists = analyze_alignment(p, return_pairwise_dists=True)
+            if stats["n_seqs"] == 0:
+                continue
             results.append(stats)
-            pairwise_dict[stats["block_id"]] = dists
+            key = (stats["block_id"], stats["context"]) if context_sensitive else stats["block_id"]
+            pairwise_dict[key] = dists
         else:
             stats = analyze_alignment(p)
+            if stats["n_seqs"] == 0:
+                continue
             results.append(stats)
 
     df = pd.DataFrame(results)

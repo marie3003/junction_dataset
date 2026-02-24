@@ -270,6 +270,7 @@ def get_isolate_sequence(pangraph, block_id, node_id):
 def write_shared_nodes_fasta(pangraph, path_dict, shared_nodes, shared_node_isolates, output_path):
     """
     Docstring for write_shared_nodes_fasta. Blocks are added in the order of shared_nodes list.
+    Only isolates that contain all shared nodes are included.
     
     :param pangraph: Pangraph object
     :param path_dict: Dictionary of all paths (can be deduplicated)
@@ -290,7 +291,10 @@ def write_shared_nodes_fasta(pangraph, path_dict, shared_nodes, shared_node_isol
         for shared_block in shared_nodes:
             for block in path_dict[isolate].nodes:
                 if block == shared_block:
-                    seq = seq + get_isolate_sequence(pangraph, block.id, block.nid)
+                    block_seq = get_isolate_sequence(pangraph, block.id, block.nid)
+                    if not block.strand:
+                        block_seq = str(Seq(block_seq).reverse_complement())
+                    seq = seq + block_seq
                     break # end low level loop once one sequence was added (since blocks are unique should only happen once)
 
         record = SeqRecord(Seq(seq), id = isolate, description = f"blocks{shared_nodes} length{len(seq)}")
@@ -341,15 +345,25 @@ def get_block_length(alignment_file, fmt="fasta"):
 
 
 def build_subtree(tree, isolate_list):
+    # Only keep isolates that actually appear in the tree
+    tree_tips = {tip.name for tip in tree.get_terminals()}
+    isolate_list = [iso for iso in isolate_list if iso in tree_tips]
+
+    if not isolate_list:
+        raise ValueError("No isolates in isolate_list are present in the tree.")
+
     mrca = tree.common_ancestor(isolate_list)
     subtree = Tree(root=copy.deepcopy(mrca), rooted=True)
     subtree.root.branch_length = 0.0  # there is no parent anymore
 
-    # prune unwanted tips
+    # prune unwanted tips by name to avoid stale clade-object references
     keep = set(isolate_list)
-    for tip in list(subtree.get_terminals()):
-        if tip.name not in keep:
-            subtree.prune(tip)
+    tips_to_remove = [tip.name for tip in subtree.get_terminals() if tip.name not in keep]
+    for name in tips_to_remove:
+        # re-check: earlier prunes may have already collapsed this tip away
+        current_tip_names = {tip.name for tip in subtree.get_terminals()}
+        if name in current_tip_names:
+            subtree.prune(name)
 
     return subtree
 

@@ -20,59 +20,136 @@ from junction_analysis.block_alignment import create_block_msas_for_cluster, sum
 
 def find_invertible_ids(paths: dict) -> set:
     """
-    Returns a set of block ids that are inverted in any path. This is needed for context definition of inverted blocks.
-    We need to make sure, that the context block is never invertible, such that when comparing invertible edges, their context is the same.
+    Returns a set of block ids that appear in both orientations across all paths.
+    A block that only ever appears on the minus strand is not considered invertible —
+    it is simply a block that is consistently reversed. Only blocks seen in both
+    plus and minus orientation are truly invertible.
+    This is needed for context definition: context anchors must never be invertible.
     """
-
-    invertible_ids = set()
+    plus_ids  = set()
+    minus_ids = set()
 
     for path in paths.values():
         for node in path:
-            if node.strand == False:
-                invertible_ids.add(node.id)
+            if node.strand:
+                plus_ids.add(node.id)
+            else:
+                minus_ids.add(node.id)
 
-    return invertible_ids
+    return plus_ids & minus_ids
 
-def make_deduplicated_paths(pangraph, rare_context_thresh=0.1) -> dict:
+
+def filter_isolates_by_anchor_fraction(path_dict: dict, min_anchor_fraction: float = 0.7) -> list:
     """
-    Convert a dict[isolate -> Path(Node,...)] into dict[isolate -> Path(DeduplicatedNode, ...)],
-    where duplicated blocks get a context = closest non-duplicated, never inverted, less rare than rare_context_thresh block (ID) to the left.
-    For non-duplicated blocks, context is set to "".
-    Deduplication is not perfect if there are no suitable context anchors that are seperating to differing block copies because the blocks in between tham are inverted, duplicated or rare.
-    @param rare_context_threshold: is a threshold how rare blocks can be to be allowed as context anchors, right now it is hard coded to 10
-    Additionally also return deduplicated block count dictionary.
-    """
-    # create path dictionary of Path objects
-    path_dict = pangraph.to_path_dictionary()
-    path_dict = {isolate: pu.Path.from_tuple_list(path, 'node') for isolate, path in path_dict.items()}
+    For each isolate, compute the fraction of blocks that are usable as anchors.
+    A block is a non-anchor if it is:
+      - duplicated: the same block id appears more than once in that isolate's path, OR
+      - inverted: the block appears on the minus strand in that isolate
+        (approximate treatment — any minus-strand occurrence is counted as non-anchor)
 
-    blockstats_df = pangraph.to_blockstats_df()
-    duplicated_ids = set(blockstats_df.loc[blockstats_df['duplicated'] == True].index)
-    rare_context_thresh = np.floor(rare_context_thresh * len(path_dict))
-    rare_ids = set(blockstats_df.loc[blockstats_df['count'] < rare_context_thresh].index)
+    Returns the list of isolates whose anchor fraction is >= min_anchor_fraction.
+
+    Parameters
+    ----------
+    path_dict : dict
+        isolate -> Path (iterable of nodes with .id and .strand attributes)
+    min_anchor_fraction : float
+        Minimum fraction of anchor blocks required to keep an isolate (default 0.5).
+
+    Returns
+    -------
+    list of isolate names that meet the threshold.
+    """
+    qualified = []
+
+    for isolate, path in path_dict.items():
+        nodes = list(path)
+        if not nodes:
+            continue
+
+        id_counts = Counter(n.id for n in nodes)
+        duplicated_in_isolate = {bid for bid, cnt in id_counts.items() if cnt > 1}
+
+        n_anchor = sum(
+            1 for n in nodes
+            if n.id not in duplicated_in_isolate and n.strand
+        )
+        fraction = n_anchor / len(nodes)
+
+        if fraction >= min_anchor_fraction:
+            qualified.append(isolate)
+        else:
+            print(f"Isolate {isolate} filtered out: {n_anchor}/{len(nodes)} anchor blocks ({fraction:.2%})")
+
+    return qualified
+
+
+def _compute_path_dict_stats(path_dict: dict, rare_context_thresh: float):
+    """
+    Compute duplicated_ids, rare_ids, and invertible_ids directly from a path_dict.
+
+    - duplicated_ids : block ids that appear more than once in at least one isolate's path
+    - rare_ids       : block ids that appear in fewer than
+                       floor(rare_context_thresh * n_isolates) isolates
+    - invertible_ids : block ids seen in both orientations across all paths
+                       (via find_invertible_ids)
+    """
+    isolate_counts: Counter = Counter()   # how many isolates contain each block id
+    duplicated_ids: set = set()
+
+    for path in path_dict.values():
+        seen_in_isolate: Counter = Counter(n.id for n in path)
+        for bid, cnt in seen_in_isolate.items():
+            isolate_counts[bid] += 1
+            if cnt > 1:
+                duplicated_ids.add(bid)
+
+    thresh = np.floor(rare_context_thresh * len(path_dict))
+    rare_ids = {bid for bid, cnt in isolate_counts.items() if cnt < thresh}
     invertible_ids = find_invertible_ids(path_dict)
 
+    return duplicated_ids, rare_ids, invertible_ids
+
+
+def _deduplicate_path_dict(path_dict: dict, pangraph, duplicated_ids: set, rare_ids: set, invertible_ids: set):
+    """
+    Core deduplication logic.  Assigns context labels to duplicated blocks based
+    on the nearest upstream non-duplicated, non-invertible, non-rare block.
+    Node ids (nids) are looked up from pangraph.paths[isolate].nodes[idx].
+
+    Parameters
+    ----------
+    path_dict      : dict[isolate -> Path(Node,...)]
+    pangraph       : pypangraph Pangraph — used to look up node ids (nids)
+    duplicated_ids : block ids that are duplicated in at least one isolate
+    rare_ids       : block ids that are too rare to serve as context anchors
+    invertible_ids : block ids that appear in both orientations
+
+    Returns
+    -------
+    deduplicated_paths : dict[isolate -> Path(DeduplicatedNode,...)]
+    freq               : dict[DeduplicatedNode -> int]
+    """
     deduplicated_paths: dict = {}
     freq = Counter()
 
     for isolate, path in path_dict.items():
-        last_non_dup: str | None = None # context anchor = last suitable non-dup block id
-        context_counts: dict[str, int] = {}  # per-context counts for duplicated node ids
+        last_non_dup: str | None = None
+        context_counts: dict[str, int] = {}
 
         dedup_nodes = []
-        for idx, n in enumerate(path):  # path is iterable over its nodes
+        for idx, n in enumerate(path):
             block_nid = pangraph.paths[isolate].nodes[idx]
             if n.id in duplicated_ids:
                 if last_non_dup is None:
                     raise ValueError("last_non_dup must not be None when encountering a duplicated node")
-                
-                # per-node count within the current context
-                count = context_counts.get(n.id, 0) + 1 # default is 0 if not inside dict yet
+
+                count = context_counts.get(n.id, 0) + 1
                 context_counts[n.id] = count
 
                 context = f"{last_non_dup}_{count}"
                 dn = pu.DeduplicatedNode(n.id, n.strand, context, block_nid)
-                
+
             else:
                 dn = pu.DeduplicatedNode(n.id, n.strand, "", block_nid)
                 if n.id not in invertible_ids and n.id not in rare_ids:
@@ -85,6 +162,59 @@ def make_deduplicated_paths(pangraph, rare_context_thresh=0.1) -> dict:
         deduplicated_paths[isolate] = pu.Path(dedup_nodes)
 
     return deduplicated_paths, dict(freq)
+
+
+def make_deduplicated_paths(pangraph, rare_context_thresh=0.1) -> dict:
+    """
+    Convert a dict[isolate -> Path(Node,...)] into dict[isolate -> Path(DeduplicatedNode, ...)],
+    where duplicated blocks get a context = closest non-duplicated, never inverted, less rare than rare_context_thresh block (ID) to the left.
+    For non-duplicated blocks, context is set to "".
+    Deduplication is not perfect if there are no suitable context anchors that are seperating to differing block copies because the blocks in between tham are inverted, duplicated or rare.
+    @param rare_context_threshold: is a threshold how rare blocks can be to be allowed as context anchors, right now it is hard coded to 10
+    Additionally also return deduplicated block count dictionary.
+    """
+    path_dict = pangraph.to_path_dictionary()
+    path_dict = {isolate: pu.Path.from_tuple_list(path, 'node') for isolate, path in path_dict.items()}
+
+    blockstats_df = pangraph.to_blockstats_df()
+    duplicated_ids = set(blockstats_df.loc[blockstats_df['duplicated'] == True].index)
+    rare_context_thresh_abs = np.floor(rare_context_thresh * len(path_dict))
+    rare_ids = set(blockstats_df.loc[blockstats_df['count'] < rare_context_thresh_abs].index)
+    invertible_ids = find_invertible_ids(path_dict)
+
+    return _deduplicate_path_dict(path_dict, pangraph, duplicated_ids, rare_ids, invertible_ids)
+
+
+def rededuplicate_cluster_paths(path_dict_cluster: dict, pangraph, rare_context_thresh=0.1):
+    """
+    Redo deduplication for a subset of isolates (one cluster), recomputing which
+    blocks are duplicated, rare, or invertible using only the isolates in the cluster.
+    This typically yields better context anchors than the full-dataset deduplication
+    because problematic blocks from other isolates no longer inflate the duplicated/
+    invertible sets.
+
+    The original path_dict (full deduplication) is left untouched; only a new
+    path_dict restricted to the cluster isolates is returned.
+
+    Parameters
+    ----------
+    path_dict_cluster : dict[isolate -> Path(Node,...)]
+        Subset of isolates belonging to this cluster, using the *original* (non-
+        deduplicated) node representation so that block ids and strands are intact.
+    pangraph : pypangraph Pangraph
+        Used to look up node ids (nids) during deduplication.
+    rare_context_thresh : float
+        Fraction threshold below which a block is considered too rare to anchor.
+
+    Returns
+    -------
+    deduplicated_paths : dict[isolate -> Path(DeduplicatedNode,...)]
+    freq               : dict[DeduplicatedNode -> int]
+    """
+    duplicated_ids, rare_ids, invertible_ids = _compute_path_dict_stats(
+        path_dict_cluster, rare_context_thresh
+    )
+    return _deduplicate_path_dict(path_dict_cluster, pangraph, duplicated_ids, rare_ids, invertible_ids)
 
 def count_edges(dedup_paths: dict) -> dict:
     """
@@ -121,16 +251,24 @@ def find_unique_frequent_paths(paths_dict, edge_counts, flow_threshold = 10):
 
     return unique_paths
 
-def filter_deduplicated_paths(paths, filter_set):
-    """Removes blocks (id, strand, context) that are inside a given set to be filtered.
-    Return filtered paths list."""
-    
+def filter_deduplicated_paths(paths, filter_set, strand_sensitive=True):
+    """Removes blocks that are inside filter_set.
+    If strand_sensitive=False, membership is checked by (id, context) only,
+    so both strand orientations of a filtered block are removed.
+    Return filtered paths dict."""
+
     filtered_paths = {}
-    
+
     for iso, path in paths.items():
-        filtered_path = pu.Path([dnode for dnode in path.nodes if dnode not in filter_set])
-        filtered_paths[iso] = filtered_path
-    
+        if strand_sensitive:
+            kept = [dnode for dnode in path.nodes if dnode not in filter_set]
+        else:
+            kept = [
+                dnode for dnode in path.nodes
+                if pu.DeduplicatedNode(dnode.id, True, dnode.context) not in filter_set
+            ]
+        filtered_paths[iso] = pu.Path(kept)
+
     return filtered_paths
 
 def compute_edge_jaccard_matrix(deduplicated_paths: dict, consensus_paths: list) -> pd.DataFrame:
@@ -403,25 +541,33 @@ def consensus_paths_and_assignments(consensus_paths_by_cluster, cluster_map):
 
     return consensus_list, assignment_df, cluster_to_consensus_name
 
-def build_block_index(path_dict):
+def build_block_index(path_dict, strand_sensitive=True):
     """
     Returns:
       blocks: list of blocks in fixed order (index -> block)
       block2idx: dict mapping block -> index
+
+    If strand_sensitive=False, blocks with the same (id, context) but different
+    strands are treated as the same block. The stored representative node always
+    has strand=True.
     """
     block2idx = OrderedDict()  # preserves insertion order deterministically
     for isolate, path in path_dict.items():
-        for block in path.nodes:          # block supports == (and should be hashable)
-            if block not in block2idx:
-                block2idx[block] = len(block2idx)
+        for block in path.nodes:
+            key = block if strand_sensitive else pu.DeduplicatedNode(block.id, True, block.context)
+            if key not in block2idx:
+                block2idx[key] = len(block2idx)
     blocks = list(block2idx.keys())
     return blocks, dict(block2idx)
 
 
-def encode_paths_binary(path_dict, block2idx):
+def encode_paths_binary(path_dict, block2idx, strand_sensitive=True):
     """
     Returns:
       enc: dict isolate -> list[int] (0/1) with length = number of unique blocks
+
+    If strand_sensitive=False, presence of a block is determined by (id, context)
+    only, regardless of strand.
     """
     n_blocks = len(block2idx)
     enc = {}
@@ -429,7 +575,9 @@ def encode_paths_binary(path_dict, block2idx):
     for isolate, path in path_dict.items():
         vec = [0] * n_blocks
         for block in path.nodes:
-            vec[block2idx[block]] = 1
+            key = block if strand_sensitive else pu.DeduplicatedNode(block.id, True, block.context)
+            if key in block2idx:
+                vec[block2idx[key]] = 1
         enc[isolate] = vec
 
     return enc
@@ -460,16 +608,17 @@ def fitch_ancestral_reconstruction(tree, binary_encodings):
     
     # one could add a top down pass to refine ambiguities for lower level sequences but its not needed at the moment
 
-def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, individual_gain_thresh = 0.01, verbose = False):
+def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, path_dict_cluster_dedup=None, individual_gain_thresh = 0.01, verbose = False):
     ambiguous_blocks = [block for block, state in zip(blocks, root_states) if len(state) > 1]
 
     # don't run followig analysis if there are no ambiguous blocks
     if ambiguous_blocks == []:
         print("No ambiguous blocks.")
         return root_states
-    
-    create_block_msas_for_cluster(junction_name, isolate_list, cl, ambiguous_blocks)
-    df, pair_dists = summarize_block_msas(junction_name, cl, return_pairwise_dists=True)
+
+    create_block_msas_for_cluster(junction_name, isolate_list, cl, ambiguous_blocks,
+                                  path_dict_cluster_dedup=path_dict_cluster_dedup)
+    df, pair_dists = summarize_block_msas(junction_name, cl, return_pairwise_dists=True, context_sensitive=True)
 
     # if all blocks only appear once
     if df.empty:
@@ -485,7 +634,7 @@ def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, blo
     for block in ambiguous_blocks:
         pos = block2idx[block]
 
-        row = df.loc[df["block_id"] == block.id, "avg_pairwise_dist"]
+        row = df.loc[(df["block_id"] == block.id) & (df["context"] == block.context), "avg_pairwise_dist"]
 
         # block not found in df, probably because it only exists once → default to gain (ancestral state 0)
         if row.empty:
@@ -502,6 +651,75 @@ def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, blo
     return root_states
 
 def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, consensus_criterium = 'core_genome_tree', tree_path = None, block_freq_thresh = 0.5, plot_consensus = False, plot_annotations = False, plot_pair_dist = False, plot_snp_dist = False, plot_ambiguities = False):
+    """
+    Determine consensus paths for each cluster of isolates at a junction.
+
+    The function loads the pangraph for the given junction, clusters isolates by
+    phylogenetic distance on core blocks, and then derives one consensus path per
+    cluster using the chosen method.
+
+    Parameters
+    ----------
+    junction_name : str
+        Name of the junction (used to locate the pangraph JSON and output files).
+    clustering_bl_thresh : float
+        Branch-length threshold for cutting the core-block tree into clusters.
+        Isolates with pairwise distance below this threshold end up in the same
+        cluster.  Default 0.005.
+    consensus_criterium : {'core_genome_tree', 'block_freq'}
+        Method used to derive the consensus path for each cluster:
+        - 'core_genome_tree': ancestral sequence reconstruction (Fitch parsimony)
+          on the species tree.  For each cluster, blocks absent at the root are
+          filtered out and the majority path of the remaining isolates is taken as
+          the consensus.  Isolates with fewer than 70 % anchor blocks (non-
+          duplicated, non-inverted) are excluded from consensus inference.
+        - 'block_freq': blocks present in fewer than `block_freq_thresh` of the
+          cluster isolates are filtered; the majority path is then taken as the
+          consensus.
+    tree_path : str or None
+        Path to the species tree in Newick format.  If None, defaults to
+        ``<repo_root>/config/polished_tree.nwk``.  Only used with
+        ``consensus_criterium='core_genome_tree'``.
+    block_freq_thresh : float
+        Minimum fraction of cluster isolates a block must appear in to be kept
+        when using ``consensus_criterium='block_freq'``.  Default 0.5.
+    plot_consensus : bool
+        If True, display an interactive pangraph plot with consensus paths and
+        cluster assignments overlaid.
+    plot_annotations : bool
+        If True, display an interactive pangraph plot with MGE and integration/
+        recombination annotations.
+    plot_pair_dist : bool
+        If True, plot the pairwise core-block distance distribution with the
+        clustering threshold marked.
+    plot_snp_dist : bool
+        If True, plot the SNP position distribution across the core-block
+        alignment.
+    plot_ambiguities : bool
+        If True, print verbose output during ancestral-state ambiguity resolution
+        (only relevant for ``consensus_criterium='core_genome_tree'``).
+
+    Returns
+    -------
+    cluster_map_core : dict[isolate -> cluster_id]
+        Mapping of each isolate to its cluster.
+    consensus_paths_core : dict[cluster_id -> Path]
+        One deduplicated consensus path per cluster.
+    path_dict : dict[isolate -> Path(DeduplicatedNode,...)]
+        Deduplicated paths for all isolates (full dataset deduplication).
+        Be careful, because deduplication in path_dict was done based on all isolates, while deduplication for consensus path was done per cluster only using isolates with enough anchors.
+        So the context of some blocks in consensus paths might not be the same as in path_dict.
+    consensus_paths_plotting : list[Path]
+        Consensus paths renumbered and ordered for plotting.
+    assignment_df_plotting : pd.DataFrame
+        Per-isolate cluster assignments used for plotting.
+    all_root_states : dict[cluster_id -> list[set]]
+        Raw Fitch root state sets per block per cluster.
+        Only returned when ``consensus_criterium='core_genome_tree'``.
+    all_root_states_unique : dict[cluster_id -> list[set]]
+        Root states after ambiguity resolution.
+        Only returned when ``consensus_criterium='core_genome_tree'``.
+    """
     # create deduplicated paths dict
     root = repo_root()
     results_dir = root / "results"
@@ -549,12 +767,20 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
         all_root_states = {}
         all_root_states_unique = {}
 
+        valid_isolats_consensus = filter_isolates_by_anchor_fraction(path_dict, min_anchor_fraction=0.6)
+
         for cl, isolate_list in cluster_to_isos.items():
 
+            # only consider isolates that have at least 70% of anchor blocks (not duplicated or invertible blocks)
+            isolate_list = [iso for iso in isolate_list if iso in valid_isolats_consensus]
+            if not isolate_list:
+                print(f"Cluster {cl}: all isolates filtered out by anchor fraction, skipping.")
+                continue
             path_dict_cluster = {iso: path_dict[iso] for iso in isolate_list}
+            path_dict_cluster_dedup, freq_cluster = rededuplicate_cluster_paths(path_dict_cluster, pangraph, rare_context_thresh=0.2)
 
-            blocks, block2idx = build_block_index(path_dict_cluster)
-            binary_encodings = encode_paths_binary(path_dict_cluster, block2idx)
+            blocks, block2idx = build_block_index(path_dict_cluster_dedup, strand_sensitive=False)
+            binary_encodings = encode_paths_binary(path_dict_cluster_dedup, block2idx, strand_sensitive=False)
 
             # build subtree for isolates of one cluster
             subtree = build_subtree(tree, isolate_list)
@@ -564,10 +790,10 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
             fitch_ancestral_reconstruction(subtree, binary_encodings)
             root_states = subtree.root._state_sets  # list of {0}/{1}
             print(root_states)
-            root_states_unique = decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, individual_gain_thresh=0.01, verbose = plot_ambiguities)
-            
+            root_states_unique = decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, path_dict_cluster_dedup=path_dict_cluster_dedup, individual_gain_thresh=0.01, verbose = plot_ambiguities)
+
             filter_set = {block for block, state in zip(blocks, root_states_unique) if 0 in state}
-            filtered_cluster_paths = filter_deduplicated_paths(path_dict_cluster, filter_set)
+            filtered_cluster_paths = filter_deduplicated_paths(path_dict_cluster_dedup, filter_set, strand_sensitive=False)
             consensus_path = compute_majority_path(filtered_cluster_paths)
 
             consensus_paths_core[cl] = consensus_path

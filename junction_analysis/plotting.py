@@ -661,6 +661,7 @@ def plot_junction_pangraph_interactive(
         # Load translocations — draw arrows from start to end of translocated region
         TRANSLOCATION_COLOR = "rgb(0,0,255)"  # blue
         MIN_ARROW_SPAN = max_x * 0.01  # 1 % of total x range keeps arrowhead always visible
+        any_trans_drawn = False
 
         for i, cons_path in enumerate(consensus_paths):
             trans_file = os.path.join(indels_base_path, "translocations", junction_name, f"consensus_{i+1}", "translocations_summary.csv")
@@ -675,6 +676,7 @@ def plot_junction_pangraph_interactive(
                 if label not in y_labels:
                     continue
 
+                any_trans_drawn = True
                 start = row["start_pos"]
                 end   = row["end_pos"]
                 if abs(end - start) < MIN_ARROW_SPAN:
@@ -723,16 +725,15 @@ def plot_junction_pangraph_interactive(
                     showlegend=False,
                 ))
 
-        # Add translocation legend entry — lines+markers gives a tail + arrowhead icon
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode="lines+markers",
-            line=dict(color=TRANSLOCATION_COLOR, width=2),
-            marker=dict(symbol="arrow-right", size=14, color=TRANSLOCATION_COLOR, angle=0),
-            name="Translocation",
-            showlegend=True,
-            hoverinfo="skip",
-        ))
+        if any_trans_drawn:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode="markers",
+                marker=dict(symbol="arrow-right", size=16, color=TRANSLOCATION_COLOR, angle=0),
+                name="Translocation",
+                showlegend=True,
+                hoverinfo="skip",
+            ))
 
     # Redraw inversion borders on top of overlays only when indels are shown
     if inversion_rects and show_indels and indels_base_path:
@@ -1858,6 +1859,7 @@ def add_annotations_for_dash(
         # Load translocations — draw arrows from start to end of translocated region
         TRANSLOCATION_COLOR = "rgb(0,0,255)"
         MIN_ARROW_SPAN = (max_x or 1) * 0.01
+        any_trans_drawn = False
 
         for i, cons_path in enumerate(consensus_paths):
             trans_file = os.path.join(indels_base_path, "translocations", junction_name, f"consensus_{i+1}", "translocations_summary.csv")
@@ -1872,6 +1874,7 @@ def add_annotations_for_dash(
                 if label not in y_labels:
                     continue
 
+                any_trans_drawn = True
                 start = row["start_pos"]
                 end   = row["end_pos"]
                 if abs(end - start) < MIN_ARROW_SPAN:
@@ -1920,16 +1923,15 @@ def add_annotations_for_dash(
                     showlegend=False,
                 ))
 
-        # Add translocation legend entry — lines+markers gives a tail + arrowhead icon
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode="lines+markers",
-            line=dict(color=TRANSLOCATION_COLOR, width=2),
-            marker=dict(symbol="arrow-right", size=14, color=TRANSLOCATION_COLOR, angle=0),
-            name="Translocation",
-            showlegend=True,
-            hoverinfo="skip",
-        ))
+        if any_trans_drawn:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode="markers",
+                marker=dict(symbol="arrow-right", size=16, color=TRANSLOCATION_COLOR, angle=0),
+                name="Translocation",
+                showlegend=True,
+                hoverinfo="skip",
+            ))
 
     # Redraw inversion borders on top of overlays only when indels are shown
     if inversion_rects and show_indels and indels_base_path:

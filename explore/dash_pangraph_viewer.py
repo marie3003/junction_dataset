@@ -345,9 +345,13 @@ def make_junction_dash_app(
 
 
 if __name__ == "__main__":
-
+    
+    #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # consensus definition very conservative here, investigate
+    #junction_name = "PLTCZQCVRD_f__RYYAQMEJGY_f"
+    #junction_name = "NOAJDCSIVA_f__NZXBIFMPMA_r"
     junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
     #junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
+    #junction_name = "ATPWUNKKID_f__KKPYPKGMXA_f"
 
     pangraph_path = REPO_ROOT / "results" / "junction_pangraphs" / f"{junction_name}.json"
     pangraph = pp.Pangraph.from_json(str(pangraph_path))
@@ -368,8 +372,6 @@ if __name__ == "__main__":
         consensus_criterium="core_genome_tree",
         tree_path=str(tree_path),
     )
-
-    print(path_dict['NZ_LS992168.1'])
 
     app = make_junction_dash_app(
         pan=pangraph,
