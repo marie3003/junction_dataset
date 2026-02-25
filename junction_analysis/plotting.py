@@ -373,6 +373,8 @@ def plot_junction_pangraph_interactive(
     # overlay defense system, prophage, IS annotations
     if show_mges_annotations and mges_gff_path:
         ann = read_gff3_annotations(mges_gff_path)
+        if ann.empty or "feature" not in ann.columns:
+            ann = pd.DataFrame(columns=["seqid", "feature", "start", "end", "attrs", "is_subtype"])
 
         DEF_COLOR = "rgb(152,78,163)"  # purple, far from inversion red
         PROPH_COLOR = "rgb(27,158,119)"
@@ -1513,6 +1515,334 @@ def plot_pangraph_base_for_dash(
     return fig, y_labels, max_x, inversion_rects
 
 
+def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
+                                    subplots=False, save_path=None):
+    """
+    Plot the distribution of event counts per junction, coloured by event type.
+
+    Each event type is shown as a normalised histogram (fraction of all junctions).
+    For non-log scale the zero bin is included as a normal bar at x=0.
+    For log scale, zero bins are shown in a separate narrow panel on the left
+    with a broken-axis marker, because 0 cannot appear on a log x-axis.
+
+    Parameters
+    ----------
+    counts_df : pd.DataFrame
+        Output of count_events_per_junction().
+    figsize : tuple
+        Matplotlib figure size.
+    log_scale : bool
+        If True (default), use log scale on the non-zero x-axis and y-axis.
+    subplots : bool
+        If True, draw one subplot per event type stacked vertically, all sharing
+        the same x-axis. If False (default), all types are overlaid on one axis.
+    save_path : str or None
+        If provided, save the figure to this path instead of calling plt.show().
+    """
+    event_cols = {
+        "insertions":     ("n_insertions",     "#4C72B0"),
+        "deletions":      ("n_deletions",      "#DD8452"),
+        "translocations": ("n_translocations", "#55A868"),
+        "inversions":     ("n_inversions",     "#C44E52"),
+    }
+    n_types = len(event_cols)
+    n_junctions = len(counts_df)
+    gap_frac = 0.15
+
+    max_count = max(
+        counts_df[col].max()
+        for col, _ in event_cols.values()
+        if col in counts_df.columns
+    )
+
+    # ------------------------------------------------------------------ #
+    # Subplots mode: one panel per event type, shared x-axis             #
+    # ------------------------------------------------------------------ #
+    if subplots:
+        if not log_scale:
+            bin_edges = np.arange(0, max_count + 2) - 0.5
+            fig, axes = plt.subplots(n_types, 1, figsize=figsize, sharex=True)
+            fig.subplots_adjust(hspace=0.08)
+
+            for ax, (label, (col, color)) in zip(axes, event_cols.items()):
+                if col not in counts_df.columns:
+                    ax.set_visible(False)
+                    continue
+                data = counts_df[col]
+                counts_per_bin, _ = np.histogram(data, bins=bin_edges)
+                bin_widths = np.diff(bin_edges)
+                bin_centres = bin_edges[:-1] + bin_widths / 2
+                normalised = counts_per_bin / n_junctions
+                ax.bar(bin_centres, normalised, width=bin_widths * (1 - gap_frac),
+                       color=color, alpha=0.85, edgecolor="none")
+                ax.set_ylabel(label.capitalize(), rotation=0, labelpad=60, va="center")
+                ax.set_yscale("log")
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+
+            axes[-1].set_xlabel("Number of unique events per junction")
+            fig.suptitle("Distribution of events per junction")
+            plt.tight_layout()
+
+        else:
+            # Log scale: each row is a broken-axis pair (zero | log histogram)
+            bin_edges = np.logspace(0, np.log10(max_count + 1), 30)
+
+            fig, axes_pairs = plt.subplots(
+                n_types, 2,
+                figsize=figsize,
+                gridspec_kw={"width_ratios": [1, 8], "wspace": 0.05},
+            )
+            fig.subplots_adjust(hspace=0.15)
+
+            # Share y-axis across ALL panels (both columns, all rows)
+            ref_ax = axes_pairs[0, 0]
+            for row in range(n_types):
+                for col_idx in range(2):
+                    if not (row == 0 and col_idx == 0):
+                        axes_pairs[row, col_idx].sharey(ref_ax)
+
+            # Resolve axes sizes for bar-width matching
+            fig.canvas.draw()
+
+            for row, (label, (col, color)) in enumerate(event_cols.items()):
+                ax0, ax1 = axes_pairs[row]
+
+                if col not in counts_df.columns:
+                    ax0.set_visible(False)
+                    ax1.set_visible(False)
+                    continue
+
+                data = counts_df[col]
+
+                # Match bar width in display pts across panels
+                ax1_width_pts = ax1.get_window_extent().width
+                log_range = np.log10(bin_edges[-1]) - np.log10(bin_edges[0])
+                first_bin_log_frac = (np.log10(bin_edges[1]) - np.log10(bin_edges[0])) / log_range
+                bar_pts = ax1_width_pts * first_bin_log_frac * (1 - gap_frac)
+                ax0_width_pts = ax0.get_window_extent().width
+                bar_width_ax0 = (bar_pts / ax0_width_pts) * 2.0  # ax0 spans [-1,1]
+
+                # Zero bar
+                n_zero = (data == 0).sum()
+                ax0.bar(0, n_zero / n_junctions, width=bar_width_ax0,
+                        color=color, alpha=0.85, edgecolor="none")
+                ax0.set_xticks([0])
+                ax0.set_xticklabels(["0"] if row == n_types - 1 else [""])
+                ax0.set_xlim(-1.0, 1.0)
+                ax0.set_yscale("log")
+                ax0.spines["right"].set_visible(False)
+                ax0.spines["top"].set_visible(False)
+                ax0.tick_params(right=False, which="both")
+                ax0.set_ylabel(label.capitalize(), rotation=0, labelpad=60, va="center")
+
+                # Non-zero bins
+                nonzero = data[data > 0]
+                counts_per_bin, _ = np.histogram(nonzero, bins=bin_edges)
+                bin_widths = np.diff(bin_edges)
+                bw = bin_widths * (1 - gap_frac)
+                bin_centres = bin_edges[:-1] + bin_widths / 2
+                ax1.bar(bin_centres, counts_per_bin / n_junctions, width=bw,
+                        color=color, alpha=0.85, edgecolor="none")
+                ax1.set_xscale("log")
+                ax1.spines["left"].set_visible(False)
+                ax1.spines["top"].set_visible(False)
+                ax1.tick_params(left=False, which="both")
+                # Hide y tick labels on ax1 since it shares the scale with ax0
+                ax1.tick_params(labelleft=False, which="both")
+                if row < n_types - 1:
+                    ax1.tick_params(labelbottom=False)
+                    ax0.tick_params(labelbottom=False)
+
+            axes_pairs[-1, 1].set_xlabel("Number of unique events per junction (log scale)")
+            fig.suptitle("Distribution of events per junction")
+            plt.tight_layout()
+
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Saved figure to {save_path}")
+        else:
+            plt.show()
+        return
+
+    # ------------------------------------------------------------------ #
+    # Non-log: single axis, 0 is a normal bin                            #
+    # ------------------------------------------------------------------ #
+    if not log_scale:
+        bin_edges = np.arange(0, max_count + 2) - 0.5  # integer-centred bins
+        fig, ax = plt.subplots(figsize=figsize)
+
+        for i, (label, (col, color)) in enumerate(event_cols.items()):
+            if col not in counts_df.columns:
+                continue
+            data = counts_df[col]
+            counts_per_bin, _ = np.histogram(data, bins=bin_edges)
+            bin_widths = np.diff(bin_edges)
+            usable = bin_widths * (1 - gap_frac)
+            bar_width = usable / n_types
+            bin_left = bin_edges[:-1] + bin_widths * (gap_frac / 2)
+            x_centres = bin_left + i * bar_width + bar_width / 2
+            normalised = counts_per_bin / n_junctions
+            ax.bar(x_centres, normalised, width=bar_width, color=color,
+                   alpha=0.85, label=label.capitalize(), edgecolor="none")
+        ax.set_yscale("log")
+        ax.set_xlabel("Number of unique events per junction")
+        ax.set_ylabel("Fraction of junctions (log scale)")
+        ax.set_title("Distribution of events per junction")
+        ax.legend(title="Event type", frameon=True)
+        plt.tight_layout()
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Saved figure to {save_path}")
+        else:
+            plt.show()
+        return
+
+    # ------------------------------------------------------------------ #
+    # Log scale: broken axis — narrow left panel for zero, wide right     #
+    # for log-spaced non-zero bins. Bar widths are matched in display pts #
+    # so both panels look proportionate.                                  #
+    # ------------------------------------------------------------------ #
+    bin_edges = np.logspace(0, np.log10(max_count + 1), 30)
+
+    fig, (ax0, ax1) = plt.subplots(
+        1, 2,
+        figsize=figsize,
+        gridspec_kw={"width_ratios": [1, 8], "wspace": 0.05},
+        sharey=True,
+    )
+
+    # Compute a representative bar width in display points from the right panel,
+    # then use the same width (in ax0 data coords) for the zero bars.
+    # We do this after the figure is created so the axes have a size.
+    fig.canvas.draw()  # needed to resolve axes positions
+
+    # Right panel: each histogram bar width in display points (use first bin as reference)
+    ax1_width_pts = ax1.get_window_extent().width
+    log_range = np.log10(bin_edges[-1]) - np.log10(bin_edges[0])
+    first_bin_log_frac = (np.log10(bin_edges[1]) - np.log10(bin_edges[0])) / log_range
+    one_type_frac = first_bin_log_frac * (1 - gap_frac) / n_types
+    bar_pts = ax1_width_pts * one_type_frac  # display pts per bar in right panel
+
+    # Convert that to data coords in ax0 (xlim will be set to [-1, 1])
+    ax0_width_pts = ax0.get_window_extent().width
+    ax0_xlim = 2.0  # ax0 spans [-1, 1]
+    bar_width_ax0 = (bar_pts / ax0_width_pts) * ax0_xlim
+
+    group_width_ax0 = bar_width_ax0 * n_types
+
+    for i, (label, (col, color)) in enumerate(event_cols.items()):
+        if col not in counts_df.columns:
+            continue
+        data = counts_df[col]
+
+        # --- zero bar ---
+        n_zero = (data == 0).sum()
+        zero_frac = n_zero / n_junctions
+        x_zero = -group_width_ax0 / 2 + i * bar_width_ax0 + bar_width_ax0 / 2
+        ax0.bar(x_zero, zero_frac, width=bar_width_ax0,
+                color=color, alpha=0.85, edgecolor="none")
+
+        # --- non-zero bins ---
+        nonzero = data[data > 0]
+        counts_per_bin, _ = np.histogram(nonzero, bins=bin_edges)
+        bin_widths = np.diff(bin_edges)
+        usable = bin_widths * (1 - gap_frac)
+        bw = usable / n_types
+        bin_left = bin_edges[:-1] + bin_widths * (gap_frac / 2)
+        x_centres = bin_left + i * bw + bw / 2
+        normalised = counts_per_bin / n_junctions
+        ax1.bar(x_centres, normalised, width=bw, color=color,
+                alpha=0.85, label=label.capitalize(), edgecolor="none")
+
+
+    # Left panel
+    ax0.set_xticks([0])
+    ax0.set_xticklabels(["0"])
+    ax0.set_xlim(-1.0, 1.0)
+    ax0.set_yscale("log")
+    ax0.set_ylabel("Fraction of junctions (log scale)")
+    ax0.spines["right"].set_visible(False)
+    ax0.tick_params(right=False, which="both")
+
+    # Right panel
+    ax1.set_xscale("log")
+    ax1.set_yscale("log")
+    ax1.set_xlabel("Number of unique events per junction (log scale)")
+    ax1.spines["left"].set_visible(False)
+    ax1.tick_params(left=False, which="both")
+
+    plt.tight_layout()
+
+    fig.suptitle("Distribution of events per junction")
+    ax1.legend(title="Event type", frameon=True)
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_events_per_junction(counts_df, figsize=(12, 5), save_path=None):
+    """
+    Scatter plot: junctions on the x-axis (sorted by total event count),
+    number of unique events on the y-axis, coloured by event type.
+
+    Parameters
+    ----------
+    counts_df : pd.DataFrame
+        Output of count_events_per_junction(), with columns
+        junction_name, n_insertions, n_deletions, n_translocations, n_inversions.
+    figsize : tuple
+        Matplotlib figure size.
+    save_path : str or None
+        If provided, save the figure to this path instead of calling plt.show().
+    """
+    event_cols = {
+        "Insertions":     ("n_insertions",     "#4C72B0"),
+        "Deletions":      ("n_deletions",      "#DD8452"),
+        "Translocations": ("n_translocations", "#55A868"),
+        "Inversions":     ("n_inversions",     "#C44E52"),
+    }
+
+    # Sort junctions by total event count descending
+    total = sum(
+        counts_df[col] for col, _ in event_cols.values() if col in counts_df.columns
+    )
+    order = total.argsort()[::-1].values
+    sorted_df = counts_df.iloc[order].reset_index(drop=True)
+    x = np.arange(len(sorted_df))
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for label, (col, color) in event_cols.items():
+        if col not in sorted_df.columns:
+            continue
+        y = sorted_df[col].values
+        mask = y > 0
+        ax.scatter(x[mask], y[mask], color=color, label=label, s=10, alpha=0.7, linewidths=0)
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Junctions (sorted by total event count)")
+    ax.set_ylabel("Number of unique events (log scale)")
+    ax.set_title("Unique events per junction")
+    ax.legend(title="Event type", frameon=True)
+    ax.set_xlim(-1, len(sorted_df))
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
 def add_annotations_for_dash(
     fig: go.Figure,
     y_labels: list,
@@ -1574,6 +1904,8 @@ def add_annotations_for_dash(
     # overlay defense system, prophage, IS annotations
     if show_mges_annotations and mges_gff_path:
         ann = read_gff3_annotations(mges_gff_path)
+        if ann.empty or "feature" not in ann.columns:
+            ann = pd.DataFrame(columns=["seqid", "feature", "start", "end", "attrs", "is_subtype"])
 
         DEF_COLOR = "rgb(152,78,163)"  # purple, far from inversion red
         PROPH_COLOR = "rgb(27,158,119)"

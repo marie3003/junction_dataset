@@ -39,27 +39,38 @@ def find_invertible_ids(paths: dict) -> set:
     return plus_ids & minus_ids
 
 
-def filter_isolates_by_anchor_fraction(path_dict: dict, min_anchor_fraction: float = 0.7) -> list:
+def filter_isolates_by_anchor_fraction(path_dict: dict, min_anchor_fraction: float = 0.7,
+                                        rare_context_thresh: float = 0.1) -> list:
     """
     For each isolate, compute the fraction of blocks that are usable as anchors.
     A block is a non-anchor if it is:
       - duplicated: the same block id appears more than once in that isolate's path, OR
+      - rare: the block id appears in fewer than floor(rare_context_thresh * n_isolates)
+              isolates across the full path_dict, OR
       - inverted: the block appears on the minus strand in that isolate
-        (approximate treatment — any minus-strand occurrence is counted as non-anchor)
-
-    Returns the list of isolates whose anchor fraction is >= min_anchor_fraction.
 
     Parameters
     ----------
     path_dict : dict
         isolate -> Path (iterable of nodes with .id and .strand attributes)
     min_anchor_fraction : float
-        Minimum fraction of anchor blocks required to keep an isolate (default 0.5).
+        Minimum fraction of anchor blocks required to keep an isolate (default 0.7).
+    rare_context_thresh : float
+        A block is rare if it appears in fewer than
+        floor(rare_context_thresh * n_isolates) isolates (default 0.1).
 
     Returns
     -------
     list of isolate names that meet the threshold.
     """
+    # Compute rare ids globally (same threshold as used during deduplication)
+    isolate_counts: Counter = Counter()
+    for path in path_dict.values():
+        for bid in set(n.id for n in path):
+            isolate_counts[bid] += 1
+    thresh = np.floor(rare_context_thresh * len(path_dict))
+    rare_ids = {bid for bid, cnt in isolate_counts.items() if cnt < thresh}
+
     qualified = []
 
     for isolate, path in path_dict.items():
@@ -69,10 +80,11 @@ def filter_isolates_by_anchor_fraction(path_dict: dict, min_anchor_fraction: flo
 
         id_counts = Counter(n.id for n in nodes)
         duplicated_in_isolate = {bid for bid, cnt in id_counts.items() if cnt > 1}
+        non_anchor_ids = duplicated_in_isolate | rare_ids
 
         n_anchor = sum(
             1 for n in nodes
-            if n.id not in duplicated_in_isolate and n.strand
+            if n.id not in non_anchor_ids and n.strand
         )
         fraction = n_anchor / len(nodes)
 
@@ -183,6 +195,55 @@ def make_deduplicated_paths(pangraph, rare_context_thresh=0.1) -> dict:
     invertible_ids = find_invertible_ids(path_dict)
 
     return _deduplicate_path_dict(path_dict, pangraph, duplicated_ids, rare_ids, invertible_ids)
+
+
+def remap_consensus_to_global_contexts(consensus_path, filtered_cluster_paths, path_dict_cluster_dedup, path_dict):
+    """
+    Replace per-cluster deduplication contexts in a consensus path with the
+    corresponding global deduplication contexts from path_dict.
+
+    The consensus path is the majority path among filtered_cluster_paths, so
+    at least one isolate in filtered_cluster_paths has an identical path.
+    For that isolate, we know the positional correspondence between
+    path_dict_cluster_dedup (cluster contexts) and path_dict (global contexts)
+    because both have the same block order — only the context strings differ.
+
+    Returns a new pu.Path with global contexts.
+    """
+    # 1. Find an isolate whose filtered path matches the consensus
+    majority_iso = next(
+        (iso for iso, path in filtered_cluster_paths.items() if path == consensus_path),
+        None,
+    )
+    if majority_iso is None:
+        return consensus_path  # fallback: return unchanged
+
+    # 2. Build positional mapping: cluster DeduplicatedNode → global DeduplicatedNode
+    #    Both paths have the same block order; zip them to align by position.
+    cluster_nodes = path_dict_cluster_dedup[majority_iso].nodes
+    global_nodes  = path_dict[majority_iso].nodes
+    cluster_to_global: dict = {}
+    for c_node, g_node in zip(cluster_nodes, global_nodes):
+        cluster_to_global[id(c_node)] = g_node
+
+    # 3. The consensus path is a subsequence of cluster_nodes (filter removed some).
+    #    Walk through cluster_nodes in order to find the matching global node for
+    #    each consensus node.
+    global_idx = 0
+    remapped_nodes = []
+    for c_node in consensus_path.nodes:
+        # advance through cluster_nodes until we find this consensus node
+        while global_idx < len(cluster_nodes) and id(cluster_nodes[global_idx]) != id(c_node):
+            global_idx += 1
+        if global_idx < len(cluster_nodes):
+            g_node = global_nodes[global_idx]
+            remapped_nodes.append(pu.DeduplicatedNode(g_node.id, g_node.strand, g_node.context, g_node.nid))
+            global_idx += 1
+        else:
+            # fallback: keep original node if no match found
+            remapped_nodes.append(c_node)
+
+    return pu.Path(remapped_nodes)
 
 
 def rededuplicate_cluster_paths(path_dict_cluster: dict, pangraph, rare_context_thresh=0.1):
@@ -650,7 +711,7 @@ def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, blo
 
     return root_states
 
-def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, consensus_criterium = 'core_genome_tree', tree_path = None, block_freq_thresh = 0.5, plot_consensus = False, plot_annotations = False, plot_pair_dist = False, plot_snp_dist = False, plot_ambiguities = False):
+def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, consensus_criterium = 'core_genome_tree', tree_path = None, block_freq_thresh = 0.5, rare_context_thresh = 0.2, min_anchor_fraction = 0.6, min_anchor_fraction_relaxed = 0.3, min_cluster_retention = 0.8, plot_consensus = False, plot_annotations = False, plot_pair_dist = False, plot_snp_dist = False, plot_ambiguities = False):
     """
     Determine consensus paths for each cluster of isolates at a junction.
 
@@ -767,17 +828,42 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
         all_root_states = {}
         all_root_states_unique = {}
 
-        valid_isolats_consensus = filter_isolates_by_anchor_fraction(path_dict, min_anchor_fraction=0.6)
+        # Pre-compute valid isolates at the strict threshold
+        valid_strict = set(filter_isolates_by_anchor_fraction(
+            path_dict, min_anchor_fraction=min_anchor_fraction, rare_context_thresh=rare_context_thresh
+        ))
 
         for cl, isolate_list in cluster_to_isos.items():
+            n_cluster = len(isolate_list)
 
-            # only consider isolates that have at least 70% of anchor blocks (not duplicated or invertible blocks)
-            isolate_list = [iso for iso in isolate_list if iso in valid_isolats_consensus]
+            # Step 1: strict anchor threshold
+            filtered = [iso for iso in isolate_list if iso in valid_strict]
+
+            # Step 2: if fewer than min_cluster_retention of the cluster remains, retry with relaxed threshold
+            if n_cluster > 0 and len(filtered) / n_cluster < min_cluster_retention:
+                print(
+                    f"Cluster {cl}: only {len(filtered)}/{n_cluster} isolates pass strict anchor filter "
+                    f"({len(filtered)/n_cluster:.0%} < {min_cluster_retention:.0%}), retrying with relaxed threshold ({min_anchor_fraction_relaxed:.0%})."
+                )
+                valid_relaxed = set(filter_isolates_by_anchor_fraction(
+                    path_dict, min_anchor_fraction=min_anchor_fraction_relaxed, rare_context_thresh=rare_context_thresh
+                ))
+                filtered = [iso for iso in isolate_list if iso in valid_relaxed]
+
+                # Step 3: still not enough — skip filtering entirely for this cluster
+                if n_cluster > 0 and len(filtered) / n_cluster < min_cluster_retention:
+                    print(
+                        f"Cluster {cl}: still only {len(filtered)}/{n_cluster} isolates pass relaxed anchor filter "
+                        f"({len(filtered)/n_cluster:.0%} < {min_cluster_retention:.0%}), skipping isolate filtering for this cluster."
+                    )
+                    filtered = list(isolate_list)
+
+            isolate_list = filtered
             if not isolate_list:
                 print(f"Cluster {cl}: all isolates filtered out by anchor fraction, skipping.")
                 continue
             path_dict_cluster = {iso: path_dict[iso] for iso in isolate_list}
-            path_dict_cluster_dedup, freq_cluster = rededuplicate_cluster_paths(path_dict_cluster, pangraph, rare_context_thresh=0.2)
+            path_dict_cluster_dedup, freq_cluster = rededuplicate_cluster_paths(path_dict_cluster, pangraph, rare_context_thresh=rare_context_thresh)
 
             blocks, block2idx = build_block_index(path_dict_cluster_dedup, strand_sensitive=False)
             binary_encodings = encode_paths_binary(path_dict_cluster_dedup, block2idx, strand_sensitive=False)
@@ -795,6 +881,9 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
             filter_set = {block for block, state in zip(blocks, root_states_unique) if 0 in state}
             filtered_cluster_paths = filter_deduplicated_paths(path_dict_cluster_dedup, filter_set, strand_sensitive=False)
             consensus_path = compute_majority_path(filtered_cluster_paths)
+            consensus_path = remap_consensus_to_global_contexts(
+                consensus_path, filtered_cluster_paths, path_dict_cluster_dedup, path_dict
+            )
 
             consensus_paths_core[cl] = consensus_path
             all_root_states[cl] = root_states

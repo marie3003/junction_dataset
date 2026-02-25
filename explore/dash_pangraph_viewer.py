@@ -352,6 +352,7 @@ if __name__ == "__main__":
     junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
     #junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
     #junction_name = "ATPWUNKKID_f__KKPYPKGMXA_f"
+    #junction_name = 'KGWWUZQEKD_r__UXLELLOQVR_r'
 
     pangraph_path = REPO_ROOT / "results" / "junction_pangraphs" / f"{junction_name}.json"
     pangraph = pp.Pangraph.from_json(str(pangraph_path))

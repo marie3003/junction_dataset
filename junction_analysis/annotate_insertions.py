@@ -346,20 +346,30 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         # Pass 1: walk isolate — insertions and translocations               #
         # ------------------------------------------------------------------ #
         current_insertion     = []
+        current_insertion_first_ctx = None
         current_translocation = []
+        current_translocation_first_ctx = None
         trans_first_ctxs = []  # parallel to translocations[isolate]: (iso_ctx, c_ctx) of first block
 
         def flush_ins():
-            nonlocal current_insertion
+            nonlocal current_insertion, current_insertion_first_ctx
             if current_insertion:
-                insertions.setdefault(isolate, []).append(pu.Path(list(current_insertion)))
+                insertions.setdefault(isolate, []).append({
+                    "path": pu.Path(list(current_insertion)),
+                    "ctx": current_insertion_first_ctx,
+                })
                 current_insertion = []
+                current_insertion_first_ctx = None
 
         def flush_trans():
-            nonlocal current_translocation
+            nonlocal current_translocation, current_translocation_first_ctx
             if current_translocation:
-                translocations.setdefault(isolate, []).append(pu.Path(list(current_translocation)))
+                translocations.setdefault(isolate, []).append({
+                    "path": pu.Path(list(current_translocation)),
+                    "ctx": current_translocation_first_ctx,
+                })
                 current_translocation = []
+                current_translocation_first_ctx = None
 
         for n, ctx in zip(iso_nodes, iso_ctxs):
             if (n.id, ctx) in matched:
@@ -375,10 +385,13 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 flush_ins()
                 if not current_translocation:
                     trans_first_ctxs.append((ctx, c_ctx))
+                    current_translocation_first_ctx = ctx
                 current_translocation.append(n)
             else:
                 matched.add((n.id, ctx))
                 flush_trans()
+                if not current_insertion:
+                    current_insertion_first_ctx = ctx
                 current_insertion.append(n)
 
         flush_ins()
@@ -389,7 +402,8 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         iso_id_ctx_to_pos = {(n.id, ctx): i for i, (n, ctx) in enumerate(zip(iso_nodes, iso_ctxs))}
         c_id_ctx_to_pos   = {(n.id, ctx): i for i, (n, ctx) in enumerate(zip(c_nodes,   c_ctxs))}
 
-        for trans_path, (iso_ctx, c_ctx) in zip(translocations.get(isolate, []), trans_first_ctxs):
+        for trans_entry, (iso_ctx, c_ctx) in zip(translocations.get(isolate, []), trans_first_ctxs):
+            trans_path = trans_entry["path"]
             first_node = trans_path.nodes[0]
             iso_pos = iso_id_ctx_to_pos.get((first_node.id, iso_ctx))
             c_pos   = c_id_ctx_to_pos  .get((first_node.id, c_ctx))
@@ -405,11 +419,11 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
 
         all_trans = translocations.get(isolate, [])
         filtered_translocations = [
-            tp for tp in all_trans
+            te for te in all_trans
             if not any(
-                (tp.nodes[0].id, tp.nodes[0].context) == (n.id, n.context)
-                for other in all_trans if other is not tp
-                for n in other.nodes
+                (te["path"].nodes[0].id, te["path"].nodes[0].context) == (n.id, n.context)
+                for other in all_trans if other is not te
+                for n in other["path"].nodes
             )
         ]
         if filtered_translocations:
@@ -422,15 +436,18 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         # ------------------------------------------------------------------ #
         last_iso_node    = None
         current_deletion = []
+        current_deletion_first_ctx = None
 
         def flush_del():
-            nonlocal current_deletion, last_iso_node
+            nonlocal current_deletion, last_iso_node, current_deletion_first_ctx
             if current_deletion:
                 deletions.setdefault(isolate, []).append({
                     "path": pu.Path(list(current_deletion)),
                     "left_nid": last_iso_node.nid if last_iso_node else None,
+                    "ctx": current_deletion_first_ctx,
                 })
                 current_deletion = []
+                current_deletion_first_ctx = None
 
         for n, ctx in zip(c_nodes, c_ctxs):
             if (n.id, ctx) in matched:
@@ -440,6 +457,8 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                     last_iso_node = iso_n
                 continue
 
+            if not current_deletion:
+                current_deletion_first_ctx = ctx
             current_deletion.append(n)
 
         flush_del()
@@ -449,21 +468,26 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         # Inversion: exact (id, ctx) match in consensus but opposite strand. #
         # ------------------------------------------------------------------ #
         current_inversion = []
+        current_inversion_first_ctx = None
 
         def flush_inv():
-            nonlocal current_inversion
+            nonlocal current_inversion, current_inversion_first_ctx
             if current_inversion:
-                inversions.setdefault(isolate, []).append(pu.Path(list(current_inversion)))
+                inversions.setdefault(isolate, []).append({
+                    "path": pu.Path(list(current_inversion)),
+                    "ctx": current_inversion_first_ctx,
+                })
                 current_inversion = []
+                current_inversion_first_ctx = None
 
         insertion_id_ctxs = {
             (n.id, n.context)
-            for ins_path in insertions.get(isolate, [])
-            for n in ins_path.nodes
+            for ins_entry in insertions.get(isolate, [])
+            for n in ins_entry["path"].nodes
         } | {
             (n.id, n.context)
-            for trans_path in translocations.get(isolate, [])
-            for n in trans_path.nodes
+            for te in translocations.get(isolate, [])
+            for n in te["path"].nodes
         }
 
         for n, ctx in zip(iso_nodes, iso_ctxs):
@@ -472,6 +496,8 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 continue
             c_strand = c_id_ctx_strand.get((n.id, ctx))
             if c_strand is not None and n.strand != c_strand:
+                if not current_inversion:
+                    current_inversion_first_ctx = ctx
                 current_inversion.append(n)
             else:
                 flush_inv()
@@ -513,7 +539,9 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
     os.makedirs(out_dir, exist_ok=True)
 
     for isolate, inserted_paths in insertions.items():
-        for idx, inserted_path in enumerate(inserted_paths):
+        for idx, ins_entry in enumerate(inserted_paths):
+            inserted_path = ins_entry["path"]
+            ctx = ins_entry["ctx"]
             start_pos = pangraph.nodes[inserted_path.nodes[0].nid].start
             end_pos = pangraph.nodes[inserted_path.nodes[-1].nid].end
 
@@ -538,6 +566,7 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
                     "strand": "+" if inserted_path.nodes[0].strand else "-",
                     "start_pos": start_pos,
                     "end_pos": end_pos,
+                    "ctx": ctx,
                 }
             )
 
@@ -554,29 +583,32 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
 
 
 def print_insertions_deletions(insertions, deletions, inversions=None, translocations=None):
+    def _path(entry):
+        return entry["path"] if isinstance(entry, dict) else entry
+
     if insertions:
         print("Insertions:")
         for isolate, segs in insertions.items():
             for seg in segs:
-                print(isolate, "INSERTED:", seg)
+                print(isolate, "INSERTED:", _path(seg))
 
     if deletions:
         print("\nDeletions:")
         for isolate, segs in deletions.items():
             for seg in segs:
-                print(isolate, "DELETED:", seg)
+                print(isolate, "DELETED:", _path(seg))
 
     if inversions:
         print("\nInversions:")
         for isolate, segs in inversions.items():
             for seg in segs:
-                print(isolate, "INVERTED:", seg)
+                print(isolate, "INVERTED:", _path(seg))
 
     if translocations:
         print("\nTranslocations:")
         for isolate, segs in translocations.items():
             for seg in segs:
-                print(isolate, "TRANSLOCATED:", seg)
+                print(isolate, "TRANSLOCATED:", _path(seg))
 
 def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, deduplicated_paths, consensus = 1, verbose = True):
     # get isolates belonging to consensus 1
@@ -895,6 +927,7 @@ def summarize_deletions_consensus(
                     "length": length,
                     "position": pangraph.nodes[left_nid].end if left_nid is not None else None,
                     "strand": "+" if path.nodes[0].strand else "-",
+                    "ctx": entry.get("ctx"),
                 }
             )
 
@@ -944,7 +977,9 @@ def summarize_inversions_consensus(
 
     results = []
     for iso, inv_paths in inversions.items():
-        for idx, inv_path in enumerate(inv_paths):
+        for idx, inv_entry in enumerate(inv_paths):
+            inv_path = inv_entry["path"]
+            ctx = inv_entry["ctx"]
             nodes = inv_path.nodes
             if not nodes:
                 continue
@@ -975,6 +1010,7 @@ def summarize_inversions_consensus(
                 "start_pos": start_pos,
                 "end_pos": end_pos,
                 "strand": majority_strand,
+                "ctx": ctx,
             })
 
     if not results:
@@ -1097,7 +1133,9 @@ def summarize_translocations_consensus(
 
     results = []
     for iso, trans_paths in translocations.items():
-        for idx, trans_path in enumerate(trans_paths):
+        for idx, trans_entry in enumerate(trans_paths):
+            trans_path = trans_entry["path"]
+            ctx = trans_entry["ctx"]
             nodes = trans_path.nodes
             if not nodes:
                 continue
@@ -1117,6 +1155,7 @@ def summarize_translocations_consensus(
                 "length": total_length,
                 "start_pos": start_pos,
                 "end_pos": end_pos,
+                "ctx": ctx,
             })
 
     if not results:
@@ -1274,3 +1313,76 @@ def combine_all_junctions_summaries(parent_dir, save_df=False):
 
     return results
 
+
+def count_events_per_junction(summaries, min_length=200, save_path=None):
+    """
+    Count the number of unique events per junction for each event type.
+
+    Two events are considered the same (and counted only once) if they share
+    the same junction_name, path (block ids + strand), and ctx.  Events
+    shorter than `min_length` bp are excluded before counting.
+
+    Parameters
+    ----------
+    summaries : dict
+        Output of combine_all_junctions_summaries(), i.e. a dict with keys
+        "insertions", "deletions", "translocations", "inversions", each
+        mapping to a pd.DataFrame.
+    min_length : int
+        Minimum event length in bp (inclusive). Events below this threshold
+        are ignored. Default: 200.
+    save_path : str or None
+        If provided, the counts DataFrame is written as a CSV to this path.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per junction_name with columns:
+        junction_name, n_insertions, n_deletions, n_translocations, n_inversions
+    """
+    event_types = ["insertions", "deletions", "translocations", "inversions"]
+
+    # Collect all junction names across all event types
+    all_junctions = set()
+    for dtype in event_types:
+        df = summaries.get(dtype)
+        if df is not None and not df.empty and "junction_name" in df.columns:
+            all_junctions.update(df["junction_name"].unique())
+
+    rows = []
+    for junction in sorted(all_junctions):
+        row = {"junction_name": junction}
+        for dtype in event_types:
+            df = summaries.get(dtype)
+            if df is None or df.empty:
+                row[f"n_{dtype}"] = 0
+                continue
+
+            # Filter to this junction and apply minimum length threshold
+            sub = df[(df["junction_name"] == junction) & (df["length"] >= min_length)].copy()
+
+            if sub.empty:
+                row[f"n_{dtype}"] = 0
+                continue
+
+            # Deduplicate: same (path, ctx) → same event; fall back to path-only if ctx absent
+            if "ctx" in sub.columns:
+                dedup_cols = ["path", "ctx"]
+            else:
+                dedup_cols = ["path"]
+
+            row[f"n_{dtype}"] = sub.drop_duplicates(subset=dedup_cols).shape[0]
+
+        rows.append(row)
+
+    counts_df = pd.DataFrame(
+        rows,
+        columns=["junction_name", "n_insertions", "n_deletions", "n_translocations", "n_inversions"],
+    )
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        counts_df.to_csv(save_path, index=False)
+        print(f"Saved event counts to {save_path}")
+
+    return counts_df
