@@ -28,8 +28,8 @@ def _(pd):
 
 @app.cell
 def _(alt, jdf, mo, np):
-    _xvar = "nonempty_acc_len"
-    # _xvar = "pangenome_len"
+    # _xvar = "nonempty_acc_len"
+    _xvar = "tot_acc_len"
     _yvar = "n_categories"
     _cvar = "nonempty_freq"
     _yvar_jiggle = _yvar + "_jiggle"
