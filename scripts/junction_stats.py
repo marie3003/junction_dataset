@@ -93,7 +93,7 @@ def get_stats(pan_file):
     stats["transitive"] = stats["n_categories"] == 1
 
     # average length of accessory blocks when non-empty
-    # and average frequency of only core blocks.
+    # average frequency of only core blocks
     acc_len = 0
     n_with_acc = 0
     for count, nodes, isolates in path_cat:
@@ -108,6 +108,10 @@ def get_stats(pan_file):
     else:
         stats["nonempty_acc_len"] = None
     stats["nonempty_freq"] = n_with_acc / N
+
+    # total accessory block length in the junction
+    tot_acc_len = bdf["len"][~bdf["core"]].sum()
+    stats["tot_acc_len"] = tot_acc_len
 
     return stats
 
