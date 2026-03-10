@@ -2,9 +2,13 @@ import numpy as np
 import pandas as pd
 
 import string
+import os
 from itertools import combinations
+from pathlib import Path
 
 from Bio import Align
+
+import pypangraph as pp
 
 from junction_analysis.helpers import get_hierarchical_order, get_tree_order
 
@@ -225,3 +229,86 @@ def calculate_edge_ji_matrix(pangraph, order="hierarchical"):
     union_df = union_df.loc[isolate_order, isolate_order]
 
     return jaccard_edges_df, union_df - shared_df, shared_df
+
+
+def _mean_upper_triangle(df):
+    """Return the mean of the strictly upper triangle of a square DataFrame."""
+    arr = df.values.astype(float)
+    n = arr.shape[0]
+    if n < 2:
+        return float("nan")
+    idx = np.triu_indices(n, k=1)
+    return arr[idx].mean()
+
+
+def compute_diversity_all_junctions(pangraph_dir, junction_names=None, save_path=None):
+    """
+    For every junction pangraph in `pangraph_dir`, compute four mean pairwise
+    diversity metrics across all isolate pairs:
+      - mean_block_ji:       mean block Jaccard index
+      - mean_edge_ji:        mean edge Jaccard index
+      - mean_seq_similarity: mean accessory genome sequence similarity
+      - mean_divergence:     mean divergence points
+
+    Parameters
+    ----------
+    pangraph_dir : str or Path
+        Directory containing one JSON pangraph per junction, named
+        ``<junction_name>.json``.
+    junction_names : list of str or None
+        If provided, only process these junctions. Otherwise all .json files
+        in `pangraph_dir` are used.
+    save_path : str or None
+        If provided, save the resulting DataFrame as a CSV.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        junction_name, mean_block_ji, mean_edge_ji,
+        mean_seq_similarity, mean_n_divergence_points
+    """
+    pangraph_dir = Path(pangraph_dir)
+
+    if junction_names is None:
+        junction_names = [f.stem for f in sorted(pangraph_dir.glob("*.json"))]
+
+    rows = []
+    for jname in junction_names:
+        fpath = pangraph_dir / f"{jname}.json"
+        if not fpath.exists():
+            print(f"Pangraph not found for {jname}, skipping.")
+            continue
+
+        try:
+            pan = pp.Pangraph.from_json(str(fpath))
+        except Exception as e:
+            print(f"Error loading pangraph for {jname}: {e}")
+            continue
+
+        row = {"junction_name": jname}
+
+        for metric, compute in [
+            ("mean_block_ji",      lambda: _mean_upper_triangle(calculate_block_ji_matrix(pan, order=None))),
+            ("mean_edge_ji",       lambda: _mean_upper_triangle(calculate_edge_ji_matrix(pan, order=None))),
+            ("mean_n_divergence_points",    lambda: _mean_upper_triangle(calculate_divergence_matrix(pan, order=None))),
+            ("mean_seq_similarity",lambda: _mean_upper_triangle(compare_sequences_by_shared_proportion(pan.pairwise_accessory_genome_comparison(), order=None)[0])),
+        ]:
+            try:
+                row[metric] = compute()
+            except Exception as e:
+                print(f"  {jname} [{metric}]: {e}")
+                row[metric] = float("nan")
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=[
+        "junction_name", "mean_block_ji", "mean_edge_ji",
+        "mean_seq_similarity", "mean_n_divergence_points",
+    ])
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(save_path, index=False)
+        print(f"Saved diversity summary to {save_path}")
+
+    return df

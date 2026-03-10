@@ -2,12 +2,14 @@ import numpy as np
 import math
 import random
 import os
+from pathlib import Path
 
 import plotly.graph_objects as go
 import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.gridspec import GridSpec
 import colorsys
 
 import pandas as pd
@@ -1160,8 +1162,9 @@ def plot_dendrogram(Z, names):
     plt.tight_layout()
     plt.show()
 
-def plot_pairwise_distance_hist(distances, bins=30, figsize=(6, 4),
+def plot_pairwise_distance_hist(distances, bins=30, figsize=(7, 3.5),
                                 vline=None, vline_kwargs=None,
+                                percentage=False,
                                 title="Pairwise Distance Distribution"):
     """
     Plot a histogram of pairwise distances with an optional vertical line.
@@ -1178,6 +1181,8 @@ def plot_pairwise_distance_hist(distances, bins=30, figsize=(6, 4),
         If provided, draw a vertical line at this x-position.
     vline_kwargs : dict or None
         Custom style for the vertical line.
+    percentage : bool
+        If True, show y-axis as percentage of total distances. Default: False.
     title : str
         Plot title.
     """
@@ -1188,17 +1193,29 @@ def plot_pairwise_distance_hist(distances, bins=30, figsize=(6, 4),
 
     fig, ax = plt.subplots(figsize=figsize)
 
-    # histogram
-    ax.hist(distances, bins=bins, density=True, alpha=0.7)
+    bar_color = "#7394c2"
+    ax.yaxis.grid(True, color="0.9", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
 
-    # vertical line
+    if percentage:
+        counts, edges = np.histogram(distances, bins=bins)
+        pcts = counts / counts.sum() * 100
+        ax.bar(edges[:-1], pcts, width=np.diff(edges), align="edge",
+               color=bar_color, edgecolor="white", linewidth=0.5, zorder=2)
+        ax.set_ylabel("% of pairwise distances", fontsize=11)
+    else:
+        ax.hist(distances, bins=bins, density=False,
+                color=bar_color, edgecolor="white", linewidth=0.5, zorder=2)
+        ax.set_ylabel("Count", fontsize=11)
+
     if vline is not None:
         ax.axvline(vline, **vline_kwargs)
 
-    # labels
-    ax.set_title(title)
-    ax.set_xlabel("Distance")
-    ax.set_ylabel("Density")
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel("Pairwise patristic distance (substitutions per site)", fontsize=11)
+    ax.tick_params(labelsize=10)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
     plt.tight_layout()
     plt.show()
@@ -1515,14 +1532,212 @@ def plot_pangraph_base_for_dash(
     return fig, y_labels, max_x, inversion_rects
 
 
+def plot_cluster_count_distribution(cluster_df, figsize=(7, 4), save_path=None):
+    """
+    Plot the distribution of the number of clusters per junction as a bar chart.
+
+    Parameters
+    ----------
+    cluster_df : pd.DataFrame
+        Output of cluster_map_to_dataframe(). Must contain columns
+        'junction_name' and 'n_clusters'.
+    figsize : tuple
+    save_path : str or None
+        If provided, save the figure instead of showing it.
+    """
+    per_junction = cluster_df.drop_duplicates("junction_name")
+    counts = per_junction["n_clusters"].value_counts().sort_index()
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.bar(counts.index, counts.values, color="#4C72B0", edgecolor="white", linewidth=0.5)
+    ax.set_xlabel("Number of clusters per junction")
+    ax.set_ylabel("Number of junctions")
+    ax.set_title("Distribution of cluster counts across junctions")
+    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_cluster_count_vs_diversity(
+    cluster_df,
+    jdf,
+    diversity_columns,
+    figsize=None,
+    save_path=None,
+):
+    """
+    Scatter plots of n_clusters per junction against junction diversity measures.
+
+    One subplot per column in `diversity_columns`, laid out in a row.
+
+    Parameters
+    ----------
+    cluster_df : pd.DataFrame
+        Output of cluster_map_to_dataframe(). Must contain 'junction_name'
+        and 'n_clusters'.
+    jdf : pd.DataFrame
+        Junction summary DataFrame. Must contain 'junction_name' and all
+        columns listed in `diversity_columns`.
+    diversity_columns : list of str
+        Column names in `jdf` to plot on the x-axis.
+    figsize : tuple or None
+        Figure size. Defaults to (4 * n_cols, 4).
+    save_path : str or None
+        If provided, save the figure; otherwise call plt.show().
+    """
+    n_cols = len(diversity_columns)
+    if n_cols == 0:
+        return
+
+    if figsize is None:
+        figsize = (4 * n_cols, 4)
+
+    # One row per junction, merge n_clusters with jdf
+    # cluster_df uses 'junction_name'; jdf uses 'edge'
+    per_junction = cluster_df.drop_duplicates("junction_name")[["junction_name", "n_clusters"]]
+    merged = per_junction.merge(jdf, left_on="junction_name", right_on="edge", how="inner")
+
+    fig, axes = plt.subplots(1, n_cols, figsize=figsize)
+    if n_cols == 1:
+        axes = [axes]
+
+    for ax, col in zip(axes, diversity_columns):
+        if col not in merged.columns:
+            ax.set_visible(False)
+            continue
+        valid = merged[["n_clusters", col]].dropna()
+        ax.scatter(valid[col], valid["n_clusters"], alpha=0.6, s=20,
+                   color="#4C72B0", linewidths=0)
+        ax.set_xlabel(col)
+        ax.set_ylabel("Number of clusters")
+        ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    fig.suptitle("Cluster count vs. junction diversity")
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_all_junctions_pairwise_distances(
+    distances_df,
+    exclude=None,
+    bins=100,
+    figsize=(7, 3.5),
+    vline=None,
+    vline_kwargs=None,
+    log_y=False,
+    percentage=False,
+    title="default",
+    save_path=None,
+):
+    """
+    Plot a combined histogram of pairwise distances pooled across all junctions.
+
+    Parameters
+    ----------
+    distances_df : pd.DataFrame
+        Output of collect_all_pairwise_distances(), with columns
+        'junction_name' and 'distance'.
+    exclude : list of str or None
+        Junction names to exclude from the plot. Default: None.
+    bins : int
+        Number of histogram bins. Default: 100.
+    figsize : tuple
+        Figure size.
+    vline : float or None
+        If provided, draw a vertical line at this x-position.
+    vline_kwargs : dict or None
+        Custom style for the vertical line.
+    log_y : bool
+        If True, use log scale on the y-axis. Default: False.
+    percentage : bool
+        If True, show y-axis as percentage of total distances. Default: False.
+    save_path : str or None
+        If provided, save the figure; otherwise call plt.show().
+    """
+    df = distances_df.copy()
+    if exclude is not None:
+        df = df[~df["junction_name"].isin(exclude)]
+
+    distances = df["distance"].values
+    if len(distances) == 0:
+        print("No distances to plot.")
+        return
+
+    n_junctions = df["junction_name"].nunique()
+
+    if vline_kwargs is None:
+        vline_kwargs = dict(color="black", linestyle="--", linewidth=1.5)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    bar_color = "#7394c2"
+    ax.yaxis.grid(True, color="0.9", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+
+    if percentage:
+        counts, edges = np.histogram(distances, bins=bins)
+        pcts = counts / counts.sum() * 100
+        widths = np.diff(edges)
+        ax.bar(edges[:-1], pcts, width=widths, align="edge",
+               color=bar_color, edgecolor="white", linewidth=0.5, zorder=2)
+        ax.set_ylabel("% of pairwise distances", fontsize=11)
+    else:
+        ax.hist(distances, bins=bins, density=False,
+                color=bar_color, edgecolor="white", linewidth=0.5, zorder=2)
+        ax.set_ylabel("Count", fontsize=11)
+
+    if vline is not None:
+        ax.axvline(vline, label=f"Pairwise distance cutoff for\nhomologous recombination ({vline})",
+                   **vline_kwargs)
+        ax.legend(frameon=False, fontsize=10)
+    if log_y:
+        ax.set_yscale("log")
+    ax.set_xlabel("Pairwise patristic distance (substitutions per site)", fontsize=11)
+    ax.tick_params(labelsize=10)
+    if title == "default":
+        title = f"Core genome pairwise distances ({n_junctions} junctions)"
+    if title is not None:
+        ax.set_title(title, fontsize=12)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
 def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
-                                    subplots=False, save_path=None):
+                                    log_x=None, log_y=None,
+                                    subplots=False, share_y=True,
+                                    save_path=None):
     """
     Plot the distribution of event counts per junction, coloured by event type.
 
     Each event type is shown as a normalised histogram (fraction of all junctions).
-    For non-log scale the zero bin is included as a normal bar at x=0.
-    For log scale, zero bins are shown in a separate narrow panel on the left
+    For linear x, the zero bin is included as a normal bar at x=0.
+    For log x, zero bins are shown in a separate narrow panel on the left
     with a broken-axis marker, because 0 cannot appear on a log x-axis.
 
     Parameters
@@ -1532,18 +1747,32 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
     figsize : tuple
         Matplotlib figure size.
     log_scale : bool
-        If True (default), use log scale on the non-zero x-axis and y-axis.
+        Legacy parameter. If True (default), sets log_x=True and log_y=True
+        unless those are specified explicitly.
+    log_x : bool or None
+        If True, use log scale on the x-axis (with broken-axis zero panel).
+        Defaults to the value of log_scale.
+    log_y : bool or None
+        If True, use log scale on the y-axis.
+        Defaults to the value of log_scale.
     subplots : bool
         If True, draw one subplot per event type stacked vertically, all sharing
         the same x-axis. If False (default), all types are overlaid on one axis.
+    share_y : bool
+        Only used when subplots=True. If True (default), all subplots share the
+        same y-axis scale. If False, each subplot has an independent y-axis.
     save_path : str or None
         If provided, save the figure to this path instead of calling plt.show().
     """
+    if log_x is None:
+        log_x = log_scale
+    if log_y is None:
+        log_y = log_scale
     event_cols = {
-        "insertions":     ("n_insertions",     "#4C72B0"),
-        "deletions":      ("n_deletions",      "#DD8452"),
-        "translocations": ("n_translocations", "#55A868"),
-        "inversions":     ("n_inversions",     "#C44E52"),
+        "insertion":     ("n_insertion",     "#4C72B0"),
+        "deletion":      ("n_deletion",      "#DD8452"),
+        "translocation": ("n_translocation", "#55A868"),
+        "inversion":     ("n_inversion",     "#C44E52"),
     }
     n_types = len(event_cols)
     n_junctions = len(counts_df)
@@ -1559,9 +1788,10 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
     # Subplots mode: one panel per event type, shared x-axis             #
     # ------------------------------------------------------------------ #
     if subplots:
-        if not log_scale:
+        if not log_x:
             bin_edges = np.arange(0, max_count + 2) - 0.5
-            fig, axes = plt.subplots(n_types, 1, figsize=figsize, sharex=True)
+            fig, axes = plt.subplots(n_types, 1, figsize=figsize, sharex=True,
+                                     sharey=share_y)
             fig.subplots_adjust(hspace=0.08)
 
             for ax, (label, (col, color)) in zip(axes, event_cols.items()):
@@ -1572,11 +1802,11 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
                 counts_per_bin, _ = np.histogram(data, bins=bin_edges)
                 bin_widths = np.diff(bin_edges)
                 bin_centres = bin_edges[:-1] + bin_widths / 2
-                normalised = counts_per_bin / n_junctions
-                ax.bar(bin_centres, normalised, width=bin_widths * (1 - gap_frac),
+                ax.bar(bin_centres, counts_per_bin, width=bin_widths * (1 - gap_frac),
                        color=color, alpha=0.85, edgecolor="none")
                 ax.set_ylabel(label.capitalize(), rotation=0, labelpad=60, va="center")
-                ax.set_yscale("log")
+                if log_y:
+                    ax.set_yscale("log")
                 ax.spines["top"].set_visible(False)
                 ax.spines["right"].set_visible(False)
 
@@ -1596,11 +1826,12 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
             fig.subplots_adjust(hspace=0.15)
 
             # Share y-axis across ALL panels (both columns, all rows)
-            ref_ax = axes_pairs[0, 0]
-            for row in range(n_types):
-                for col_idx in range(2):
-                    if not (row == 0 and col_idx == 0):
-                        axes_pairs[row, col_idx].sharey(ref_ax)
+            if share_y:
+                ref_ax = axes_pairs[0, 0]
+                for row in range(n_types):
+                    for col_idx in range(2):
+                        if not (row == 0 and col_idx == 0):
+                            axes_pairs[row, col_idx].sharey(ref_ax)
 
             # Resolve axes sizes for bar-width matching
             fig.canvas.draw()
@@ -1625,16 +1856,16 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
 
                 # Zero bar
                 n_zero = (data == 0).sum()
-                ax0.bar(0, n_zero / n_junctions, width=bar_width_ax0,
+                ax0.bar(0, n_zero, width=bar_width_ax0,
                         color=color, alpha=0.85, edgecolor="none")
                 ax0.set_xticks([0])
                 ax0.set_xticklabels(["0"] if row == n_types - 1 else [""])
                 ax0.set_xlim(-1.0, 1.0)
-                ax0.set_yscale("log")
+                if log_y:
+                    ax0.set_yscale("log")
                 ax0.spines["right"].set_visible(False)
                 ax0.spines["top"].set_visible(False)
                 ax0.tick_params(right=False, which="both")
-                ax0.set_ylabel(label.capitalize(), rotation=0, labelpad=60, va="center")
 
                 # Non-zero bins
                 nonzero = data[data > 0]
@@ -1642,7 +1873,7 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
                 bin_widths = np.diff(bin_edges)
                 bw = bin_widths * (1 - gap_frac)
                 bin_centres = bin_edges[:-1] + bin_widths / 2
-                ax1.bar(bin_centres, counts_per_bin / n_junctions, width=bw,
+                ax1.bar(bin_centres, counts_per_bin, width=bw,
                         color=color, alpha=0.85, edgecolor="none")
                 ax1.set_xscale("log")
                 ax1.spines["left"].set_visible(False)
@@ -1654,9 +1885,27 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
                     ax1.tick_params(labelbottom=False)
                     ax0.tick_params(labelbottom=False)
 
-            axes_pairs[-1, 1].set_xlabel("Number of unique events per junction (log scale)")
+            axes_pairs[-1, 1].set_xlabel(
+                "Number of unique events per junction (log scale)" if log_x
+                else "Number of unique events per junction"
+            )
             fig.suptitle("Distribution of events per junction")
             plt.tight_layout()
+
+            # After layout is resolved, place per-row event-type labels and
+            # the shared "Number of junctions" label to their left.
+            fig.canvas.draw()
+            x0 = axes_pairs[0, 0].get_position().x0
+            for row, (label, (col, color)) in enumerate(event_cols.items()):
+                ax0 = axes_pairs[row, 0]
+                pos = ax0.get_position()
+                y_center = (pos.y0 + pos.y1) / 2
+                # event-type label horizontal, per row
+                fig.text(x0 - 0.11, y_center, label.capitalize(),
+                         va="center", ha="center", rotation=0, fontsize=9)
+            # shared "Number of junctions" label centered across all rows
+            fig.text(x0 - 0.045, 0.5, "Number of junctions",
+                     va="center", ha="center", rotation="vertical", fontsize=9)
 
         if save_path is not None:
             os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
@@ -1669,7 +1918,7 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
     # ------------------------------------------------------------------ #
     # Non-log: single axis, 0 is a normal bin                            #
     # ------------------------------------------------------------------ #
-    if not log_scale:
+    if not log_x:
         bin_edges = np.arange(0, max_count + 2) - 0.5  # integer-centred bins
         fig, ax = plt.subplots(figsize=figsize)
 
@@ -1683,12 +1932,12 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
             bar_width = usable / n_types
             bin_left = bin_edges[:-1] + bin_widths * (gap_frac / 2)
             x_centres = bin_left + i * bar_width + bar_width / 2
-            normalised = counts_per_bin / n_junctions
-            ax.bar(x_centres, normalised, width=bar_width, color=color,
+            ax.bar(x_centres, counts_per_bin, width=bar_width, color=color,
                    alpha=0.85, label=label.capitalize(), edgecolor="none")
-        ax.set_yscale("log")
+        if log_y:
+            ax.set_yscale("log")
         ax.set_xlabel("Number of unique events per junction")
-        ax.set_ylabel("Fraction of junctions (log scale)")
+        ax.set_ylabel("Count (log scale)" if log_y else "Count")
         ax.set_title("Distribution of events per junction")
         ax.legend(title="Event type", frameon=True)
         plt.tight_layout()
@@ -1740,9 +1989,8 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
 
         # --- zero bar ---
         n_zero = (data == 0).sum()
-        zero_frac = n_zero / n_junctions
         x_zero = -group_width_ax0 / 2 + i * bar_width_ax0 + bar_width_ax0 / 2
-        ax0.bar(x_zero, zero_frac, width=bar_width_ax0,
+        ax0.bar(x_zero, n_zero, width=bar_width_ax0,
                 color=color, alpha=0.85, edgecolor="none")
 
         # --- non-zero bins ---
@@ -1753,8 +2001,7 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
         bw = usable / n_types
         bin_left = bin_edges[:-1] + bin_widths * (gap_frac / 2)
         x_centres = bin_left + i * bw + bw / 2
-        normalised = counts_per_bin / n_junctions
-        ax1.bar(x_centres, normalised, width=bw, color=color,
+        ax1.bar(x_centres, counts_per_bin, width=bw, color=color,
                 alpha=0.85, label=label.capitalize(), edgecolor="none")
 
 
@@ -1762,14 +2009,16 @@ def plot_event_counts_distribution(counts_df, figsize=(10, 5), log_scale=True,
     ax0.set_xticks([0])
     ax0.set_xticklabels(["0"])
     ax0.set_xlim(-1.0, 1.0)
-    ax0.set_yscale("log")
-    ax0.set_ylabel("Fraction of junctions (log scale)")
+    if log_y:
+        ax0.set_yscale("log")
+    ax0.set_ylabel("Count (log scale)" if log_y else "Count")
     ax0.spines["right"].set_visible(False)
     ax0.tick_params(right=False, which="both")
 
     # Right panel
     ax1.set_xscale("log")
-    ax1.set_yscale("log")
+    if log_y:
+        ax1.set_yscale("log")
     ax1.set_xlabel("Number of unique events per junction (log scale)")
     ax1.spines["left"].set_visible(False)
     ax1.tick_params(left=False, which="both")
@@ -1803,10 +2052,10 @@ def plot_events_per_junction(counts_df, figsize=(12, 5), save_path=None):
         If provided, save the figure to this path instead of calling plt.show().
     """
     event_cols = {
-        "Insertions":     ("n_insertions",     "#4C72B0"),
-        "Deletions":      ("n_deletions",      "#DD8452"),
-        "Translocations": ("n_translocations", "#55A868"),
-        "Inversions":     ("n_inversions",     "#C44E52"),
+        "Insertion":     ("n_insertion",     "#4C72B0"),
+        "Deletion":      ("n_deletion",      "#DD8452"),
+        "Translocation": ("n_translocation", "#55A868"),
+        "Inversion":     ("n_inversion",     "#C44E52"),
     }
 
     # Sort junctions by total event count descending
@@ -1833,6 +2082,116 @@ def plot_events_per_junction(counts_df, figsize=(12, 5), save_path=None):
     ax.legend(title="Event type", frameon=True)
     ax.set_xlim(-1, len(sorted_df))
 
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_event_length_distribution(
+    deduped_df,
+    min_length_threshold=200,
+    bins=50,
+    log_x=False,
+    log_y=True,
+    y_max=None,
+    x_max=None,
+    filter_below_threshold=False,
+    figsize=(10, 8),
+    save_path=None,
+):
+    """
+    Plot the length distribution of each event type as 4 histograms stacked
+    vertically, using the same colour scheme as plot_event_counts_distribution.
+
+    All subplots share the same x- and y-scales. A vertical red dashed line
+    is drawn at `min_length_threshold` to mark the filtering cutoff.
+
+    Parameters
+    ----------
+    deduped_df : pd.DataFrame
+        Output of deduplicate_events(). Must have columns 'event_type' and 'length'.
+    min_length_threshold : int or None
+        Position of the red dashed cutoff line. Pass None to omit. Default: 200.
+    bins : int
+        Number of histogram bins. Default: 50.
+    log_x : bool
+        If True, use a log scale on the x-axis with log-spaced bin edges.
+        Default: False.
+    log_y : bool
+        If True, use a log scale on the y-axis. Default: True.
+    y_max : float or None
+        If provided, cap the y-axis at this value. Default: None.
+    x_max : float or None
+        If provided, cap the x-axis at this value. Default: None.
+    filter_below_threshold : bool
+        If True, events with length < min_length_threshold are excluded from
+        the plot. Has no effect if min_length_threshold is None. Default: False.
+    figsize : tuple
+        Matplotlib figure size.
+    save_path : str or None
+        If provided, save the figure; otherwise call plt.show().
+    """
+    event_cfg = [
+        ("insertion",     "#4C72B0"),
+        ("deletion",      "#DD8452"),
+        ("translocation", "#55A868"),
+        ("inversion",     "#C44E52"),
+    ]
+
+    plot_df = deduped_df.copy()
+    if filter_below_threshold and min_length_threshold is not None:
+        plot_df = plot_df[plot_df["length"] >= min_length_threshold]
+
+    all_lengths = plot_df["length"].dropna().values
+    if len(all_lengths) == 0:
+        return
+
+    x_min = max(all_lengths.min(), 1) if log_x else all_lengths.min()
+    x_max_data = x_max if x_max is not None else all_lengths.max()
+
+    if log_x:
+        bin_edges = np.logspace(np.log10(x_min), np.log10(x_max_data), bins + 1)
+    else:
+        bin_edges = np.linspace(x_min, x_max_data, bins + 1)
+
+    fig, axes_grid = plt.subplots(2, 2, figsize=figsize, sharex=True, sharey=True)
+    fig.subplots_adjust(hspace=0.25, wspace=0.1)
+    axes = axes_grid.flatten()
+
+    for ax, (etype, color) in zip(axes, event_cfg):
+        sub = plot_df[plot_df["event_type"] == etype]
+        if not sub.empty and "length" in sub.columns:
+            lengths = sub["length"].dropna().values
+            ax.hist(lengths, bins=bin_edges, color=color, alpha=0.85, edgecolor="none")
+        if min_length_threshold is not None and not filter_below_threshold:
+            ax.axvline(min_length_threshold, color="red", linestyle="--", linewidth=1.2,
+                       label=f"cutoff = {min_length_threshold} bp")
+            ax.legend(frameon=False, fontsize=10)
+        ax.set_title(etype.capitalize())
+        if log_y:
+            ax.set_yscale("log")
+        if log_x:
+            ax.set_xscale("log")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(axis="x", labelbottom=True)
+
+    if y_max is not None:
+        axes[0].set_ylim(top=y_max)
+    if x_max is not None:
+        axes[0].set_xlim(right=x_max)
+
+    for ax in axes_grid[1, :]:
+        ax.set_xlabel("Event length (bp)")
+    for ax in axes_grid[:, 0]:
+        ax.set_ylabel("Count")
+
+    fig.suptitle("Length distribution of events by type")
     plt.tight_layout()
 
     if save_path is not None:
@@ -2278,3 +2637,426 @@ def add_annotations_for_dash(
         )
 
     return fig
+
+def plot_marginal_scatter(
+    df: pd.DataFrame,
+    x_col: str = "tot_acc_len",
+    y_col: str = "n_categories",
+    figsize=(8, 6),
+    y_jitter_low: float = 0.9,
+    y_jitter_high: float = 1.1,
+    fill_alpha: float = 0.6,
+    edge_alpha: float = 1.0,
+    scatter_size: float = 28,
+    point_linewidth: float = 0.8,
+    filled: bool = True,
+    random_seed: int = 42,
+    filter_y_gt_1: bool = True,
+    color_by_n_clusters: bool = False,
+    color_by_event_count=None,
+    log_color_scale: bool = True,
+    show_histograms: bool = True,
+    subplot_arrangement: tuple = None,
+    shared_colorbar: bool = True,
+):
+    """
+    Scatter plot with marginal histograms, similar to panel (b),
+    using multiplicative random jitter on the y-axis.
+
+    This reproduces the old plotting style:
+        y_jittered = y * uniform(y_jitter_low, y_jitter_high)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe.
+    x_col : str
+        Column for x-axis, e.g. "tot_acc_len".
+    y_col : str
+        Column for y-axis, e.g. "n_categories".
+    figsize : tuple
+        Figure size.
+    y_jitter_low : float
+        Lower bound of multiplicative y-jitter.
+    y_jitter_high : float
+        Upper bound of multiplicative y-jitter.
+    fill_alpha : float
+        Transparency of the dot fill. Default: 0.6.
+    edge_alpha : float
+        Transparency of the dot border. Default: 1.0.
+    scatter_size : float
+        Scatter marker size.
+    point_linewidth : float
+        Marker edge linewidth.
+    filled : bool
+        If True (default), dots are filled. If False, only the ring outline is shown.
+    random_seed : int
+        Seed for reproducible jitter.
+    filter_y_gt_1 : bool
+        If True, only plot rows with y_col > 1, like in your Altair snippet.
+    color_by_n_clusters : bool
+        If True, color scatter points and histogram bars by the 'n_clusters'
+        column (discrete values 1–7). Default: False.
+    color_by_event_count : str or None
+        Column name (e.g. 'n_events', 'n_insertion') to color dots by
+        continuously. Zero values are shown in gray; non-zero values use a
+        continuous blue-to-red colormap. A colorbar is added. Default: None.
+    log_color_scale : bool
+        If True (default), use log scale for the event count colormap.
+        If False, use linear scale.
+    show_histograms : bool
+        If True (default), show marginal histograms. If False, only the
+        scatter plot is shown.
+    subplot_arrangement : tuple or None
+        If given (e.g. ``(2, 2)``), ``color_by_event_count`` must be a list
+        of column names.  Creates a grid of nrows × ncols scatter panels,
+        one per column, with a shared colormap/colorbar.  Histograms are
+        suppressed in this mode.
+    """
+
+    # ------------------------------------------------------------------ #
+    # Multi-panel mode                                                     #
+    # ------------------------------------------------------------------ #
+    if subplot_arrangement is not None:
+        from matplotlib.colors import (
+            to_rgba, LinearSegmentedColormap, LogNorm, Normalize,
+        )
+        from matplotlib.cm import ScalarMappable
+
+        if not isinstance(color_by_event_count, list):
+            raise ValueError(
+                "When subplot_arrangement is given, color_by_event_count must be a list."
+            )
+        nrows, ncols = subplot_arrangement
+        event_cols = color_by_event_count
+
+        _event_cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
+        event_cmap = LinearSegmentedColormap.from_list("event_cmap", _event_cmap_colors)
+
+        _axis_labels = {
+            "tot_acc_len": "local pangenome length (bp)",
+            "n_categories": "n. distinct paths",
+        }
+        _cbar_labels = {
+            "n_events":        "n. events",
+            "n_insertion":     "n. insertions",
+            "n_deletion":      "n. deletions",
+            "n_translocation": "n. translocations",
+            "n_inversion":     "n. inversions",
+        }
+
+        # prepare data once
+        all_cols = [x_col, y_col] + event_cols
+        data = df[all_cols].copy().replace([np.inf, -np.inf], np.nan).dropna()
+        data = data[(data[x_col] > 0) & (data[y_col] > 0)].copy()
+        if filter_y_gt_1:
+            data = data[data[y_col] > 1].copy()
+        if data.empty:
+            raise ValueError("No valid positive values left after filtering.")
+
+        rng = np.random.default_rng(random_seed)
+        y_jitter = rng.uniform(y_jitter_low, y_jitter_high, size=len(data))
+        data["_y_jittered"] = data[y_col] * y_jitter
+
+        # shared norm across all event columns
+        vmax = max((data[c].max() for c in event_cols), default=1)
+        if vmax <= 0:
+            vmax = 1
+        norm = LogNorm(vmin=1, vmax=vmax) if log_color_scale else Normalize(vmin=0, vmax=vmax)
+
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=figsize,
+            squeeze=False,
+        )
+        right_margin = 0.88 if shared_colorbar else 0.97
+        fig.subplots_adjust(right=right_margin, hspace=0.45, wspace=0.35)
+
+        for idx, col in enumerate(event_cols):
+            ax = axes[idx // ncols][idx % ncols]
+            event_vals = data[col].values
+            nonzero_mask = event_vals > 0
+
+            # per-panel norm when not shared
+            if shared_colorbar:
+                panel_norm = norm
+            else:
+                pmax = data[col].max() if data[col].max() > 0 else 1
+                use_log = (col in log_color_scale) if isinstance(log_color_scale, list) else log_color_scale
+                panel_norm = (LogNorm(vmin=1, vmax=pmax) if use_log
+                              else Normalize(vmin=0, vmax=pmax))
+
+            # gray for zero
+            if (~nonzero_mask).any():
+                gray_fc = (*to_rgba("#999999")[:3], fill_alpha) if filled else (0, 0, 0, 0)
+                gray_ec = (*to_rgba("#999999")[:3], edge_alpha)
+                ax.scatter(
+                    data.loc[~nonzero_mask, x_col],
+                    data.loc[~nonzero_mask, "_y_jittered"],
+                    s=scatter_size, facecolors=gray_fc, edgecolors=gray_ec,
+                    linewidths=point_linewidth,
+                )
+
+            # colored for non-zero
+            if nonzero_mask.any():
+                nd = data.loc[nonzero_mask].copy().sort_values(col, ascending=True)
+                norm_vals = panel_norm(nd[col].values)
+                face_colors = [(*event_cmap(v)[:3], fill_alpha) if filled else (0, 0, 0, 0)
+                               for v in norm_vals]
+                edge_colors = [(*event_cmap(v)[:3], edge_alpha) for v in norm_vals]
+                ax.scatter(
+                    nd[x_col], nd["_y_jittered"],
+                    s=scatter_size, facecolors=face_colors, edgecolors=edge_colors,
+                    linewidths=point_linewidth,
+                )
+
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_title(_cbar_labels.get(col, col), fontsize=12)
+            ax.set_xlabel(_axis_labels.get(x_col, x_col))
+            ax.set_ylabel(_axis_labels.get(y_col, y_col))
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+            if not shared_colorbar:
+                sm_panel = ScalarMappable(cmap=event_cmap, norm=panel_norm)
+                sm_panel.set_array([])
+                fig.colorbar(sm_panel, ax=ax, fraction=0.046, pad=0.04)
+
+        # hide unused axes
+        for idx in range(len(event_cols), nrows * ncols):
+            axes[idx // ncols][idx % ncols].set_visible(False)
+
+        # single shared colorbar
+        if shared_colorbar:
+            sm = ScalarMappable(cmap=event_cmap, norm=norm)
+            sm.set_array([])
+            cbar_ax = fig.add_axes([0.90, 0.15, 0.025, 0.7])
+            cbar = fig.colorbar(sm, cax=cbar_ax)
+            cbar.set_label("n. events", fontsize=9)
+
+        return fig, axes
+
+    # ------------------------------------------------------------------ #
+    # Single-panel mode (original code below)                             #
+    # ------------------------------------------------------------------ #
+    rng = np.random.default_rng(random_seed)
+
+    cols = [x_col, y_col]
+    if color_by_n_clusters:
+        cols.append("n_clusters")
+    if color_by_event_count is not None:
+        cols.append(color_by_event_count)
+    data = df[cols].copy()
+    data = data.replace([np.inf, -np.inf], np.nan).dropna()
+    data = data[(data[x_col] > 0) & (data[y_col] > 0)].copy()
+
+    if filter_y_gt_1:
+        data = data[data[y_col] > 1].copy()
+
+    if color_by_n_clusters:
+        cluster_values = sorted(data["n_clusters"].unique())
+        _n_clusters_palette = {
+            1: "#999999",  # gray
+            2: "#b5d2f2",  # light blue
+            3: "#7394c2",  # mid blue
+            4: "#d991b4",  # pink
+            5: "#80557e",  # purple
+            6: "#a6444f",  # reddish
+            7: "#a6444f",  # reddish (same, filtered out anyway)
+        }
+        cluster_colors = {v: _n_clusters_palette.get(v, "#999999") for v in cluster_values}
+
+    if data.empty:
+        raise ValueError("No valid positive values left after filtering.")
+
+    # multiplicative y-jitter, exactly in the style of the old plot
+    y_jitter = rng.uniform(y_jitter_low, y_jitter_high, size=len(data))
+    data["_y_jittered"] = data[y_col] * y_jitter
+
+    # layout
+    fig = plt.figure(figsize=figsize)
+    if show_histograms:
+        gs = GridSpec(
+            2, 2,
+            width_ratios=[4, 1.2],
+            height_ratios=[1.2, 4],
+            hspace=0.08,
+            wspace=0.08,
+        )
+        ax_histx = fig.add_subplot(gs[0, 0])
+        ax_scatter = fig.add_subplot(gs[1, 0], sharex=ax_histx)
+        ax_histy = fig.add_subplot(gs[1, 1], sharey=ax_scatter)
+    else:
+        ax_scatter = fig.add_subplot(1, 1, 1)
+        ax_histx = None
+        ax_histy = None
+
+    # scatter
+    if color_by_n_clusters:
+        for v in cluster_values:
+            mask = data["n_clusters"] == v
+            from matplotlib.colors import to_rgba
+            fc = (*to_rgba(cluster_colors[v])[:3], fill_alpha) if filled else (0, 0, 0, 0)
+            ec = (*to_rgba(cluster_colors[v])[:3], edge_alpha)
+            ax_scatter.scatter(
+                data.loc[mask, x_col],
+                data.loc[mask, "_y_jittered"],
+                s=scatter_size,
+                facecolors=fc,
+                edgecolors=ec,
+                linewidths=point_linewidth,
+                label=str(int(v) - 1),
+            )
+        # legend added after layout below
+        pass
+    elif color_by_event_count is not None:
+        from matplotlib.colors import to_rgba, LinearSegmentedColormap
+        _event_cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
+        event_cmap = LinearSegmentedColormap.from_list("event_cmap", _event_cmap_colors)
+
+        from matplotlib.colors import LogNorm, Normalize
+        event_vals = data[color_by_event_count].values
+        nonzero_mask = event_vals > 0
+        vmax = event_vals.max() if event_vals.max() > 0 else 1
+        log_norm = LogNorm(vmin=1, vmax=vmax) if log_color_scale else Normalize(vmin=0, vmax=vmax)
+
+        # gray dots for zero
+        if (~nonzero_mask).any():
+            gray_fc = (*to_rgba("#999999")[:3], fill_alpha) if filled else (0, 0, 0, 0)
+            gray_ec = (*to_rgba("#999999")[:3], edge_alpha)
+            ax_scatter.scatter(
+                data.loc[~nonzero_mask, x_col],
+                data.loc[~nonzero_mask, "_y_jittered"],
+                s=scatter_size, facecolors=gray_fc, edgecolors=gray_ec,
+                linewidths=point_linewidth,
+            )
+
+        # colored dots for non-zero, log-normalized, sorted ascending so high counts plot on top
+        if nonzero_mask.any():
+            nonzero_data = data.loc[nonzero_mask].copy()
+            nonzero_data = nonzero_data.sort_values(color_by_event_count, ascending=True)
+            norm_vals = log_norm(nonzero_data[color_by_event_count].values)
+            face_colors = [(*event_cmap(v)[:3], fill_alpha) if filled else (0, 0, 0, 0)
+                           for v in norm_vals]
+            edge_colors = [(*event_cmap(v)[:3], edge_alpha) for v in norm_vals]
+            ax_scatter.scatter(
+                nonzero_data[x_col],
+                nonzero_data["_y_jittered"],
+                s=scatter_size, facecolors=face_colors, edgecolors=edge_colors,
+                linewidths=point_linewidth,
+            )
+    else:
+        from matplotlib.colors import to_rgba
+        fc = (*to_rgba("0.5")[:3], fill_alpha) if filled else (0, 0, 0, 0)
+        ec = (*to_rgba("0.5")[:3], edge_alpha)
+        ax_scatter.scatter(
+            data[x_col],
+            data["_y_jittered"],
+            s=scatter_size,
+            facecolors=fc,
+            edgecolors=ec,
+            linewidths=point_linewidth,
+        )
+
+    _axis_labels = {
+        "tot_acc_len": "local pangenome length (bp)",
+        "n_categories": "n. distinct paths",
+    }
+    ax_scatter.set_xscale("log")
+    ax_scatter.set_yscale("log")
+    ax_scatter.set_xlabel(_axis_labels.get(x_col, x_col))
+    ax_scatter.set_ylabel(_axis_labels.get(y_col, y_col))
+
+    if show_histograms:
+        # histograms from original, non-jittered data
+        x_min, x_max = data[x_col].min(), data[x_col].max()
+        y_min, y_max = data[y_col].min(), data[y_col].max()
+
+        x_bins = np.logspace(np.log10(x_min), np.log10(x_max), 25)
+        y_bins = np.logspace(np.log10(y_min), np.log10(y_max), 25)
+
+        if color_by_n_clusters:
+            ax_histx.hist(
+                [data.loc[data["n_clusters"] == v, x_col] for v in cluster_values],
+                bins=x_bins,
+                color=[cluster_colors[v] for v in cluster_values],
+                stacked=True, edgecolor="none",
+            )
+            ax_histy.hist(
+                [data.loc[data["n_clusters"] == v, y_col] for v in cluster_values],
+                bins=y_bins, orientation="horizontal",
+                color=[cluster_colors[v] for v in cluster_values],
+                stacked=True, edgecolor="none",
+            )
+        elif color_by_event_count is not None:
+            from matplotlib.colors import LogNorm, Normalize, LinearSegmentedColormap
+            _hcmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
+            hcmap = LinearSegmentedColormap.from_list("event_cmap", _hcmap_colors)
+            hnorm = LogNorm(vmin=1, vmax=vmax) if log_color_scale else Normalize(vmin=0, vmax=vmax)
+
+            def _colored_hist(ax, col, bins, orientation="vertical"):
+                for i in range(len(bins) - 1):
+                    mask = (data[col] >= bins[i]) & (data[col] < bins[i + 1])
+                    if not mask.any():
+                        continue
+                    mean_val = data.loc[mask, color_by_event_count].mean()
+                    color = "#999999" if mean_val <= 0 else hcmap(hnorm(mean_val))
+                    count = mask.sum()
+                    w = bins[i + 1] - bins[i]
+                    if orientation == "vertical":
+                        ax.bar(bins[i], count, width=w, align="edge", color=color, edgecolor="none")
+                    else:
+                        ax.barh(bins[i], count, height=w, align="edge", color=color, edgecolor="none")
+
+            _colored_hist(ax_histx, x_col, x_bins, orientation="vertical")
+            _colored_hist(ax_histy, y_col, y_bins, orientation="horizontal")
+        else:
+            ax_histx.hist(data[x_col], bins=x_bins, color="0.7", edgecolor="0.55")
+            ax_histy.hist(data[y_col], bins=y_bins, orientation="horizontal",
+                          color="0.7", edgecolor="0.55")
+
+        ax_histx.set_xscale("log")
+        ax_histx.set_ylabel("n. junctions")
+        ax_histy.set_yscale("log")
+        ax_histy.set_xlabel("n. junctions")
+        plt.setp(ax_histx.get_xticklabels(), visible=False)
+        plt.setp(ax_histy.get_yticklabels(), visible=False)
+
+    for ax in [ax_scatter] + ([ax_histx, ax_histy] if show_histograms else []):
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    if color_by_n_clusters:
+        fig.subplots_adjust(right=0.78)
+        handles, labels = ax_scatter.get_legend_handles_labels()
+        fig.legend(handles, labels,
+                   title="n. homologous\nrecombination events",
+                   frameon=False, fontsize=8,
+                   loc="center left",
+                   bbox_to_anchor=(0.80, 0.45))
+    elif color_by_event_count is not None:
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import LogNorm, Normalize, LinearSegmentedColormap
+        _event_cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
+        event_cmap = LinearSegmentedColormap.from_list("event_cmap", _event_cmap_colors)
+        _cb_norm = LogNorm(vmin=1, vmax=vmax) if log_color_scale else Normalize(vmin=0, vmax=vmax)
+        sm = ScalarMappable(cmap=event_cmap, norm=_cb_norm)
+        sm.set_array([])
+        fig.subplots_adjust(right=0.78)
+        cbar_height = 0.55
+        cbar_bottom = 0.12 if show_histograms else (1 - cbar_height) / 2
+        cbar_ax = fig.add_axes([0.81, cbar_bottom, 0.03, cbar_height])
+        cbar = fig.colorbar(sm, cax=cbar_ax)
+        _cbar_labels = {
+            "n_events":       "n. events",
+            "n_insertion":    "n. insertions",
+            "n_deletion":     "n. deletions",
+            "n_translocation":"n. translocations",
+            "n_inversion":    "n. inversions",
+        }
+        cbar.set_label(_cbar_labels.get(color_by_event_count, color_by_event_count), fontsize=9)
+
+    if show_histograms:
+        return fig, (ax_scatter, ax_histx, ax_histy)
+    return fig, (ax_scatter,)

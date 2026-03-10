@@ -349,8 +349,11 @@ if __name__ == "__main__":
     #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # consensus definition very conservative here, investigate
     #junction_name = "PLTCZQCVRD_f__RYYAQMEJGY_f"
     #junction_name = "NOAJDCSIVA_f__NZXBIFMPMA_r"
-    junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
-    #junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
+    #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
+    #junction_name = "GPKQYOCEJI_r__NKVSUZGURN_f"
+    #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f"
+    #junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
+    junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
     #junction_name = "ATPWUNKKID_f__KKPYPKGMXA_f"
     #junction_name = 'KGWWUZQEKD_r__UXLELLOQVR_r'
 

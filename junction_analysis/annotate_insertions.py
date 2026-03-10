@@ -301,28 +301,48 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                     cur = n.id
             return ctxs
 
-        def _detect_translocations(anchor_ids):
-            """Preliminary pass: return the set of translocated block ids."""
-            c_ctxs   = _assign_ctx(c_nodes, anchor_ids)
-            iso_ctxs = _assign_ctx(iso_nodes, anchor_ids)
-            c_id_ctx_strand = {(n.id, ctx): n.strand for n, ctx in zip(c_nodes, c_ctxs)}
-            iso_id_ctx_strand = {(n.id, ctx): n.strand for n, ctx in zip(iso_nodes, iso_ctxs)}
-            matched = {key for key in c_id_ctx_strand if key in iso_id_ctx_strand}
-            c_ctx_by_id = defaultdict(list)
-            for n, ctx in zip(c_nodes, c_ctxs):
-                if (n.id, ctx) not in matched:
-                    c_ctx_by_id[n.id].append(ctx)
+        def _detect_translocations_iterative(initial_anchor_ids):
+            """Iterative preliminary pass: each time a new block id is identified as
+            translocated it is immediately removed from the anchor set and contexts
+            are recomputed, so that subsequent blocks in the same run are exposed
+            with different contexts and can be detected in the same pass."""
             translocated_ids = set()
-            for n, ctx in zip(iso_nodes, iso_ctxs):
-                if (n.id, ctx) in matched:
-                    continue
-                if c_ctx_by_id.get(n.id):
-                    c_ctx_by_id[n.id].pop(0)
-                    translocated_ids.add(n.id)
+            excluded = set()
+
+            while True:
+                anchor_ids = initial_anchor_ids - excluded
+                c_ctxs   = _assign_ctx(c_nodes,   anchor_ids)
+                iso_ctxs = _assign_ctx(iso_nodes, anchor_ids)
+
+                c_id_ctx_strand   = {(n.id, ctx): n.strand for n, ctx in zip(c_nodes,   c_ctxs)}
+                iso_id_ctx_strand = {(n.id, ctx): n.strand for n, ctx in zip(iso_nodes, iso_ctxs)}
+                matched = {key for key in c_id_ctx_strand if key in iso_id_ctx_strand}
+
+                c_ctx_by_id = defaultdict(list)
+                for n, ctx in zip(c_nodes, c_ctxs):
+                    if (n.id, ctx) not in matched:
+                        c_ctx_by_id[n.id].append(ctx)
+
+                new_id = None
+                for n, ctx in zip(iso_nodes, iso_ctxs):
+                    if (n.id, ctx) in matched:
+                        continue
+                    if c_ctx_by_id.get(n.id) and n.id not in translocated_ids:
+                        c_ctx_by_id[n.id].pop(0)
+                        new_id = n.id
+                        break  # add only one id per iteration
+
+                if new_id is None:
+                    break
+
+                translocated_ids.add(new_id)
+                excluded.add(new_id)
+
             return translocated_ids
 
-        # Preliminary run to find translocated ids, then exclude them as anchors
-        preliminary_trans_ids = _detect_translocations(_candidate_anchor_ids())
+        # Iterative preliminary run: recompute contexts each time a new translocated
+        # id is found, so that all blocks in a translocated run are detected.
+        preliminary_trans_ids = _detect_translocations_iterative(_candidate_anchor_ids())
         anchor_ids = _candidate_anchor_ids(excluded=preliminary_trans_ids)
 
         # ------------------------------------------------------------------ #
@@ -349,7 +369,6 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         current_insertion_first_ctx = None
         current_translocation = []
         current_translocation_first_ctx = None
-        trans_first_ctxs = []  # parallel to translocations[isolate]: (iso_ctx, c_ctx) of first block
 
         def flush_ins():
             nonlocal current_insertion, current_insertion_first_ctx
@@ -384,7 +403,6 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 matched.add((n.id, ctx))
                 flush_ins()
                 if not current_translocation:
-                    trans_first_ctxs.append((ctx, c_ctx))
                     current_translocation_first_ctx = ctx
                 current_translocation.append(n)
             else:
@@ -396,40 +414,6 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
 
         flush_ins()
         flush_trans()
-
-        # Extend each translocation forward as long as the next block id matches
-        # in both paths, then drop any that is fully contained in another.
-        iso_id_ctx_to_pos = {(n.id, ctx): i for i, (n, ctx) in enumerate(zip(iso_nodes, iso_ctxs))}
-        c_id_ctx_to_pos   = {(n.id, ctx): i for i, (n, ctx) in enumerate(zip(c_nodes,   c_ctxs))}
-
-        for trans_entry, (iso_ctx, c_ctx) in zip(translocations.get(isolate, []), trans_first_ctxs):
-            trans_path = trans_entry["path"]
-            first_node = trans_path.nodes[0]
-            iso_pos = iso_id_ctx_to_pos.get((first_node.id, iso_ctx))
-            c_pos   = c_id_ctx_to_pos  .get((first_node.id, c_ctx))
-            if iso_pos is not None and c_pos is not None:
-                iso_pos += len(trans_path.nodes)
-                c_pos   += len(trans_path.nodes)
-                while iso_pos < len(iso_nodes) and c_pos < len(c_nodes):
-                    if iso_nodes[iso_pos].id != c_nodes[c_pos].id:
-                        break
-                    trans_path.nodes.append(iso_nodes[iso_pos])
-                    iso_pos += 1
-                    c_pos   += 1
-
-        all_trans = translocations.get(isolate, [])
-        filtered_translocations = [
-            te for te in all_trans
-            if not any(
-                (te["path"].nodes[0].id, te["path"].nodes[0].context) == (n.id, n.context)
-                for other in all_trans if other is not te
-                for n in other["path"].nodes
-            )
-        ]
-        if filtered_translocations:
-            translocations[isolate] = filtered_translocations
-        elif isolate in translocations:
-            del translocations[isolate]
 
         # ------------------------------------------------------------------ #
         # Pass 2: walk consensus — deletions                                  #
@@ -634,21 +618,29 @@ def write_sgenome_ids(atb_hits_df, output_file):
 def retrieve_SAMids_txt(parent_dir):
     parent_dir = Path(parent_dir)
 
-    for file_path in parent_dir.glob("*.lexicmap.tsv"):
+    for file_path in parent_dir.rglob("*.lexicmap.tsv"):
         hits_df = pd.read_csv(file_path, sep="\t")
-        output_path = file_path.with_name(file_path.name.replace(".lexicmap.tsv", ".ids.txt"))
+
+        output_path = file_path.with_name(
+            file_path.name.replace(".lexicmap.tsv", ".ids.txt")
+        )
+
         write_sgenome_ids(hits_df, output_path)
 
 def combine_NCBI_atb_results(parent_dir):
     parent_dir = Path(parent_dir)
 
-    for file_path in parent_dir.glob("*.ncbi_results.tsv"):
-        ncbi_res_df = pd.read_csv(file_path, sep="\t")
-        hits_df = pd.read_csv(file_path.with_name(file_path.name.replace(".ncbi_results.tsv", ".lexicmap.tsv")), sep="\t")
-        merged_df = pd.merge(hits_df, ncbi_res_df, on="sgenome", how="left")
-
+    for file_path in parent_dir.rglob("*.ncbi_results.tsv"):
+        lexicmap_path = file_path.with_name(file_path.name.replace(".ncbi_results.tsv", ".lexicmap.tsv"))
         output_path = file_path.with_name(file_path.name.replace(".ncbi_results.tsv", ".hits_info.tsv"))
-        merged_df.to_csv(output_path, index = False, sep="\t")
+        try:
+            ncbi_res_df = pd.read_csv(file_path, sep="\t")
+            hits_df = pd.read_csv(lexicmap_path, sep="\t")
+            merged_df = pd.merge(hits_df, ncbi_res_df, on="sgenome", how="left")
+            merged_df.to_csv(output_path, index=False, sep="\t")
+        except pd.errors.EmptyDataError as e:
+            print(f"Empty file, skipping merge ({file_path}): {e}")
+            open(output_path, "w").close()
 
 
 def find_insertion_hits_own_genome(genome_root, insertions_seq_dir):
@@ -1314,23 +1306,91 @@ def combine_all_junctions_summaries(parent_dir, save_df=False):
     return results
 
 
-def count_events_per_junction(summaries, min_length=200, save_path=None):
+def deduplicate_events(summaries, save_path=None):
     """
-    Count the number of unique events per junction for each event type.
+    Deduplicate all event summary DataFrames and combine into one DataFrame.
 
-    Two events are considered the same (and counted only once) if they share
-    the same junction_name, path (block ids + strand), and ctx.  Events
-    shorter than `min_length` bp are excluded before counting.
+    For each event type:
+      - Deduplicate by (junction_name, path, ctx) so each unique event is
+        represented exactly once regardless of which isolate carried it.
+      - Drop the isolate column (genome_name) since events are no longer
+        tied to a specific isolate after deduplication.
+      - Add an 'event_type' column with the event type string.
+
+    No length filtering is applied here — pass the returned DataFrame to
+    ``count_events_per_junction`` with a ``min_length`` argument to filter
+    without mutating this DataFrame.
 
     Parameters
     ----------
     summaries : dict
-        Output of combine_all_junctions_summaries(), i.e. a dict with keys
-        "insertions", "deletions", "translocations", "inversions", each
-        mapping to a pd.DataFrame.
-    min_length : int
+        Output of combine_all_junctions_summaries(), with keys
+        "insertions", "deletions", "translocations", "inversions".
+    save_path : str or None
+        If provided, save the combined deduplicated DataFrame as a CSV.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per unique event with columns: event_type, junction_name,
+        path, ctx, length, ... (genome_name dropped).
+    """
+    # Maps summaries dict keys (plural, match directory names) to singular event_type labels
+    event_type_map = {
+        "insertions":     "insertion",
+        "deletions":      "deletion",
+        "translocations": "translocation",
+        "inversions":     "inversion",
+    }
+    parts = []
+
+    for dtype, etype_label in event_type_map.items():
+        df = summaries.get(dtype)
+        if df is None or df.empty:
+            continue
+
+        df = df.copy()
+
+        # Deduplicate by (junction_name, path, ctx) or (junction_name, path)
+        if "ctx" in df.columns:
+            dedup_cols = ["junction_name", "path", "ctx"]
+        else:
+            dedup_cols = ["junction_name", "path"]
+
+        df = df.drop_duplicates(subset=dedup_cols)
+
+        # Drop isolate column — events are no longer isolate-specific
+        df = df.drop(columns=["genome_name"], errors="ignore")
+
+        df = df.reset_index(drop=True)
+        df.insert(0, "event_type", etype_label)
+        parts.append(df)
+
+    if not parts:
+        return pd.DataFrame()
+
+    combined = pd.concat(parts, ignore_index=True)
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        combined.to_csv(save_path, index=False)
+        print(f"Saved deduplicated events to {save_path}")
+
+    return combined
+
+
+def count_events_per_junction(deduped_df, min_length=200, save_path=None):
+    """
+    Count the number of unique events per junction for each event type.
+
+    Parameters
+    ----------
+    deduped_df : pd.DataFrame
+        Output of deduplicate_events(). Must have columns 'event_type',
+        'junction_name', and optionally 'length'.
+    min_length : int or None
         Minimum event length in bp (inclusive). Events below this threshold
-        are ignored. Default: 200.
+        are excluded. The original DataFrame is never modified. Default: 200.
     save_path : str or None
         If provided, the counts DataFrame is written as a CSV to this path.
 
@@ -1340,45 +1400,61 @@ def count_events_per_junction(summaries, min_length=200, save_path=None):
         One row per junction_name with columns:
         junction_name, n_insertions, n_deletions, n_translocations, n_inversions
     """
-    event_types = ["insertions", "deletions", "translocations", "inversions"]
+    event_types = ["insertion", "deletion", "translocation", "inversion"]
 
-    # Collect all junction names across all event types
-    all_junctions = set()
+    # Apply length filter on a view — original df is untouched
+    if min_length is not None and "length" in deduped_df.columns:
+        df = deduped_df[deduped_df["length"] >= min_length]
+    else:
+        df = deduped_df
+
+    if df.empty:
+        empty_cols = (
+            ["junction_name"]
+            + [f"n_{t}" for t in event_types]
+            + ["n_events"]
+            + ([f"mean_length_{t}" for t in event_types] if "length" in deduped_df.columns else [])
+            + (["mean_length"] if "length" in deduped_df.columns else [])
+        )
+        return pd.DataFrame(columns=empty_cols)
+
+    # All junctions present in the original (pre-filter) df
+    all_junctions = pd.DataFrame({"junction_name": deduped_df["junction_name"].unique()})
+
+    grp = df.groupby(["junction_name", "event_type"])
+
+    # Counts per (junction, event_type)
+    counts = grp.size().unstack(fill_value=0).reset_index()
+    # Include junctions with zero events after filtering
+    counts = all_junctions.merge(counts, on="junction_name", how="left").fillna(0)
     for dtype in event_types:
-        df = summaries.get(dtype)
-        if df is not None and not df.empty and "junction_name" in df.columns:
-            all_junctions.update(df["junction_name"].unique())
+        if dtype not in counts.columns:
+            counts[dtype] = 0
+        counts = counts.rename(columns={dtype: f"n_{dtype}"})
+    count_cols = [f"n_{t}" for t in event_types]
+    counts = counts.reindex(columns=["junction_name"] + count_cols, fill_value=0)
 
-    rows = []
-    for junction in sorted(all_junctions):
-        row = {"junction_name": junction}
+    # Total events per junction
+    counts["n_events"] = counts[count_cols].sum(axis=1)
+
+    # Mean length per (junction, event_type) and overall
+    if "length" in df.columns:
+        mean_len = grp["length"].mean().unstack().reset_index()
         for dtype in event_types:
-            df = summaries.get(dtype)
-            if df is None or df.empty:
-                row[f"n_{dtype}"] = 0
-                continue
-
-            # Filter to this junction and apply minimum length threshold
-            sub = df[(df["junction_name"] == junction) & (df["length"] >= min_length)].copy()
-
-            if sub.empty:
-                row[f"n_{dtype}"] = 0
-                continue
-
-            # Deduplicate: same (path, ctx) → same event; fall back to path-only if ctx absent
-            if "ctx" in sub.columns:
-                dedup_cols = ["path", "ctx"]
+            col = f"mean_length_{dtype}"
+            if dtype in mean_len.columns:
+                mean_len = mean_len.rename(columns={dtype: col})
             else:
-                dedup_cols = ["path"]
+                mean_len[col] = float("nan")
+        mean_len_cols = [f"mean_length_{t}" for t in event_types]
+        mean_len = mean_len.reindex(columns=["junction_name"] + mean_len_cols)
 
-            row[f"n_{dtype}"] = sub.drop_duplicates(subset=dedup_cols).shape[0]
+        overall_mean = df.groupby("junction_name")["length"].mean().rename("mean_event_length").reset_index()
 
-        rows.append(row)
-
-    counts_df = pd.DataFrame(
-        rows,
-        columns=["junction_name", "n_insertions", "n_deletions", "n_translocations", "n_inversions"],
-    )
+        counts_df = counts.merge(mean_len, on="junction_name", how="left")
+        counts_df = counts_df.merge(overall_mean, on="junction_name", how="left")
+    else:
+        counts_df = counts
 
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None

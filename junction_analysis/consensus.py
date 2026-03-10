@@ -1121,3 +1121,107 @@ def renumber_context_numbering(consensus_paths, path_dict, assignment_df):
             new_path_dict[iso] = path_dict[iso]
 
     return new_consensus_paths, new_path_dict
+
+
+def cluster_map_to_dataframe(cluster_map: dict, save_path: str = None) -> pd.DataFrame:
+    """
+    Convert a cluster_map dict to a wide-form DataFrame where each row is one
+    junction, the second column is the number of clusters, and the remaining
+    columns are isolate names containing their cluster id (NaN if absent).
+
+    Parameters
+    ----------
+    cluster_map : dict
+        junction_name -> {isolate_name: cluster_id}
+    save_path : str or None
+        If provided, save the DataFrame as a CSV to this path.
+
+    Returns
+    -------
+    pd.DataFrame with columns: junction_name, n_clusters, <isolate_1>, <isolate_2>, ...
+    """
+    rows = {}
+    for junction, iso_map in cluster_map.items():
+        row = {
+            "junction_name": junction,
+            "n_clusters": len(set(iso_map.values())),
+            "n_isolates": len(iso_map),
+        }
+        row.update(iso_map)
+        rows[junction] = row
+
+    df = pd.DataFrame.from_dict(rows, orient="index").reset_index(drop=True)
+
+    # Cast isolate columns to nullable int (preserves NaN for absent isolates as <NA>)
+    meta_cols = {"junction_name", "n_clusters", "n_isolates"}
+    iso_cols = [c for c in df.columns if c not in meta_cols]
+    for col in iso_cols:
+        df[col] = df[col].astype("Int64")
+
+    # Ensure junction_name, n_clusters, n_isolates are the first three columns
+    df = df[["junction_name", "n_clusters", "n_isolates"] + iso_cols]
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(save_path, index=False)
+        print(f"Saved cluster map to {save_path}")
+
+    return df
+
+
+def collect_all_pairwise_distances(junction_names, results_dir,
+                                    save_path=None, load_path=None):
+    """
+    Collect pairwise distances from the core genome tree of each junction.
+
+    Parameters
+    ----------
+    junction_names : list of str
+        Junction names to process.
+    results_dir : str or Path
+        Base results directory; trees are expected at
+        ``results_dir/consensus_analysis/<junction_name>/core_blocks_aln.newick``.
+    save_path : str or Path or None
+        If provided, save the resulting DataFrame as a CSV to this path.
+    load_path : str or Path or None
+        If provided, load distances from this CSV instead of recomputing.
+
+    Returns
+    -------
+    pd.DataFrame with columns: junction_name, distance
+    """
+
+    if load_path is not None:
+        df = pd.read_csv(load_path)
+        print(f"Loaded pairwise distances from {load_path} ({len(df)} rows).")
+        return df
+
+    results_dir = Path(results_dir)
+    rows = []
+    skipped = []
+
+    for jname in junction_names:
+        tree_path = results_dir / "consensus_analysis" / jname / "core_blocks_aln.newick"
+        if not tree_path.exists():
+            skipped.append(jname)
+            continue
+        try:
+            dists = compute_pairwise_distances(str(tree_path))
+            for d in dists:
+                rows.append({"junction_name": jname, "distance": d})
+        except Exception as e:
+            print(f"  {jname}: {e}")
+            skipped.append(jname)
+
+    if skipped:
+        print(f"Skipped {len(skipped)} junctions (tree not found or error).")
+
+    df = pd.DataFrame(rows, columns=["junction_name", "distance"])
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(save_path, index=False)
+        print(f"Saved pairwise distances to {save_path}.")
+
+    return df
+
