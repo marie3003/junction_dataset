@@ -16,7 +16,7 @@ import pandas as pd
 import pypangraph as pp
 from scipy.cluster.hierarchy import dendrogram
 
-from junction_analysis.helpers import get_tree_order, read_gff3_annotations, read_gff3_cds_products
+from junction_analysis.helpers import get_tree_order, read_gff3_annotations, read_gff3_cds_products, read_gff3_trna
 import junction_analysis.pangraph_utils as pu
 
 
@@ -152,6 +152,7 @@ def plot_junction_pangraph_interactive(
     annotations_gff_path: str = None,
     annotation_alpha: float = 0.70,   # transparency for annotations
     cds_annotation_alpha: float = 0.30,  # transparency for CDS annotations
+    show_trna_annotations: bool = False,
     show_indels: bool = False,
     indels_base_path: str = None,  # base path (e.g., results/atb_lookup) containing insertions/ and deletions/ subfolders
     junction_name: str = None,  # junction name for path construction (e.g., CIRMBUYJFK_f__CWCCKOQCWZ_r)
@@ -276,7 +277,7 @@ def plot_junction_pangraph_interactive(
             y_seen.add(label)
 
     if not show_consensus:
-        for iso in isolates_ordered:
+        for iso in reversed(isolates_ordered):
             draw_isolate_track(iso)
     else:
         grouped = (
@@ -285,15 +286,18 @@ def plot_junction_pangraph_interactive(
             .apply(list)
             .to_dict()
         )
-        for i, cons_path in enumerate(consensus_paths):
+        # Draw groups in reverse order so consensus_1 ends up nearest the top (overview)
+        for i, cons_path in reversed(list(enumerate(consensus_paths))):
             cons_label = f"consensus_{i+1}"
             isolates_for_this = grouped.get(cons_label, [])
             if tree_order:
                 isolates_for_this = [iso for iso in tree_order if iso in isolates_for_this]
-            for iso in isolates_for_this:
+            # Reversed so tree-top isolate appears at visual top of the group
+            for iso in reversed(isolates_for_this):
                 draw_isolate_track(iso)
             draw_consensus_track(cons_path, cons_label)
-        for i, cons_path in enumerate(consensus_paths):
+        # Overview tracks drawn last → appear at top of chart; reversed so consensus_1 is topmost
+        for i, cons_path in reversed(list(enumerate(consensus_paths))):
             cons_label = f"consensus_{i+1}\u200b"
             draw_consensus_track(cons_path, cons_label)
 
@@ -339,9 +343,9 @@ def plot_junction_pangraph_interactive(
     if show_int_rec_annotations and annotations_gff_path:
         gdf = read_gff3_cds_products(annotations_gff_path)
 
-        # filter CDS products containing integrase or recombinase (case-insensitive)
+        # filter CDS products containing integrase, recombinase, or transposase (case-insensitive)
         prod = gdf["product"].fillna("").str.lower()
-        ir = gdf[prod.str.contains("integrase") | prod.str.contains("recombinase")].copy()
+        ir = gdf[prod.str.contains("integrase") | prod.str.contains("recombinase") | prod.str.contains("transposase")].copy()
 
         if not ir.empty:
             legend_added = False
@@ -359,15 +363,50 @@ def plot_junction_pangraph_interactive(
                     base=(sub_ir["start"]).tolist(),
                     orientation="h",
                     marker=dict(color=_rgba("rgb(166,216,84)", annotation_alpha), line=dict(width=0)),
-                    name="Integrase / Recombinase",
+                    name="Integrase / Recombinase / Transposase",
                     showlegend=showleg,
                     customdata=list(zip(sub_ir["end"].tolist(), sub_ir["product"].tolist())),
                     hovertemplate=(
-                        "<b>Integrase / Recombinase</b>"
+                        "<b>Integrase / Recombinase / Transposase</b>"
                         "<br>%{customdata[1]}"
                         "<br>Start = %{base:d}"
                         "<br>End = %{customdata[0]:d}"
                         "<br>Length = %{x:d}"
+                        "<extra></extra>"
+                    ),
+                ))
+
+    # overlay tRNA / tmRNA annotations
+    TRNA_COLOR = "rgb(127,201,127)"  # mid sage-green between integrase (166,216,84) and prophage (27,158,119)
+    if show_trna_annotations and annotations_gff_path:
+        tdf = read_gff3_trna(annotations_gff_path)
+        if not tdf.empty:
+            trna_legend_added = False
+            for label in y_labels:
+                sub_t = tdf[tdf["seqid"] == label]
+                if sub_t.empty:
+                    continue
+                showleg = not trna_legend_added
+                trna_legend_added = True
+                fig.add_trace(go.Bar(
+                    x=(sub_t["end"] - sub_t["start"]).tolist(),
+                    y=[label] * len(sub_t),
+                    base=sub_t["start"].tolist(),
+                    orientation="h",
+                    marker=dict(color=_rgba(TRNA_COLOR, annotation_alpha), line=dict(width=0)),
+                    name="tRNA / tmRNA",
+                    showlegend=showleg,
+                    customdata=list(zip(
+                        sub_t["end"].tolist(),
+                        sub_t["product"].fillna("").tolist(),
+                        sub_t["feature"].tolist(),
+                        (sub_t["end"] - sub_t["start"] + 1).tolist(),
+                    )),
+                    hovertemplate=(
+                        "<b>%{customdata[2]}: %{customdata[1]}</b>"
+                        "<br>Start = %{base:d}"
+                        "<br>End = %{customdata[0]:d}"
+                        "<br>Length = %{customdata[3]:d}"
                         "<extra></extra>"
                     ),
                 ))
@@ -389,7 +428,7 @@ def plot_junction_pangraph_interactive(
 
         legend_seen = set()
 
-        def _add_anno_bar(x, y, base, color_rgb, name, end):
+        def _add_anno_bar(x, y, base, color_rgb, name, end, length):
             showleg = name not in legend_seen
             if showleg:
                 legend_seen.add(name)
@@ -402,11 +441,11 @@ def plot_junction_pangraph_interactive(
                 marker=dict(color=_rgba(color_rgb, annotation_alpha), line=dict(width=0)),
                 name=name,
                 showlegend=showleg,
-                hovertemplate=f"<b>{name}</b><br>Start = %{{base:d}}<br>End = %{{customdata:d}}<br>Length = %{{x:d}}<extra></extra>",
-                customdata=end,
+                hovertemplate=f"<b>{name}</b><br>Start = %{{base:d}}<br>End = %{{customdata[0]:d}}<br>Length = %{{customdata[1]:d}}<extra></extra>",
+                customdata=list(zip(end, length)),
             ))
 
-        # add annotation bars for every row label (isolates + consensus), currently not done but one could add annotations to the consensus paths in the dataframe or gff3 file to also color the consensus tracks 
+        # add annotation bars for every row label (isolates + consensus), currently not done but one could add annotations to the consensus paths in the dataframe or gff3 file to also color the consensus tracks
         for label in y_labels:
             sub = ann[ann["seqid"] == label]
             if sub.empty:
@@ -422,6 +461,7 @@ def plot_junction_pangraph_interactive(
                     color_rgb=PROPH_COLOR,
                     name="Prophage",
                     end=ph["end"].tolist(),
+                    length=ph["length"].tolist(),
                 )
 
             # add defense system annotations
@@ -434,6 +474,7 @@ def plot_junction_pangraph_interactive(
                     color_rgb=DEF_COLOR,
                     name="Defense system",
                     end=ds["end"].tolist(),
+                    length=ds["length"].tolist(),
                 )
 
             # add IS annotations
@@ -450,6 +491,7 @@ def plot_junction_pangraph_interactive(
                         color_rgb=col,
                         name=name,
                         end=istype_df["end"].tolist(),
+                        length=istype_df["length"].tolist(),
                     )
 
     # overlay gene CDS annotations (product labels)
@@ -1423,7 +1465,7 @@ def plot_pangraph_base_for_dash(
             y_seen.add(label)
 
     if not show_consensus:
-        for iso in isolates_ordered:
+        for iso in reversed(isolates_ordered):
             draw_isolate_track(iso)
     else:
         grouped = (
@@ -1432,15 +1474,18 @@ def plot_pangraph_base_for_dash(
             .apply(list)
             .to_dict()
         )
-        for i, cons_path in enumerate(consensus_paths):
+        # Draw groups in reverse order so consensus_1 ends up nearest the top (overview)
+        for i, cons_path in reversed(list(enumerate(consensus_paths))):
             cons_label = f"consensus_{i+1}"
             isolates_for_this = grouped.get(cons_label, [])
             if tree_order:
                 isolates_for_this = [iso for iso in tree_order if iso in isolates_for_this]
-            for iso in isolates_for_this:
+            # Reversed so tree-top isolate appears at visual top of the group
+            for iso in reversed(isolates_for_this):
                 draw_isolate_track(iso)
             draw_consensus_track(cons_path, cons_label)
-        for i, cons_path in enumerate(consensus_paths):
+        # Overview tracks drawn last → appear at top of chart; reversed so consensus_1 is topmost
+        for i, cons_path in reversed(list(enumerate(consensus_paths))):
             cons_label = f"consensus_{i+1}\u200b"
             draw_consensus_track(cons_path, cons_label)
 
@@ -1625,6 +1670,77 @@ def plot_cluster_count_vs_diversity(
         ax.spines["right"].set_visible(False)
 
     fig.suptitle("Cluster count vs. junction diversity")
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_cluster_count_vs_trna_heatmap(
+    cluster_df,
+    jdf_trna,
+    trna_col="n_tRNA",
+    figsize=(6, 4),
+    save_path=None,
+):
+    """
+    Heatmap of n_clusters vs. categorical tRNA count.
+
+    tRNA categories: 0, 1–199, 200–300, >300
+    Rows = n_clusters (ascending), columns = tRNA category.
+    Cell values are junction counts, annotated as text.
+
+    Parameters
+    ----------
+    cluster_df : pd.DataFrame
+        Output of cluster_map_to_dataframe(). Must contain 'junction_name' and 'n_clusters'.
+    jdf_trna : pd.DataFrame
+        Junction DataFrame merged with tRNA counts. Must contain 'edge' and `trna_col`.
+    trna_col : str
+        Column name for tRNA count in `jdf_trna`.
+    figsize : tuple
+    save_path : str or None
+    """
+    per_junction = cluster_df.drop_duplicates("junction_name")[["junction_name", "n_clusters"]]
+    merged = per_junction.merge(jdf_trna, left_on="junction_name", right_on="edge", how="inner")
+    merged = merged[["n_clusters", trna_col]].dropna()
+    merged[trna_col] = merged[trna_col].astype(int)
+
+    bins = [-1, 0, 199, 300, float("inf")]
+    labels = ["0", "1–199", "200–300", ">300"]
+    merged["trna_cat"] = pd.cut(merged[trna_col], bins=bins, labels=labels)
+
+    ct = (
+        merged.groupby(["n_clusters", "trna_cat"], observed=True)
+        .size()
+        .unstack(fill_value=0)
+    )
+    ct = ct.reindex(columns=labels, fill_value=0)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(ct.values, aspect="auto", cmap="Blues")
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels)
+    ax.set_yticks(range(len(ct.index)))
+    ax.set_yticklabels(ct.index.astype(int))
+    ax.set_xlabel("Number of tRNAs")
+    ax.set_ylabel("Number of clusters")
+
+    for i in range(ct.shape[0]):
+        for j in range(ct.shape[1]):
+            val = ct.values[i, j]
+            if val > 0:
+                text_color = "white" if val > ct.values.max() * 0.6 else "black"
+                ax.text(j, i, str(val), ha="center", va="center",
+                        fontsize=9, color=text_color)
+
+    plt.colorbar(im, ax=ax, label="Number of junctions")
+    ax.set_title("Cluster count vs. tRNA annotation")
     plt.tight_layout()
 
     if save_path is not None:
@@ -2207,6 +2323,7 @@ def add_annotations_for_dash(
     y_labels: list,
     show_mges_annotations: bool = False,
     show_int_rec_annotations: bool = False,
+    show_trna_annotations: bool = False,
     mges_gff_path: str = None,
     show_cds_annotations: bool = False,
     annotations_gff_path: str = None,
@@ -2227,9 +2344,9 @@ def add_annotations_for_dash(
     if show_int_rec_annotations and annotations_gff_path:
         gdf = read_gff3_cds_products(annotations_gff_path)
 
-        # filter CDS products containing integrase or recombinase (case-insensitive)
+        # filter CDS products containing integrase, recombinase, or transposase (case-insensitive)
         prod = gdf["product"].fillna("").str.lower()
-        ir = gdf[prod.str.contains("integrase") | prod.str.contains("recombinase")].copy()
+        ir = gdf[prod.str.contains("integrase") | prod.str.contains("recombinase") | prod.str.contains("transposase")].copy()
 
         if not ir.empty:
             legend_added = False
@@ -2247,15 +2364,50 @@ def add_annotations_for_dash(
                     base=(sub_ir["start"]).tolist(),
                     orientation="h",
                     marker=dict(color=_rgba("rgb(166,216,84)", annotation_alpha), line=dict(width=0)),
-                    name="Integrase / Recombinase",
+                    name="Integrase / Recombinase / Transposase",
                     showlegend=showleg,
-                    customdata=list(zip(sub_ir["end"].tolist(), sub_ir["product"].tolist())),
+                    customdata=list(zip(sub_ir["end"].tolist(), sub_ir["product"].tolist(), sub_ir["length"].tolist())),
                     hovertemplate=(
-                        "<b>Integrase / Recombinase</b>"
+                        "<b>Integrase / Recombinase / Transposase</b>"
                         "<br>%{customdata[1]}"
                         "<br>Start = %{base:d}"
                         "<br>End = %{customdata[0]:d}"
-                        "<br>Length = %{x:d}"
+                        "<br>Length = %{customdata[2]:d}"
+                        "<extra></extra>"
+                    ),
+                ))
+
+    # overlay tRNA / tmRNA annotations
+    TRNA_COLOR = "rgb(127,201,127)"  # mid sage-green between integrase (166,216,84) and prophage (27,158,119)
+    if show_trna_annotations and annotations_gff_path:
+        tdf = read_gff3_trna(annotations_gff_path)
+        if not tdf.empty:
+            trna_legend_added = False
+            for label in y_labels:
+                sub_t = tdf[tdf["seqid"] == label]
+                if sub_t.empty:
+                    continue
+                showleg = not trna_legend_added
+                trna_legend_added = True
+                fig.add_trace(go.Bar(
+                    x=(sub_t["end"] - sub_t["start"]).tolist(),
+                    y=[label] * len(sub_t),
+                    base=sub_t["start"].tolist(),
+                    orientation="h",
+                    marker=dict(color=_rgba(TRNA_COLOR, annotation_alpha), line=dict(width=0)),
+                    name="tRNA / tmRNA",
+                    showlegend=showleg,
+                    customdata=list(zip(
+                        sub_t["end"].tolist(),
+                        sub_t["product"].fillna("").tolist(),
+                        sub_t["feature"].tolist(),
+                        sub_t["length"].tolist(),
+                    )),
+                    hovertemplate=(
+                        "<b>%{customdata[2]}: %{customdata[1]}</b>"
+                        "<br>Start = %{base:d}"
+                        "<br>End = %{customdata[0]:d}"
+                        "<br>Length = %{customdata[3]:d}"
                         "<extra></extra>"
                     ),
                 ))
@@ -2277,7 +2429,7 @@ def add_annotations_for_dash(
 
         legend_seen = set()
 
-        def _add_anno_bar(x, y, base, color_rgb, name, end):
+        def _add_anno_bar(x, y, base, color_rgb, name, end, length):
             showleg = name not in legend_seen
             if showleg:
                 legend_seen.add(name)
@@ -2290,11 +2442,11 @@ def add_annotations_for_dash(
                 marker=dict(color=_rgba(color_rgb, annotation_alpha), line=dict(width=0)),
                 name=name,
                 showlegend=showleg,
-                hovertemplate=f"<b>{name}</b><br>Start = %{{base:d}}<br>End = %{{customdata:d}}<br>Length = %{{x:d}}<extra></extra>",
-                customdata=end,
+                hovertemplate=f"<b>{name}</b><br>Start = %{{base:d}}<br>End = %{{customdata[0]:d}}<br>Length = %{{customdata[1]:d}}<extra></extra>",
+                customdata=list(zip(end, length)),
             ))
 
-        # add annotation bars for every row label (isolates + consensus), currently not done but one could add annotations to the consensus paths in the dataframe or gff3 file to also color the consensus tracks 
+        # add annotation bars for every row label (isolates + consensus), currently not done but one could add annotations to the consensus paths in the dataframe or gff3 file to also color the consensus tracks
         for label in y_labels:
             sub = ann[ann["seqid"] == label]
             if sub.empty:
@@ -2310,6 +2462,7 @@ def add_annotations_for_dash(
                     color_rgb=PROPH_COLOR,
                     name="Prophage",
                     end=ph["end"].tolist(),
+                    length = ph["length"].tolist(),
                 )
 
             # add defense system annotations
@@ -2322,6 +2475,7 @@ def add_annotations_for_dash(
                     color_rgb=DEF_COLOR,
                     name="Defense system",
                     end=ds["end"].tolist(),
+                    length=ds["length"].tolist()
                 )
 
             # add IS annotations
@@ -2338,6 +2492,7 @@ def add_annotations_for_dash(
                         color_rgb=col,
                         name=name,
                         end=istype_df["end"].tolist(),
+                        length=istype_df["length"].tolist()
                     )
 
     # overlay gene CDS annotations (product labels)
@@ -2366,12 +2521,12 @@ def add_annotations_for_dash(
                 marker=dict(color=_rgba(CDS_COLOR, cds_annotation_alpha), line=dict(width=0)),
                 name="Coding Sequence (CDS)",
                 showlegend=showleg,
-                customdata=list(zip(subg["end"].tolist(), subg["product"].tolist())),
+                customdata=list(zip(subg["end"].tolist(), subg["product"].tolist(), subg["length"].tolist())),
                 hovertemplate=(
                     "<b>CDS:</b> %{customdata[1]}"
                     "<br>Start = %{base:d}"
                     "<br>End = %{customdata[0]:d}"
-                    "<br>Length = %{x:d}"
+                    "<br>Length = %{customdata[2]:d}"
                     "<extra></extra>"
                 ),
             ))

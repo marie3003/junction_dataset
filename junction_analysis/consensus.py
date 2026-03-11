@@ -942,6 +942,48 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
     return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting
 
 
+def save_consensus_cache(path, cluster_map_core, consensus_paths_plotting, assignment_df_plotting):
+    """
+    Save the three objects needed by the dash app to a compact JSON file.
+    """
+    import json
+    data = {
+        "cluster_map_core": cluster_map_core,
+        "consensus_paths_plotting": [
+            [n.to_str_id() for n in p.nodes]
+            for p in consensus_paths_plotting
+        ],
+        "assignment_df_plotting": assignment_df_plotting.to_dict(orient="split"),
+    }
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+def load_consensus_cache(path):
+    """
+    Load cluster_map_core, consensus_paths_plotting, assignment_df_plotting from a JSON cache.
+    """
+    import json
+    import pandas as pd
+    with open(path) as f:
+        data = json.load(f)
+
+    cluster_map_core = data["cluster_map_core"]
+
+    consensus_paths_plotting = [
+        pu.Path([pu.DeduplicatedNode.from_str_id(s) for s in nodes])
+        for nodes in data["consensus_paths_plotting"]
+    ]
+
+    assignment_df_plotting = pd.DataFrame(
+        data["assignment_df_plotting"]["data"],
+        index=data["assignment_df_plotting"]["index"],
+        columns=data["assignment_df_plotting"]["columns"],
+    )
+
+    return cluster_map_core, consensus_paths_plotting, assignment_df_plotting
+
+
 def renumber_context_numbering(consensus_paths, path_dict, assignment_df):
     """
     Renumber context suffixes (_N) in consensus paths and isolate paths consistently.

@@ -265,7 +265,7 @@ def strip_newick_suffixes(input_path, output_path):
 
 def get_isolate_sequence(pangraph, block_id, node_id):
     sequence = pangraph.blocks[block_id].alignment.generate_alignment()[str(node_id)]
-    return sequence
+    return sequence.replace("-", "")
 
 def write_shared_nodes_fasta(pangraph, path_dict, shared_nodes, shared_node_isolates, output_path):
     """
@@ -401,11 +401,87 @@ def read_gff3_annotations(gff_path: str) -> pd.DataFrame:
                     feature=ftype,      # "IS", "defense_system", "prophage", ...
                     start=start,
                     end=end,
+                    length = end - start,
                     attrs=ad,
                     is_subtype=is_subtype,
                 )
             )
     return pd.DataFrame(rows)
+
+
+def read_gff3_trna(gff_path: str) -> pd.DataFrame:
+    """
+    Read tRNA and tmRNA entries from a GFF3 annotation file.
+
+    Returns a DataFrame with columns:
+        seqid, start, end, strand, feature (tRNA/tmRNA),
+        product, locus_tag, anticodon, is_partial, gene_id
+    """
+    rows = []
+    with open(gff_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 9:
+                continue
+
+            seqid, source, ftype, start, end, score, strand, phase, attrs = parts
+            if ftype not in ("tRNA", "tmRNA"):
+                continue
+
+            start, end = int(start), int(end)
+
+            ad = {}
+            for item in attrs.split(";"):
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    ad[k] = v
+
+            rows.append(dict(
+                seqid=seqid,
+                start=start,
+                end=end,
+                length=end - start,
+                strand=strand,
+                feature=ftype,
+                product=ad.get("product") or ad.get("Name") or ad.get("ID"),
+                locus_tag=ad.get("locus_tag"),
+                anticodon=ad.get("anticodon"),
+                is_partial=ad.get("is_partial"),
+                gene_id=ad.get("ID"),
+            ))
+
+    return pd.DataFrame(rows)
+
+
+def count_trna_per_junction(annotations_dir: str) -> pd.DataFrame:
+    """
+    For each junction GFF file in annotations_dir, count the number of
+    annotated tRNA and tmRNA entries.
+
+    Returns a DataFrame with columns:
+        junction_name, n_tRNA, n_tmRNA, n_total
+    sorted by n_total descending.
+    """
+    rows = []
+    for gff_path in sorted(Path(annotations_dir).glob("*.gff")):
+        junction_name = gff_path.stem
+        tdf = read_gff3_trna(str(gff_path))
+        if tdf.empty:
+            n_trna, n_tmrna = 0, 0
+        else:
+            n_trna  = int((tdf["feature"] == "tRNA").sum())
+            n_tmrna = int((tdf["feature"] == "tmRNA").sum())
+        rows.append(dict(
+            junction_name=junction_name,
+            n_tRNA=n_trna,
+            n_tmRNA=n_tmrna,
+            n_total=n_trna + n_tmrna,
+        ))
+    return pd.DataFrame(rows).sort_values("n_total", ascending=False).reset_index(drop=True)
+
 
 def read_gff3_cds_products(gff_path: str) -> pd.DataFrame:
     rows = []
@@ -437,6 +513,7 @@ def read_gff3_cds_products(gff_path: str) -> pd.DataFrame:
                 seqid=seqid,
                 start=start,
                 end=end,
+                length=end - start,
                 strand=strand,
                 product=label,
                 attrs=ad,

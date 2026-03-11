@@ -636,6 +636,7 @@ def combine_NCBI_atb_results(parent_dir):
         try:
             ncbi_res_df = pd.read_csv(file_path, sep="\t")
             hits_df = pd.read_csv(lexicmap_path, sep="\t")
+            ncbi_res_df = ncbi_res_df.drop_duplicates(subset="sgenome", keep="first")
             merged_df = pd.merge(hits_df, ncbi_res_df, on="sgenome", how="left")
             merged_df.to_csv(output_path, index=False, sep="\t")
         except pd.errors.EmptyDataError as e:
@@ -1462,3 +1463,66 @@ def count_events_per_junction(deduped_df, min_length=200, save_path=None):
         print(f"Saved event counts to {save_path}")
 
     return counts_df
+
+
+def collect_hits_info_counts(search_root: str) -> pd.DataFrame:
+    """
+    Iterate over all *.lexicmap.tsv files under `search_root` and collect
+    the number of hits (lines excluding header) and number of genomes per file.
+
+    Parses junction_name, consensus, genome_name, and segment from the path:
+      .../insertions/{junction_name}/{consensus}/{genome_name}_segment_{n}.lexicmap.tsv
+
+    Returns a DataFrame with columns:
+        junction_name, consensus, genome_name, segment, n_hits, n_genomes, file_path
+    """
+    rows = []
+    for p in sorted(Path(search_root).rglob("*.lexicmap.tsv")):
+        # path structure: .../insertions/<junction>/<consensus>/<genome>_segment_<n>.hits_info.tsv
+        parts = p.parts
+        try:
+            ins_idx = [i for i, x in enumerate(parts) if x == "insertions"][-1]
+            junction_name = parts[ins_idx + 1]
+            consensus = parts[ins_idx + 2]
+        except (IndexError, ValueError):
+            junction_name = consensus = None
+
+        stem = p.name.replace(".lexicmap.tsv", "")   # e.g. NZ_AP022044.1_segment_1
+        seg_match = re.search(r"_segment_(\d+)$", stem)
+        if seg_match:
+            segment = f"segment_{seg_match.group(1)}"
+            genome_name = stem[: seg_match.start()]
+        else:
+            segment = None
+            genome_name = stem
+
+        n_hits = 0
+        n_genomes = None
+        with open(p) as f:
+            header = f.readline()
+            if header:
+                try:
+                    hits_col = header.strip().split("\t").index("hits")
+                except ValueError:
+                    hits_col = None
+                for line in f:
+                    n_hits += 1
+                    if n_genomes is None and hits_col is not None:
+                        fields = line.strip().split("\t")
+                        if len(fields) > hits_col:
+                            try:
+                                n_genomes = int(fields[hits_col])
+                            except ValueError:
+                                pass
+
+        rows.append(dict(
+            junction_name=junction_name,
+            consensus=consensus,
+            genome_name=genome_name,
+            segment=segment,
+            n_hits=n_hits,
+            n_genomes=n_genomes,
+            file_path=str(p),
+        ))
+
+    return pd.DataFrame(rows)

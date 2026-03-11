@@ -18,7 +18,7 @@ REPO_ROOT = HERE.parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from junction_analysis.plotting import plot_pangraph_base_for_dash, add_annotations_for_dash, _rgb_str, _shades_from_base_rgb, _rgba
-from junction_analysis.consensus import find_consensus_paths_core
+from junction_analysis.consensus import find_consensus_paths_core, save_consensus_cache, load_consensus_cache
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -32,12 +32,12 @@ def _trace_groups_from_fig(fig):
     Find trace indices for:
       - blocks: bar traces with customdata containing block_id at [0][3] AND hovertemplate contains '<br>block:'
       - mges: bar traces named Prophage / Defense system / IS:*
-      - intrec: bar traces named 'Integrase / Recombinase'
+      - intrec: bar traces named 'Integrase / Recombinase / Transposase'
       - cds: bar traces named 'Coding Sequence (CDS)'
       - insertions: bar traces named 'Insertion'
       - deletions: scatter traces named 'Deletion'
     """
-    groups = {"blocks": [], "mges": [], "intrec": [], "cds": [], "insertions": [], "deletions": [], "inversions": [], "translocations": []}
+    groups = {"blocks": [], "mges": [], "intrec": [], "cds": [], "trna": [], "insertions": [], "deletions": [], "inversions": [], "translocations": []}
 
     for i, tr in enumerate(fig.data):
         ttype = getattr(tr, "type", None)
@@ -54,10 +54,12 @@ def _trace_groups_from_fig(fig):
             continue
 
         # annotation traces: your function sets these names explicitly
-        if name == "Integrase / Recombinase":
+        if name == "Integrase / Recombinase / Transposase":
             groups["intrec"].append(i)
         elif name == "Coding Sequence (CDS)":
             groups["cds"].append(i)
+        elif name == "tRNA / tmRNA":
+            groups["trna"].append(i)
         elif name in ("Prophage", "Defense system") or name.startswith("IS:"):
             groups["mges"].append(i)
         elif name == "Insertion":
@@ -117,6 +119,7 @@ def make_junction_dash_app(
     title: str = "Junction viewer",
     initial_selection=("mges",),  # e.g. ("mges","intrec","cds","indels") or ()
     show_indels: bool = False,
+    show_trna: bool = False,
     indels_base_path: str = None,
     junction_name: str = None,
 ):
@@ -142,6 +145,7 @@ def make_junction_dash_app(
         y_labels=y_labels,
         show_mges_annotations=True,
         show_int_rec_annotations=True,
+        show_trna_annotations=show_trna,
         show_cds_annotations=True,
         mges_gff_path=mges_gff_path,
         annotations_gff_path=annotations_gff_path,
@@ -169,7 +173,7 @@ def make_junction_dash_app(
     original_hovertemplates = [base_fig.data[tidx].hovertemplate for tidx in groups["blocks"]]
 
     # Store original hover templates for annotations
-    anno_indices = groups["mges"] + groups["intrec"] + groups["cds"]
+    anno_indices = groups["mges"] + groups["intrec"] + groups["cds"] + groups["trna"]
     original_anno_hovertemplates = {tidx: base_fig.data[tidx].hovertemplate for tidx in anno_indices}
 
     # Store original hover templates for indels
@@ -205,16 +209,17 @@ def make_junction_dash_app(
                         id="anno-toggle",
                         options=[
                             {"label": "MGEs", "value": "mges"},
-                            {"label": "Integrase/Recombinase", "value": "intrec"},
+                            {"label": "Integrase/Recombinase/Transposase", "value": "intrec"},
                             {"label": "CDS", "value": "cds"},
                             {"label": "Insertions/Deletions", "value": "indels", "disabled": not show_indels},
+                            {"label": "tRNA/tmRNA", "value": "trna", "disabled": not show_trna},
                         ],
                         value=list(initial_selection),
                         inline=True,
                         persistence=True,
                         persistence_type="memory",
                     ),
-                    html.Div("Hover options:", style={"fontWeight": "bold", "marginLeft": "20px"}),
+                    html.Div("Hover options:", style={"fontWeight": "bold", "marginLeft": "20px", "whiteSpace": "nowrap"}),
                     dcc.Checklist(
                         id="hover-toggle",
                         options=[
@@ -227,7 +232,7 @@ def make_junction_dash_app(
                         persistence=True,
                         persistence_type="memory",
                     ),
-                    html.Div("Search block ID:", style={"fontWeight": "bold", "marginLeft": "20px"}),
+                    html.Div("Search block ID:", style={"fontWeight": "bold", "marginLeft": "20px", "whiteSpace": "nowrap"}),
                     dcc.Input(
                         id="block-search",
                         type="text",
@@ -276,6 +281,7 @@ def make_junction_dash_app(
         _set_visible(groups["mges"], "mges" in selected_annos)
         _set_visible(groups["intrec"], "intrec" in selected_annos)
         _set_visible(groups["cds"], "cds" in selected_annos)
+        _set_visible(groups["trna"], "trna" in selected_annos)
         _set_visible(groups["insertions"], "indels" in selected_annos)
         _set_visible(groups["deletions"], "indels" in selected_annos)
         _set_visible(groups["inversions"], "indels" in selected_annos)
@@ -351,9 +357,9 @@ if __name__ == "__main__":
     #junction_name = "NOAJDCSIVA_f__NZXBIFMPMA_r"
     #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
     #junction_name = "GPKQYOCEJI_r__NKVSUZGURN_f"
-    #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f"
+    junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f"
     #junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
-    junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
+    #junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
     #junction_name = "ATPWUNKKID_f__KKPYPKGMXA_f"
     #junction_name = 'KGWWUZQEKD_r__UXLELLOQVR_r'
 
@@ -365,17 +371,26 @@ if __name__ == "__main__":
     tree_path = REPO_ROOT / "config" / "polished_tree.nwk"
     in_del_path = REPO_ROOT / "results" / "atb_lookup" 
 
-    cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unqiue = find_consensus_paths_core(
-        junction_name,
-        plot_consensus=False,
-        plot_annotations=False,
-        plot_pair_dist=False,
-        plot_snp_dist=False,
-        plot_ambiguities=False,
-        clustering_bl_thresh=0.005,
-        consensus_criterium="core_genome_tree",
-        tree_path=str(tree_path),
-    )
+    cache_path = REPO_ROOT / "results" / "consensus_analysis" / junction_name / "dash_cache.json"
+    if cache_path.exists():
+        print(f"Loading consensus cache from {cache_path}")
+        cluster_map_core, consensus_paths_plotting, assignment_df_plotting = load_consensus_cache(cache_path)
+    else:
+        print("Cache not found, running find_consensus_paths_core ...")
+        cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unqiue = find_consensus_paths_core(
+            junction_name,
+            plot_consensus=False,
+            plot_annotations=False,
+            plot_pair_dist=False,
+            plot_snp_dist=False,
+            plot_ambiguities=False,
+            clustering_bl_thresh=0.005,
+            consensus_criterium="core_genome_tree",
+            tree_path=str(tree_path),
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        save_consensus_cache(cache_path, cluster_map_core, consensus_paths_plotting, assignment_df_plotting)
+        print(f"Cache saved to {cache_path}")
 
     app = make_junction_dash_app(
         pan=pangraph,
@@ -389,6 +404,7 @@ if __name__ == "__main__":
         initial_selection=("mges", "indels"),  # change to () to start with no annotations
         indels_base_path=str(in_del_path),
         show_indels=True,
+        show_trna=True,
         junction_name=junction_name,
     )
 

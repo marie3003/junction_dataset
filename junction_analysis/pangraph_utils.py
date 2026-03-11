@@ -61,8 +61,12 @@ class DeduplicatedNode:
 
     @staticmethod
     def from_str_id(t) -> "DeduplicatedNode":
-        bid, strand, context = t.split("_")
+        bid, strand, context = t.split("_", 2)
         strand = True if strand == "f" else False
+        try:
+            bid = int(bid)
+        except ValueError:
+            pass
         return DeduplicatedNode(bid, strand, context)
 
 
