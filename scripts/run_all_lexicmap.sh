@@ -31,6 +31,6 @@ find "$FOLDER" -type f -name '*.fasta' | while read -r f; do
     fi
 
     echo "Submitting: $f (length=$L) -> qcov_hsp=$QCOV_HSP qcov_genome=$QCOV_GENOME align_len=$ALIGN_LEN -p $SEED_P -P $SEED_PP"
-    sbatch lexicmap_query.sh "$f" 99 "$QCOV_HSP" "$QCOV_GENOME" "$ALIGN_LEN" "$SEED_P" "$SEED_PP"
+    sbatch lexicmap_query.sh "$f" 98 "$QCOV_HSP" "$QCOV_GENOME" "$ALIGN_LEN" "$SEED_P" "$SEED_PP"
 
 done

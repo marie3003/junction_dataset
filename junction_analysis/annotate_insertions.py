@@ -500,18 +500,18 @@ def get_isolate_sequence_from_fasta(fasta_path, isolate_name):
             return str(record.seq)
     return None
 
-def write_segment_fasta(example_junction, isolate_name, segment_name, consensus, sequence, path):
+def write_segment_fasta(example_junction, isolate_name, segment_name, consensus, sequence, path, parent_dir):
     record = SeqRecord(
         Seq(sequence),
         id=f"{isolate_name}|{segment_name}",
         description=f"path{path} length{len(sequence)}"
     )
-    output_path = f"../results/atb_lookup/insertions/{example_junction}/consensus{consensus}/{isolate_name}_{segment_name}.fasta"
+    output_path = f"{parent_dir}/{example_junction}/consensus{consensus}/{isolate_name}_{segment_name}.fasta"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     SeqIO.write(record, output_path, "fasta")
     return output_path
 
-def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1, save_df = False):
+def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1, parent_dir = "../results/atb_lookup/insertions", save_df = False):
     """
     Retrieve sequence of insertion from isolate's blocks.
     Blocks are kept in their original order; minus-strand blocks have their
@@ -519,7 +519,7 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
     """
     results = []
 
-    out_dir = f"../results/atb_lookup/insertions/{example_junction}/consensus{consensus}"
+    out_dir = f"{parent_dir}/{example_junction}/consensus{consensus}"
     os.makedirs(out_dir, exist_ok=True)
 
     for isolate, inserted_paths in insertions.items():
@@ -536,7 +536,7 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
                     block_seq = str(Seq(block_seq).reverse_complement())
                 parts.append(block_seq)
             seq = "".join(parts)
-            fasta_path = write_segment_fasta(example_junction, isolate, f"segment_{idx}", consensus, seq, inserted_path)
+            fasta_path = write_segment_fasta(example_junction, isolate, f"segment_{idx}", consensus, seq, inserted_path, parent_dir)
 
             results.append(
                 {
@@ -641,6 +641,30 @@ def combine_NCBI_atb_results(parent_dir):
             merged_df.to_csv(output_path, index=False, sep="\t")
         except pd.errors.EmptyDataError as e:
             print(f"Empty file, skipping merge ({file_path}): {e}")
+            open(output_path, "w").close()
+
+
+def combine_NCBI_atb_results_centralized(parent_dir):
+    """
+    Like combine_NCBI_atb_results, but uses a single all_ncbi_results.tsv
+    in parent_dir as the lookup table instead of per-segment ncbi_results files.
+    """
+    parent_dir = Path(parent_dir)
+    ncbi_results_path = parent_dir / "all_ncbi_results.tsv"
+
+    ncbi_res_df = pd.read_csv(ncbi_results_path, sep="\t")
+    ncbi_res_df = ncbi_res_df.drop_duplicates(subset="sgenome", keep="first")
+
+    for lexicmap_path in parent_dir.rglob("*.lexicmap.tsv"):
+        output_path = lexicmap_path.with_name(
+            lexicmap_path.name.replace(".lexicmap.tsv", ".hits_info.tsv")
+        )
+        try:
+            hits_df = pd.read_csv(lexicmap_path, sep="\t")
+            merged_df = pd.merge(hits_df, ncbi_res_df, on="sgenome", how="left")
+            merged_df.to_csv(output_path, index=False, sep="\t")
+        except pd.errors.EmptyDataError as e:
+            print(f"Empty file, skipping merge ({lexicmap_path}): {e}")
             open(output_path, "w").close()
 
 

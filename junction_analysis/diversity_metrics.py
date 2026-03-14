@@ -11,6 +11,88 @@ from Bio import Align
 import pypangraph as pp
 
 from junction_analysis.helpers import get_hierarchical_order, get_tree_order
+from junction_analysis.consensus import make_deduplicated_paths
+import junction_analysis.pangraph_utils as pu
+
+
+def _path_to_node_set(path):
+    """Return frozenset of DeduplicatedNodes in a path."""
+    return frozenset(path.nodes)
+
+
+def _path_to_edge_set(path):
+    """
+    Return frozenset of Edges from consecutive DeduplicatedNode pairs.
+    Returns None if the path has fewer than 2 nodes (no edges).
+    """
+    nodes = path.nodes
+    if len(nodes) < 2:
+        return None
+    return frozenset(pu.Edge(nodes[i], nodes[i + 1]) for i in range(len(nodes) - 1))
+
+
+def _jaccard(set_a, set_b):
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return inter / union if union > 0 else 1.0
+
+
+def calculate_dedup_block_ji_matrix(pangraph):
+    """
+    Compute pairwise block Jaccard index between all isolate pairs using
+    deduplicated paths (DeduplicatedNode comparison: id + strand + context).
+
+    Returns
+    -------
+    pd.DataFrame of shape (n_isolates, n_isolates) with JI values.
+    """
+    dedup_paths, _ = make_deduplicated_paths(pangraph)
+    isolates = sorted(dedup_paths.keys())
+    node_sets = {iso: _path_to_node_set(dedup_paths[iso]) for iso in isolates}
+
+    n = len(isolates)
+    mat = np.ones((n, n), dtype=float)
+    for i, j in combinations(range(n), 2):
+        ji = _jaccard(node_sets[isolates[i]], node_sets[isolates[j]])
+        mat[i, j] = ji
+        mat[j, i] = ji
+
+    return pd.DataFrame(mat, index=isolates, columns=isolates)
+
+
+def calculate_dedup_edge_ji_matrix(pangraph):
+    """
+    Compute pairwise edge Jaccard index between all isolate pairs using
+    deduplicated paths. Edge equality ignores context (id + strand only),
+    and is bidirectional (edge == its reverse complement).
+
+    Junctions with only one block (no edges) return a matrix of NaN.
+
+    Returns
+    -------
+    pd.DataFrame of shape (n_isolates, n_isolates) with JI values,
+    or NaN-filled DataFrame if no edges exist in any path.
+    """
+    dedup_paths, _ = make_deduplicated_paths(pangraph)
+    isolates = sorted(dedup_paths.keys())
+
+    edge_sets = {iso: _path_to_edge_set(dedup_paths[iso]) for iso in isolates}
+
+    # if all paths have no edges (single-block junction) → return NaN matrix
+    if all(es is None for es in edge_sets.values()):
+        return pd.DataFrame(np.full((len(isolates), len(isolates)), np.nan), index=isolates, columns=isolates)
+
+    # treat missing edge sets (single-node paths) as empty sets
+    edge_sets = {iso: (es if es is not None else frozenset()) for iso, es in edge_sets.items()}
+
+    n = len(isolates)
+    mat = np.ones((n, n), dtype=float)
+    for i, j in combinations(range(n), 2):
+        ji = _jaccard(edge_sets[isolates[i]], edge_sets[isolates[j]])
+        mat[i, j] = ji
+        mat[j, i] = ji
+
+    return pd.DataFrame(mat, index=isolates, columns=isolates)
 
 
 def compare_sequences_by_shared_proportion(sequence_comparison_df, order="hierarchical"):
@@ -241,38 +323,80 @@ def _mean_upper_triangle(df):
     return arr[idx].mean()
 
 
-def compute_diversity_all_junctions(pangraph_dir, junction_names=None, save_path=None):
+_ALL_METRICS = ["block_ji", "edge_ji", "dedup_block_ji", "dedup_edge_ji", "seq_similarity", "n_divergence_points"]
+
+
+def _upper_triangle_pairs(mat_df):
     """
-    For every junction pangraph in `pangraph_dir`, compute four mean pairwise
-    diversity metrics across all isolate pairs:
-      - mean_block_ji:       mean block Jaccard index
-      - mean_edge_ji:        mean edge Jaccard index
-      - mean_seq_similarity: mean accessory genome sequence similarity
-      - mean_divergence:     mean divergence points
+    Extract upper-triangle pairs from a square DataFrame.
+    Returns list of (name_i, name_j, value).
+    """
+    names = list(mat_df.index)
+    arr = mat_df.values.astype(float)
+    pairs = []
+    for i, j in combinations(range(len(names)), 2):
+        a, b = names[i], names[j]
+        # canonicalise order so pairs from differently-sorted matrices merge correctly
+        if a > b:
+            a, b = b, a
+            val = arr[j, i]
+        else:
+            val = arr[i, j]
+        pairs.append((a, b, val))
+    return pairs
+
+
+def compute_diversity_all_junctions(
+    pangraph_dir,
+    junction_names=None,
+    metrics=None,
+    save_path=None,
+    pairwise_save_path=None,
+):
+    """
+    For every junction pangraph in `pangraph_dir`, compute pairwise diversity
+    metrics across all isolate pairs and return summary (mean) and pairwise DataFrames.
+
+    Available metrics (pass subset to ``metrics`` to skip others):
+      - ``block_ji``            block Jaccard index
+      - ``edge_ji``             edge Jaccard index
+      - ``seq_similarity``      accessory genome sequence similarity
+      - ``n_divergence_points`` divergence point count
 
     Parameters
     ----------
     pangraph_dir : str or Path
-        Directory containing one JSON pangraph per junction, named
-        ``<junction_name>.json``.
     junction_names : list of str or None
-        If provided, only process these junctions. Otherwise all .json files
-        in `pangraph_dir` are used.
+    metrics : list of str or None
+        Subset of metrics to compute. Defaults to all four.
     save_path : str or None
-        If provided, save the resulting DataFrame as a CSV.
+        CSV path for the per-junction mean-diversity summary.
+    pairwise_save_path : str or None
+        CSV path for the long-format pairwise distances:
+        columns junction_name, isolate_1, isolate_2, <metric>, ...
 
     Returns
     -------
-    pd.DataFrame with columns:
-        junction_name, mean_block_ji, mean_edge_ji,
-        mean_seq_similarity, mean_n_divergence_points
+    summary_df : pd.DataFrame
+        Columns: junction_name, mean_<metric>, ...
+    pairwise_df : pd.DataFrame
+        Columns: junction_name, isolate_1, isolate_2, <metric>, ...
     """
     pangraph_dir = Path(pangraph_dir)
+
+    if metrics is None:
+        metrics = list(_ALL_METRICS)
+    else:
+        unknown = set(metrics) - set(_ALL_METRICS)
+        if unknown:
+            raise ValueError(f"Unknown metrics: {unknown}. Choose from {_ALL_METRICS}")
 
     if junction_names is None:
         junction_names = [f.stem for f in sorted(pangraph_dir.glob("*.json"))]
 
-    rows = []
+    summary_rows = []
+    pairwise_rows = []
+
     for jname in junction_names:
         fpath = pangraph_dir / f"{jname}.json"
         if not fpath.exists():
@@ -285,30 +409,152 @@ def compute_diversity_all_junctions(pangraph_dir, junction_names=None, save_path
             print(f"Error loading pangraph for {jname}: {e}")
             continue
 
-        row = {"junction_name": jname}
-
-        for metric, compute in [
-            ("mean_block_ji",      lambda: _mean_upper_triangle(calculate_block_ji_matrix(pan, order=None))),
-            ("mean_edge_ji",       lambda: _mean_upper_triangle(calculate_edge_ji_matrix(pan, order=None))),
-            ("mean_n_divergence_points",    lambda: _mean_upper_triangle(calculate_divergence_matrix(pan, order=None))),
-            ("mean_seq_similarity",lambda: _mean_upper_triangle(compare_sequences_by_shared_proportion(pan.pairwise_accessory_genome_comparison(), order=None)[0])),
-        ]:
+        # compute requested metric matrices
+        metric_matrices = {}
+        for metric in metrics:
             try:
-                row[metric] = compute()
+                mat = None
+                if metric == "block_ji":
+                    mat = calculate_block_ji_matrix(pan, order=None)
+                elif metric == "edge_ji":
+                    mat = calculate_edge_ji_matrix(pan, order=None)
+                    if isinstance(mat, tuple):
+                        mat = mat[0]
+                elif metric == "dedup_block_ji":
+                    mat = calculate_dedup_block_ji_matrix(pan)
+                elif metric == "dedup_edge_ji":
+                    mat = calculate_dedup_edge_ji_matrix(pan)
+                elif metric == "seq_similarity":
+                    mat = compare_sequences_by_shared_proportion(
+                        pan.pairwise_accessory_genome_comparison(), order=None
+                    )[0]
+                elif metric == "n_divergence_points":
+                    mat = calculate_divergence_matrix(pan, order=None)
+                metric_matrices[metric] = mat
             except Exception as e:
+                import traceback
                 print(f"  {jname} [{metric}]: {e}")
-                row[metric] = float("nan")
+                traceback.print_exc()
+                metric_matrices[metric] = None
 
-        rows.append(row)
+        # summary row
+        summary_row = {"junction_name": jname}
+        for metric, mat in metric_matrices.items():
+            summary_row[f"mean_{metric}"] = _mean_upper_triangle(mat) if mat is not None else float("nan")
+        summary_rows.append(summary_row)
 
-    df = pd.DataFrame(rows, columns=[
-        "junction_name", "mean_block_ji", "mean_edge_ji",
-        "mean_seq_similarity", "mean_n_divergence_points",
-    ])
+        # pairwise rows — collect all pairs across all computed metrics
+        # use the first available matrix to get the list of pairs
+        pair_data = {}  # (iso_i, iso_j) -> {metric: value}
+        for metric, mat in metric_matrices.items():
+            if mat is None:
+                continue
+            for iso_i, iso_j, val in _upper_triangle_pairs(mat):
+                key = (iso_i, iso_j)
+                if key not in pair_data:
+                    pair_data[key] = {}
+                pair_data[key][metric] = val
+
+        for (iso_i, iso_j), vals in pair_data.items():
+            row = {"junction_name": jname, "isolate_1": iso_i, "isolate_2": iso_j}
+            row.update(vals)
+            pairwise_rows.append(row)
+
+    summary_cols = ["junction_name"] + [f"mean_{m}" for m in metrics]
+    summary_df = pd.DataFrame(summary_rows, columns=summary_cols)
+
+    pairwise_cols = ["junction_name", "isolate_1", "isolate_2"] + list(metrics)
+    pairwise_df = pd.DataFrame(pairwise_rows)
+    if not pairwise_df.empty:
+        for col in pairwise_cols:
+            if col not in pairwise_df.columns:
+                pairwise_df[col] = float("nan")
+        pairwise_df = pairwise_df[pairwise_cols]
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        summary_df.to_csv(save_path, index=False)
+        print(f"Saved diversity summary to {save_path}")
+
+    if pairwise_save_path is not None:
+        Path(pairwise_save_path).parent.mkdir(parents=True, exist_ok=True)
+        pairwise_df.to_csv(pairwise_save_path, index=False)
+        print(f"Saved pairwise distances to {pairwise_save_path}")
+
+    return summary_df, pairwise_df
+
+
+def compute_dedup_ji_all_junctions(pangraph_dir, junction_names=None, save_path=None):
+    """
+    For every junction pangraph compute pairwise block and edge Jaccard indices
+    using deduplicated paths.
+
+    Parameters
+    ----------
+    pangraph_dir : str or Path
+    junction_names : list of str or None
+    save_path : str or None
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        junction_name, isolate_1, isolate_2, block_ji_dist, edge_ji_dist
+    """
+    pangraph_dir = Path(pangraph_dir)
+    if junction_names is None:
+        junction_names = [f.stem for f in sorted(pangraph_dir.glob("*.json"))]
+
+    rows = []
+    for jname in junction_names:
+        fpath = pangraph_dir / f"{jname}.json"
+        if not fpath.exists():
+            print(f"Pangraph not found for {jname}, skipping.")
+            continue
+        try:
+            pan = pp.Pangraph.from_json(str(fpath))
+        except Exception as e:
+            print(f"Error loading {jname}: {e}")
+            continue
+
+        try:
+            dedup_paths, _ = make_deduplicated_paths(pan)
+        except Exception as e:
+            print(f"  {jname} [make_deduplicated_paths]: {e}")
+            continue
+
+        isolates = sorted(dedup_paths.keys())
+
+        # block JI
+        try:
+            block_df = calculate_dedup_block_ji_matrix(pan)
+        except Exception as e:
+            print(f"  {jname} [dedup_block_ji]: {e}")
+            block_df = None
+
+        # edge JI
+        try:
+            edge_df = calculate_dedup_edge_ji_matrix(pan)
+        except Exception as e:
+            print(f"  {jname} [dedup_edge_ji]: {e}")
+            edge_df = None
+
+        for i, j in combinations(range(len(isolates)), 2):
+            iso_a, iso_b = isolates[i], isolates[j]
+            block_val = block_df.loc[iso_a, iso_b] if block_df is not None else np.nan
+            edge_val = edge_df.loc[iso_a, iso_b] if edge_df is not None else np.nan
+            rows.append({
+                "junction_name": jname,
+                "isolate_1": iso_a,
+                "isolate_2": iso_b,
+                "block_ji_dist": block_val,
+                "edge_ji_dist": edge_val,
+            })
+
+    df = pd.DataFrame(rows, columns=["junction_name", "isolate_1", "isolate_2", "block_ji_dist", "edge_ji_dist"])
 
     if save_path is not None:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(save_path, index=False)
-        print(f"Saved diversity summary to {save_path}")
+        print(f"Saved to {save_path}")
 
     return df

@@ -9,14 +9,27 @@ import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset 
 from matplotlib.gridspec import GridSpec
 import colorsys
 
 import pandas as pd
+
+COLORS = {
+    "reddish":    "#a6444f",
+    "teal":       "#57a8b8",
+    "purple":     "#80557e",
+    "light_blue": "#b5d2f2",
+    "pink":       "#d991b4",
+    "dark_blue":  "#397398",
+    "mid_blue":   "#7394c2",
+    "gray":       "#7a7a7a",
+    "wine":       "#7a2030",
+}
 import pypangraph as pp
 from scipy.cluster.hierarchy import dendrogram
 
-from junction_analysis.helpers import get_tree_order, read_gff3_annotations, read_gff3_cds_products, read_gff3_trna
+from junction_analysis.helpers import get_tree_order, read_gff3_annotations, read_gff3_cds_products, read_gff3_trna, add_silhouette_scores
 import junction_analysis.pangraph_utils as pu
 
 
@@ -311,7 +324,8 @@ def plot_junction_pangraph_interactive(
         random.shuffle(palette)
         cluster_color = {cid: palette[i % len(palette)] for i, cid in enumerate(clusters)}
 
-        star_x = -2000
+        # place stars inside the left margin reserved by the axis range (-5% of max_x)
+        star_x = -max(1, int(0.035 * max_x))
         xs, ys, cs = [], [], []
         for iso in y_labels:
             if iso.startswith("consensus_"):
@@ -810,7 +824,12 @@ def plot_junction_pangraph_interactive(
 
     fig.update_layout(
         title=dict(
-            text=title,
+            text=(
+                f"{title}<br>"
+                f"<span style='font-size:12px; color:#666; font-weight:normal;'>"
+                f"Isolates are ordered by their position in the core-genome phylogeny, grouped by consensus path assignment."
+                f"</span>"
+            ),
             x=0.05,
             y=0.99,
             xanchor="left",
@@ -836,7 +855,7 @@ def plot_junction_pangraph_interactive(
             tickvals=tickvals,
             ticktext=ticktext,
         ),
-        margin=dict(l=140, r=20, t=100, b=40),
+        margin=dict(l=140, r=20, t=140, b=40),
         height=max(300, int(len(y_labels) * 22)),
         template="plotly_white",
     )
@@ -1264,7 +1283,7 @@ def plot_pairwise_distance_hist(distances, bins=30, figsize=(7, 3.5),
 
 
 def plot_block_distance_distribution(pair_dists, block_list, bins=30, cols=4,
-                                 figsize=(14, 20), vline=None, vline_kwargs=None, same_xrange=False):
+                                 figsize=None, vline=None, vline_kwargs=None, same_xrange=False):
     """
     pair_dists: dict {block_id: 1D numpy array of pairwise distances}
     block_list: list or Series of block IDs to plot
@@ -1275,6 +1294,8 @@ def plot_block_distance_distribution(pair_dists, block_list, bins=30, cols=4,
     n = len(block_list)
 
     rows = math.ceil(n / cols)
+    if figsize is None:
+        figsize = (cols * 3, rows * 2.5)
     fig, axes = plt.subplots(rows, cols, figsize=figsize, squeeze=False)
     axes = axes.flatten()
 
@@ -1299,8 +1320,8 @@ def plot_block_distance_distribution(pair_dists, block_list, bins=30, cols=4,
         d = pair_dists.get(block_id)
 
         if d is None or d.size == 0:
-            ax.text(0.5, 0.5, f"No data\nBlock {block_id}",
-                    ha='center', va='center', fontsize=10)
+            lbl = str(block_id[0])[:8] if isinstance(block_id, tuple) else str(block_id)[:12]
+            ax.text(0.5, 0.5, f"No data\n{lbl}", ha='center', va='center', fontsize=7)
             ax.set_axis_off()
             continue
 
@@ -1312,9 +1333,14 @@ def plot_block_distance_distribution(pair_dists, block_list, bins=30, cols=4,
             ax.axvline(vline, **vline_kwargs)
 
         # titles & labels
-        ax.set_title(f"Block {block_id}")
-        ax.set_xlabel("Distance")
-        ax.set_ylabel("Density")
+        if isinstance(block_id, tuple):
+            label = f"{str(block_id[0])[:8]}\n{block_id[1]}"
+        else:
+            label = str(block_id)[:12]
+        ax.set_title(label, fontsize=8)
+        ax.set_xlabel("Distance", fontsize=7)
+        ax.set_ylabel("Density", fontsize=7)
+        ax.tick_params(labelsize=6)
 
         if same_xrange:
             ax.set_xlim(xmin, xmax)
@@ -1499,7 +1525,8 @@ def plot_pangraph_base_for_dash(
         random.shuffle(palette)
         cluster_color = {cid: palette[i % len(palette)] for i, cid in enumerate(clusters)}
 
-        star_x = -2000
+        # place stars inside the left margin reserved by the axis range (-5% of max_x)
+        star_x = -max(1, int(0.035 * max_x))
         xs, ys, cs = [], [], []
         for iso in y_labels:
             if iso.startswith("consensus_"):
@@ -1544,7 +1571,12 @@ def plot_pangraph_base_for_dash(
 
     fig.update_layout(
         title=dict(
-            text=title,
+            text=(
+                f"{title}<br>"
+                f"<span style='font-size:17px; color:#666; font-weight:normal;'>"
+                f"Isolates are ordered by their position in the core-genome phylogeny, grouped by consensus path assignment."
+                f"</span>"
+            ),
             x=0.05,
             y=0.99,
             xanchor="left",
@@ -1570,31 +1602,29 @@ def plot_pangraph_base_for_dash(
             tickvals=tickvals,
             ticktext=ticktext,
         ),
-        margin=dict(l=140, r=20, t=100, b=40),
+        margin=dict(l=140, r=20, t=140, b=40),
         height=max(300, int(len(y_labels) * 22)),
         template="plotly_white",
     )
     return fig, y_labels, max_x, inversion_rects
 
 
-def plot_cluster_count_distribution(cluster_df, figsize=(7, 4), save_path=None):
+def plot_cluster_count_distribution(df, figsize=(7, 4), save_path=None):
     """
     Plot the distribution of the number of clusters per junction as a bar chart.
 
     Parameters
     ----------
-    cluster_df : pd.DataFrame
-        Output of cluster_map_to_dataframe(). Must contain columns
-        'junction_name' and 'n_clusters'.
+    df : pd.DataFrame
+        Must contain column 'n_clusters'. One row per junction.
     figsize : tuple
     save_path : str or None
         If provided, save the figure instead of showing it.
     """
-    per_junction = cluster_df.drop_duplicates("junction_name")
-    counts = per_junction["n_clusters"].value_counts().sort_index()
+    counts = df["n_clusters"].value_counts().sort_index()
 
     fig, ax = plt.subplots(figsize=figsize)
-    ax.bar(counts.index, counts.values, color="#4C72B0", edgecolor="white", linewidth=0.5)
+    ax.bar(counts.index, counts.values, color=COLORS["mid_blue"], edgecolor="white", linewidth=0.5)
     ax.set_xlabel("Number of clusters per junction")
     ax.set_ylabel("Number of junctions")
     ax.set_title("Distribution of cluster counts across junctions")
@@ -1614,8 +1644,7 @@ def plot_cluster_count_distribution(cluster_df, figsize=(7, 4), save_path=None):
 
 
 def plot_cluster_count_vs_diversity(
-    cluster_df,
-    jdf,
+    df,
     diversity_columns,
     figsize=None,
     save_path=None,
@@ -1627,14 +1656,11 @@ def plot_cluster_count_vs_diversity(
 
     Parameters
     ----------
-    cluster_df : pd.DataFrame
-        Output of cluster_map_to_dataframe(). Must contain 'junction_name'
-        and 'n_clusters'.
-    jdf : pd.DataFrame
-        Junction summary DataFrame. Must contain 'junction_name' and all
-        columns listed in `diversity_columns`.
+    df : pd.DataFrame
+        Must contain 'n_clusters' and all columns listed in `diversity_columns`.
+        One row per junction.
     diversity_columns : list of str
-        Column names in `jdf` to plot on the x-axis.
+        Column names to plot on the x-axis.
     figsize : tuple or None
         Figure size. Defaults to (4 * n_cols, 4).
     save_path : str or None
@@ -1647,22 +1673,17 @@ def plot_cluster_count_vs_diversity(
     if figsize is None:
         figsize = (4 * n_cols, 4)
 
-    # One row per junction, merge n_clusters with jdf
-    # cluster_df uses 'junction_name'; jdf uses 'edge'
-    per_junction = cluster_df.drop_duplicates("junction_name")[["junction_name", "n_clusters"]]
-    merged = per_junction.merge(jdf, left_on="junction_name", right_on="edge", how="inner")
-
     fig, axes = plt.subplots(1, n_cols, figsize=figsize)
     if n_cols == 1:
         axes = [axes]
 
     for ax, col in zip(axes, diversity_columns):
-        if col not in merged.columns:
+        if col not in df.columns:
             ax.set_visible(False)
             continue
-        valid = merged[["n_clusters", col]].dropna()
+        valid = df[["n_clusters", col]].dropna()
         ax.scatter(valid[col], valid["n_clusters"], alpha=0.6, s=20,
-                   color="#4C72B0", linewidths=0)
+                   color=COLORS["mid_blue"], linewidths=0)
         ax.set_xlabel(col)
         ax.set_ylabel("Number of clusters")
         ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
@@ -1680,56 +1701,62 @@ def plot_cluster_count_vs_diversity(
         plt.show()
 
 
-def plot_cluster_count_vs_trna_heatmap(
-    cluster_df,
-    jdf_trna,
-    trna_col="n_tRNA",
+def plot_junction_heatmap(
+    df,
+    x_col,
+    y_col,
+    heatmap_col,
+    x_label=None,
+    y_label=None,
+    legend_label=None,
+    title=None,
     figsize=(6, 4),
     save_path=None,
 ):
     """
-    Heatmap of n_clusters vs. categorical tRNA count.
-
-    tRNA categories: 0, 1–199, 200–300, >300
-    Rows = n_clusters (ascending), columns = tRNA category.
-    Cell values are junction counts, annotated as text.
+    Heatmap of counts for two categorical columns, with cell annotations.
 
     Parameters
     ----------
-    cluster_df : pd.DataFrame
-        Output of cluster_map_to_dataframe(). Must contain 'junction_name' and 'n_clusters'.
-    jdf_trna : pd.DataFrame
-        Junction DataFrame merged with tRNA counts. Must contain 'edge' and `trna_col`.
-    trna_col : str
-        Column name for tRNA count in `jdf_trna`.
+    df : pd.DataFrame
+        Must contain `x_col`, `y_col`, and `heatmap_col`. One row per junction.
+    x_col : str
+        Column for x-axis (columns of heatmap).
+    y_col : str
+        Column for y-axis (rows of heatmap).
+    heatmap_col : str
+        Unused directly — the cell values are counts of rows per (y_col, x_col) bin.
+        Both `x_col` and `y_col` should already be categorical or discrete.
+    x_label : str or None
+        X-axis label. Defaults to `x_col`.
+    y_label : str or None
+        Y-axis label. Defaults to `y_col`.
+    legend_label : str or None
+        Colorbar label. Defaults to "Number of junctions".
+    title : str or None
     figsize : tuple
     save_path : str or None
     """
-    per_junction = cluster_df.drop_duplicates("junction_name")[["junction_name", "n_clusters"]]
-    merged = per_junction.merge(jdf_trna, left_on="junction_name", right_on="edge", how="inner")
-    merged = merged[["n_clusters", trna_col]].dropna()
-    merged[trna_col] = merged[trna_col].astype(int)
-
-    bins = [-1, 0, 199, 300, float("inf")]
-    labels = ["0", "1–199", "200–300", ">300"]
-    merged["trna_cat"] = pd.cut(merged[trna_col], bins=bins, labels=labels)
+    data = df[[y_col, x_col]].dropna()
 
     ct = (
-        merged.groupby(["n_clusters", "trna_cat"], observed=True)
+        data.groupby([y_col, x_col], observed=True)
         .size()
         .unstack(fill_value=0)
     )
-    ct = ct.reindex(columns=labels, fill_value=0)
+
+    x_cats = ct.columns.tolist()
+    y_cats = ct.index.tolist()
 
     fig, ax = plt.subplots(figsize=figsize)
     im = ax.imshow(ct.values, aspect="auto", cmap="Blues")
 
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels)
-    ax.set_yticks(range(len(ct.index)))
-    ax.set_yticklabels(ct.index.astype(int))
-    ax.set_xlabel("Number of tRNAs")
-    ax.set_ylabel("Number of clusters")
+    ax.set_xticks(range(len(x_cats)))
+    ax.set_xticklabels(x_cats)
+    ax.set_yticks(range(len(y_cats)))
+    ax.set_yticklabels(y_cats)
+    ax.set_xlabel(x_label or x_col)
+    ax.set_ylabel(y_label or y_col)
 
     for i in range(ct.shape[0]):
         for j in range(ct.shape[1]):
@@ -1739,8 +1766,9 @@ def plot_cluster_count_vs_trna_heatmap(
                 ax.text(j, i, str(val), ha="center", va="center",
                         fontsize=9, color=text_color)
 
-    plt.colorbar(im, ax=ax, label="Number of junctions")
-    ax.set_title("Cluster count vs. tRNA annotation")
+    plt.colorbar(im, ax=ax, label=legend_label or "Number of junctions")
+    if title:
+        ax.set_title(title)
     plt.tight_layout()
 
     if save_path is not None:
@@ -1760,11 +1788,19 @@ def plot_all_junctions_pairwise_distances(
     vline_kwargs=None,
     log_y=False,
     percentage=False,
+    cumulative=False,
+    log_x=False,
+    distance_col="distance",
     title="default",
+    xlabel=None,
+    ylabel=None,
+    legend_title=None,
+    cluster_df=None,
+    xlim=None,
     save_path=None,
 ):
     """
-    Plot a combined histogram of pairwise distances pooled across all junctions.
+    Plot a combined histogram (or declining CDF) of pairwise distances pooled across all junctions.
 
     Parameters
     ----------
@@ -1785,6 +1821,11 @@ def plot_all_junctions_pairwise_distances(
         If True, use log scale on the y-axis. Default: False.
     percentage : bool
         If True, show y-axis as percentage of total distances. Default: False.
+    cumulative : bool
+        If True, plot a declining cumulative distribution (fraction/% of distances
+        >= x) instead of a histogram. Default: False.
+    log_x : bool
+        If True and cumulative=True, use log scale on the x-axis. Default: False.
     save_path : str or None
         If provided, save the figure; otherwise call plt.show().
     """
@@ -1792,8 +1833,7 @@ def plot_all_junctions_pairwise_distances(
     if exclude is not None:
         df = df[~df["junction_name"].isin(exclude)]
 
-    distances = df["distance"].values
-    if len(distances) == 0:
+    if len(df) == 0:
         print("No distances to plot.")
         return
 
@@ -1803,30 +1843,79 @@ def plot_all_junctions_pairwise_distances(
         vline_kwargs = dict(color="black", linestyle="--", linewidth=1.5)
 
     fig, ax = plt.subplots(figsize=figsize)
-
-    bar_color = "#7394c2"
     ax.yaxis.grid(True, color="0.9", linewidth=0.8, zorder=0)
     ax.set_axisbelow(True)
 
-    if percentage:
-        counts, edges = np.histogram(distances, bins=bins)
-        pcts = counts / counts.sum() * 100
-        widths = np.diff(edges)
-        ax.bar(edges[:-1], pcts, width=widths, align="edge",
-               color=bar_color, edgecolor="white", linewidth=0.5, zorder=2)
-        ax.set_ylabel("% of pairwise distances", fontsize=11)
+    # build groups: split by within/between cluster if cluster_df provided
+    if cluster_df is not None:
+        meta_cols = {"junction_name", "n_clusters", "n_isolates"}
+        isolate_cols = [c for c in cluster_df.columns if c not in meta_cols]
+        # build (junction_name, isolate) -> cluster_id lookup
+        records = []
+        for _, row in cluster_df.iterrows():
+            jname = row["junction_name"]
+            for iso in isolate_cols:
+                if pd.notna(row[iso]):
+                    records.append((jname, iso, int(row[iso])))
+        cl_lookup = pd.DataFrame(records, columns=["junction_name", "isolate", "cluster"])
+        df = df.merge(
+            cl_lookup.rename(columns={"isolate": "isolate_1", "cluster": "cl_1"}),
+            on=["junction_name", "isolate_1"], how="left"
+        ).merge(
+            cl_lookup.rename(columns={"isolate": "isolate_2", "cluster": "cl_2"}),
+            on=["junction_name", "isolate_2"], how="left"
+        )
+        groups = [
+            (df[df["cl_1"] == df["cl_2"]][distance_col].dropna().values,  COLORS["dark_blue"], "within cluster"),
+            (df[df["cl_1"] != df["cl_2"]][distance_col].dropna().values,  COLORS["reddish"],   "between cluster"),
+        ]
     else:
-        ax.hist(distances, bins=bins, density=False,
-                color=bar_color, edgecolor="white", linewidth=0.5, zorder=2)
-        ax.set_ylabel("Count", fontsize=11)
+        groups = [(df[distance_col].dropna().values, COLORS["mid_blue"], None)]
+
+    def _plot_group(distances, color, label):
+        if len(distances) == 0:
+            return
+        if cumulative:
+            sorted_d = np.sort(distances)
+            y = np.arange(len(sorted_d), 0, -1) / len(sorted_d)
+            if percentage:
+                y = y * 100
+            ax.plot(sorted_d, y, color=color, linewidth=1.5, zorder=2, label=label)
+        elif percentage:
+            counts, edges = np.histogram(distances, bins=bins)
+            pcts = counts / counts.sum() * 100
+            widths = np.diff(edges)
+            ax.bar(edges[:-1], pcts, width=widths, align="edge",
+                   color=color, edgecolor="white", linewidth=0.5, zorder=2, label=label, alpha=0.7)
+        else:
+            ax.hist(distances, bins=bins, color=color, edgecolor="white",
+                    linewidth=0.5, zorder=2, label=label, alpha=0.7)
+
+    for distances, color, label in groups:
+        _plot_group(distances, color, label)
+
+    if cluster_df is not None:
+        ax.legend(frameon=False, fontsize=10)
+
+    if cumulative:
+        ax.set_ylabel(ylabel if ylabel is not None else ("% of pairwise distances ≥ x" if percentage else "Fraction of pairwise distances ≥ x"), fontsize=11)
+    elif percentage:
+        ax.set_ylabel(ylabel if ylabel is not None else "% of pairwise distances", fontsize=11)
+    else:
+        ax.set_ylabel(ylabel if ylabel is not None else "Count", fontsize=11)
 
     if vline is not None:
-        ax.axvline(vline, label=f"Pairwise distance cutoff for\nhomologous recombination ({vline})",
+        default_label = f"Pairwise distance cutoff for\nhomologous recombination ({vline})"
+        ax.axvline(vline, label=legend_title if legend_title is not None else default_label,
                    **vline_kwargs)
         ax.legend(frameon=False, fontsize=10)
     if log_y:
         ax.set_yscale("log")
-    ax.set_xlabel("Pairwise patristic distance (substitutions per site)", fontsize=11)
+    if log_x:
+        ax.set_xscale("log")
+    if xlim is not None:
+        ax.set_xlim(*xlim)
+    ax.set_xlabel(xlabel if xlabel is not None else "Pairwise patristic distance (substitutions per site)", fontsize=11)
     ax.tick_params(labelsize=10)
     if title == "default":
         title = f"Core genome pairwise distances ({n_junctions} junctions)"
@@ -2810,6 +2899,9 @@ def plot_marginal_scatter(
     color_by_n_clusters: bool = False,
     color_by_event_count=None,
     log_color_scale: bool = True,
+    power_norm_color_scale: bool = False,
+    log_x: bool = True,
+    log_y: bool = True,
     show_histograms: bool = True,
     subplot_arrangement: tuple = None,
     shared_colorbar: bool = True,
@@ -3012,15 +3104,20 @@ def plot_marginal_scatter(
     if color_by_n_clusters:
         cluster_values = sorted(data["n_clusters"].unique())
         _n_clusters_palette = {
-            1: "#999999",  # gray
-            2: "#b5d2f2",  # light blue
-            3: "#7394c2",  # mid blue
-            4: "#d991b4",  # pink
-            5: "#80557e",  # purple
-            6: "#a6444f",  # reddish
-            7: "#a6444f",  # reddish (same, filtered out anyway)
+            1:  COLORS["gray"],        # 0 additional clusters
+            2:  COLORS["light_blue"],  # 1 additional cluster
+            3:  COLORS["mid_blue"],
+            4:  COLORS["teal"],
+            5:  COLORS["dark_blue"],
+            6:  COLORS["purple"],
+            7:  COLORS["pink"],
+            8:  COLORS["reddish"],
+            9:  COLORS["wine"],
+            10: COLORS["wine"],
+            11: COLORS["wine"],
+            12: COLORS["wine"],
         }
-        cluster_colors = {v: _n_clusters_palette.get(v, "#999999") for v in cluster_values}
+        cluster_colors = {v: _n_clusters_palette.get(v, COLORS["wine"]) for v in cluster_values}
 
     if data.empty:
         raise ValueError("No valid positive values left after filtering.")
@@ -3067,14 +3164,22 @@ def plot_marginal_scatter(
         pass
     elif color_by_event_count is not None:
         from matplotlib.colors import to_rgba, LinearSegmentedColormap
-        _event_cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
+        if power_norm_color_scale:
+            _event_cmap_colors = ["#b5d2f2", "#7394c2", "#a6444f"]
+        else:
+            _event_cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
         event_cmap = LinearSegmentedColormap.from_list("event_cmap", _event_cmap_colors)
 
-        from matplotlib.colors import LogNorm, Normalize
+        from matplotlib.colors import LogNorm, Normalize, PowerNorm
         event_vals = data[color_by_event_count].values
         nonzero_mask = event_vals > 0
         vmax = event_vals.max() if event_vals.max() > 0 else 1
-        log_norm = LogNorm(vmin=1, vmax=vmax) if log_color_scale else Normalize(vmin=0, vmax=vmax)
+        if power_norm_color_scale:
+            log_norm = PowerNorm(gamma=0.5, vmin=0, vmax=vmax)
+        elif log_color_scale:
+            log_norm = LogNorm(vmin=1, vmax=vmax)
+        else:
+            log_norm = Normalize(vmin=0, vmax=vmax)
 
         # gray dots for zero
         if (~nonzero_mask).any():
@@ -3118,8 +3223,10 @@ def plot_marginal_scatter(
         "tot_acc_len": "local pangenome length (bp)",
         "n_categories": "n. distinct paths",
     }
-    ax_scatter.set_xscale("log")
-    ax_scatter.set_yscale("log")
+    if log_x:
+        ax_scatter.set_xscale("log")
+    if log_y:
+        ax_scatter.set_yscale("log")
     ax_scatter.set_xlabel(_axis_labels.get(x_col, x_col))
     ax_scatter.set_ylabel(_axis_labels.get(y_col, y_col))
 
@@ -3128,8 +3235,8 @@ def plot_marginal_scatter(
         x_min, x_max = data[x_col].min(), data[x_col].max()
         y_min, y_max = data[y_col].min(), data[y_col].max()
 
-        x_bins = np.logspace(np.log10(x_min), np.log10(x_max), 25)
-        y_bins = np.logspace(np.log10(y_min), np.log10(y_max), 25)
+        x_bins = np.logspace(np.log10(max(x_min, 1e-10)), np.log10(x_max), 25) if log_x else np.linspace(x_min, x_max, 25)
+        y_bins = np.logspace(np.log10(max(y_min, 1e-10)), np.log10(y_max), 25) if log_y else np.linspace(y_min, y_max, 25)
 
         if color_by_n_clusters:
             ax_histx.hist(
@@ -3145,10 +3252,10 @@ def plot_marginal_scatter(
                 stacked=True, edgecolor="none",
             )
         elif color_by_event_count is not None:
-            from matplotlib.colors import LogNorm, Normalize, LinearSegmentedColormap
+            from matplotlib.colors import LinearSegmentedColormap
             _hcmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
             hcmap = LinearSegmentedColormap.from_list("event_cmap", _hcmap_colors)
-            hnorm = LogNorm(vmin=1, vmax=vmax) if log_color_scale else Normalize(vmin=0, vmax=vmax)
+            hnorm = log_norm
 
             def _colored_hist(ax, col, bins, orientation="vertical"):
                 for i in range(len(bins) - 1):
@@ -3171,9 +3278,11 @@ def plot_marginal_scatter(
             ax_histy.hist(data[y_col], bins=y_bins, orientation="horizontal",
                           color="0.7", edgecolor="0.55")
 
-        ax_histx.set_xscale("log")
+        if log_x:
+            ax_histx.set_xscale("log")
+        if log_y:
+            ax_histy.set_yscale("log")
         ax_histx.set_ylabel("n. junctions")
-        ax_histy.set_yscale("log")
         ax_histy.set_xlabel("n. junctions")
         plt.setp(ax_histx.get_xticklabels(), visible=False)
         plt.setp(ax_histy.get_yticklabels(), visible=False)
@@ -3186,16 +3295,19 @@ def plot_marginal_scatter(
         fig.subplots_adjust(right=0.78)
         handles, labels = ax_scatter.get_legend_handles_labels()
         fig.legend(handles, labels,
-                   title="n. homologous\nrecombination events",
+                   title="n. additional\nclusters",
                    frameon=False, fontsize=8,
                    loc="center left",
                    bbox_to_anchor=(0.80, 0.45))
     elif color_by_event_count is not None:
         from matplotlib.cm import ScalarMappable
         from matplotlib.colors import LogNorm, Normalize, LinearSegmentedColormap
-        _event_cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
+        if power_norm_color_scale:
+            _event_cmap_colors = ["#b5d2f2", "#7394c2", "#a6444f"]
+        else:
+            _event_cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
         event_cmap = LinearSegmentedColormap.from_list("event_cmap", _event_cmap_colors)
-        _cb_norm = LogNorm(vmin=1, vmax=vmax) if log_color_scale else Normalize(vmin=0, vmax=vmax)
+        _cb_norm = log_norm
         sm = ScalarMappable(cmap=event_cmap, norm=_cb_norm)
         sm.set_array([])
         fig.subplots_adjust(right=0.78)
@@ -3215,3 +3327,773 @@ def plot_marginal_scatter(
     if show_histograms:
         return fig, (ax_scatter, ax_histx, ax_histy)
     return fig, (ax_scatter,)
+
+def plot_score_threshold_violin(
+    dfs,
+    thresholds,
+    score_col="silhouette_score",
+    figsize=(8, 5),
+    ylim=None,
+    xlabel=None,
+    ylabel=None,
+    legend_labels=None,
+    legend_title=None,
+    save_path=None,
+):
+    """
+    Plot per-threshold violin plots for one or more score columns.
+
+    For multiple score columns, violins are placed side by side within each
+    threshold group, each column in a distinct color.
+
+    Parameters
+    ----------
+    dfs : list of pd.DataFrame
+        One DataFrame per threshold, already filtered and with score columns present.
+    thresholds : list
+        Threshold labels for the x-axis, matching `dfs`.
+    score_col : str or list of str
+        Column(s) to plot. If a list, one violin per column per threshold.
+    figsize : tuple
+    ylim : tuple or None
+        (min, max) for the y-axis.
+    xlabel : str or None
+        Override the x-axis label.
+    ylabel : str or None
+        Override the y-axis label.
+    legend_labels : list of str or None
+        Override legend labels for each score column.
+    legend_title : str or None
+        Title for the legend.
+    save_path : str or None
+    """
+    _COL_COLORS = [COLORS["reddish"], COLORS["mid_blue"], COLORS["purple"], COLORS["light_blue"]]
+
+    if isinstance(score_col, str):
+        score_col = [score_col]
+
+    n_thresh = len(thresholds)
+    n_cols = len(score_col)
+    width = 0.8 / n_cols if n_cols > 1 else 0.8
+    offsets = np.linspace(-(n_cols - 1) / 2, (n_cols - 1) / 2, n_cols) * width
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_facecolor("white")
+
+    # subtle horizontal gridlines behind everything
+    ax.yaxis.grid(True, color="0.88", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+
+    legend_handles = []
+
+    all_scores = []
+    for col_idx, col in enumerate(score_col):
+        color = _COL_COLORS[col_idx % len(_COL_COLORS)]
+        all_positions = [i + offsets[col_idx] for i in range(n_thresh)]
+        all_data = [df[col].dropna().values for df in dfs]
+        all_scores.extend([s for s in all_data if len(s) > 0])
+
+        # violinplot requires >= 2 points; filter out insufficient datasets
+        valid = [(pos, d) for pos, d in zip(all_positions, all_data) if len(d) >= 2]
+        if not valid:
+            continue
+        positions, data = zip(*valid)
+
+        parts = ax.violinplot(data, positions=list(positions), widths=width * 0.75,
+                              showmedians=True, showextrema=False)
+        for pc in parts["bodies"]:
+            pc.set_facecolor(color)
+            pc.set_alpha(0.45)
+        if "cmedians" in parts:
+            parts["cmedians"].set_color("black")
+            parts["cmedians"].set_linewidth(1.5)
+
+        # strip plot with aggressive jitter
+        for pos, d in zip(positions, data):
+            jitter = np.random.uniform(-width * 0.32, width * 0.32, size=len(d))
+            ax.scatter(pos + jitter, d, color=color, s=11, alpha=0.4, zorder=1,
+                       linewidths=0.4, edgecolors="black")
+
+        label = legend_labels[col_idx] if legend_labels and col_idx < len(legend_labels) else col
+        legend_handles.append(plt.matplotlib.patches.Patch(facecolor=color, alpha=0.7, label=label))
+
+    ax.axhline(0, color=COLORS["gray"], linewidth=1.0, linestyle="--", zorder=1)
+
+    ax.set_xticks(range(n_thresh))
+    if all(isinstance(t, (int, float)) for t in thresholds):
+        tick_labels = [f"{t * 1000:g}" for t in thresholds]
+        x_unit = " (×10⁻³)"
+    else:
+        tick_labels = [str(t) for t in thresholds]
+        x_unit = ""
+    ax.set_xticklabels(tick_labels, fontsize=12)
+    ax.tick_params(axis="y", labelsize=12)
+    ax.set_xlabel(f"{xlabel if xlabel is not None else 'Branch-length threshold'}{x_unit}", fontsize=14)
+    ax.set_ylabel(ylabel if ylabel is not None else "Score", fontsize=14)
+
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    elif all_scores:
+        combined = np.concatenate(all_scores)
+        margin = (combined.max() - combined.min()) * 0.05
+        ax.set_ylim(combined.min() - margin, combined.max() + margin)
+
+    # remove top and right spines
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    if n_cols > 1:
+        leg = ax.legend(handles=legend_handles, frameon=False, title=legend_title,
+                        bbox_to_anchor=(1.01, 1), loc="upper left", borderaxespad=0,
+                        fontsize=13, title_fontsize=14)
+        leg._legend_box.align = "left"
+        if legend_title is not None:
+            leg.get_title().set_ha("left")
+
+    plt.tight_layout()
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_core_alignment_lengths(
+    junction_df,
+    block_df=None,
+    col="aln_length_nogap",
+    bins=50,
+    cumulative=False,
+    log_x=False,
+    log_y=False,
+    figsize=(8, 4),
+    save_path=None,
+):
+    """
+    Plot the distribution of core alignment lengths for junction-level and/or
+    per-block alignments.
+
+    Parameters
+    ----------
+    junction_df : pd.DataFrame
+        Output of get_core_alignment_lengths() junction_df — one row per junction.
+    block_df : pd.DataFrame or None
+        Output of get_core_alignment_lengths() block_df — one row per core block.
+        If provided, both series are shown together.
+    col : str
+        Column to plot. Default: 'aln_length_nogap'.
+    bins : int
+        Number of histogram bins.
+    cumulative : bool
+        If True, plot declining CDFs instead of histograms.
+    log_x : bool
+    log_y : bool
+    figsize : tuple
+    save_path : str or None
+    """
+    junction_values = junction_df[col].dropna().values
+    block_values = block_df[col].dropna().values if block_df is not None else None
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.yaxis.grid(True, color="0.9", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+
+    if cumulative:
+        def _plot_cdf(vals, color, label):
+            sv = np.sort(vals)
+            y = np.arange(len(sv), 0, -1) / len(sv) * 100
+            ax.plot(sv, y, color=color, linewidth=1.5, label=label)
+
+        if block_values is not None:
+            _plot_cdf(block_values, COLORS["mid_blue"], "Individual core blocks")
+        _plot_cdf(junction_values, COLORS["reddish"], "Combined core blocks (per junction)")
+        ax.set_ylabel("Fraction of alignments ≥ x (%)", fontsize=13)
+        ax.legend(fontsize=11)
+    else:
+        if block_values is not None:
+            ax.hist(block_values, bins=bins, color=COLORS["mid_blue"], edgecolor="white",
+                    linewidth=0.5, alpha=0.7, label="Individual core blocks",
+                    weights=np.ones(len(block_values)) / len(block_values) * 100)
+        ax.hist(junction_values, bins=bins, color=COLORS["reddish"], edgecolor="white",
+                linewidth=0.5, alpha=0.7, label="Combined core blocks (per junction)",
+                weights=np.ones(len(junction_values)) / len(junction_values) * 100)
+        ax.set_ylabel("Relative frequency (%)", fontsize=13)
+        ax.legend(fontsize=11)
+
+    ax.set_xlabel("Alignment length (bp)", fontsize=13)
+
+    if log_x:
+        ax.set_xscale("log")
+    if log_y:
+        ax.set_yscale("log")
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_block_avg_pairwise_dist(
+    df,
+    bins=100,
+    cumulative=False,
+    log_x=False,
+    log_y=False,
+    vline=None,
+    vline_kwargs=None,
+    figsize=(8, 4),
+    save_path=None,
+):
+    """
+    Plot the distribution of avg_pairwise_dist across all blocks and junctions.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Output of load_all_block_alignment_stats(), must contain avg_pairwise_dist column.
+    bins : int
+    cumulative : bool
+        If True, plot a declining CDF (fraction of blocks with avg_pairwise_dist >= x).
+    log_x : bool
+    log_y : bool
+    vline : float or None
+        Draw a vertical line at this x-value (e.g. the gain/loss threshold).
+    vline_kwargs : dict or None
+    figsize : tuple
+    save_path : str or None
+    """
+    values = df["avg_pairwise_dist"].dropna().values
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.yaxis.grid(True, color="0.9", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+
+    if cumulative:
+        sorted_v = np.sort(values)
+        y = np.arange(len(sorted_v), 0, -1) / len(sorted_v) * 100
+        ax.plot(sorted_v, y, color=COLORS["mid_blue"], linewidth=1.5)
+        ax.set_ylabel("% of blocks with avg pairwise dist ≥ x", fontsize=11)
+    else:
+        ax.hist(values, bins=bins, color=COLORS["mid_blue"], edgecolor="white", linewidth=0.5)
+        ax.set_ylabel("Number of blocks", fontsize=11)
+
+    ax.set_xlabel("Average pairwise distance", fontsize=11)
+
+    if vline is not None:
+        kw = dict(color=COLORS["reddish"], linestyle="--", linewidth=1.5)
+        if vline_kwargs:
+            kw.update(vline_kwargs)
+        ax.axvline(vline, **kw)
+
+    if log_x:
+        ax.set_xscale("log")
+    if log_y:
+        ax.set_yscale("log")
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_ambiguous_block_distances(
+    ambiguity_df,
+    bins=100,
+    cumulative=False,
+    log_x=False,
+    log_y=False,
+    vline=None,
+    vline_kwargs=None,
+    figsize=(8, 4),
+    save_path=None,
+):
+    """
+    Plot the distribution of avg_pairwise_dist values from decide_ambiguities,
+    unpacking the list stored in each row of ambiguity_df.avg_pairwise_dists.
+
+    Parameters
+    ----------
+    ambiguity_df : pd.DataFrame
+        Output of find_consensus_paths_core(), must contain avg_pairwise_dists column
+        where each cell is a list of float values.
+    bins : int
+    cumulative : bool
+        If True, plot a declining CDF (fraction of blocks with avg_pairwise_dist >= x).
+    log_x : bool
+    log_y : bool
+    vline : float or None
+        Draw a vertical line at this x-value (e.g. the gain/loss threshold).
+    vline_kwargs : dict or None
+    figsize : tuple
+    save_path : str or None
+    """
+    import ast, re
+
+    raw = ambiguity_df["avg_pairwise_dists"].dropna()
+    values = []
+    for entry in raw:
+        if isinstance(entry, str):
+            # parse floats directly from string, handles np.float64(...) and nan
+            entry = [float(x) for x in re.findall(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?(?=\s*[,\)])", entry)]
+        values.extend([float(v) for v in entry if not np.isnan(float(v))])
+    values = np.array(values)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.yaxis.grid(True, color="0.88", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+
+    if cumulative:
+        sv = np.sort(values)
+        y = np.arange(len(sv), 0, -1) / len(sv) * 100
+        ax.plot(sv, y, color=COLORS["mid_blue"], linewidth=1.5)
+        ax.set_ylabel("Fraction of blocks ≥ x (%)", fontsize=13)
+    else:
+        ax.hist(values, bins=bins, color=COLORS["mid_blue"], edgecolor="white", linewidth=0.5,
+                weights=np.ones(len(values)) / len(values) * 100)
+        ax.set_ylabel("Relative frequency (%)", fontsize=13)
+
+    ax.set_xlabel("Average pairwise distance", fontsize=13)
+
+    if vline is not None:
+        kw = dict(color=COLORS["reddish"], linestyle="--", linewidth=1.5)
+        if vline_kwargs:
+            kw.update(vline_kwargs)
+        ax.axvline(vline, **kw)
+
+    if log_x:
+        ax.set_xscale("log")
+    if log_y:
+        ax.set_yscale("log")
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_scatter(
+    df,
+    x_col,
+    y_col,
+    xlabel=None,
+    ylabel=None,
+    log_x=False,
+    log_y=False,
+    alpha=0.6,
+    size=20,
+    figsize=None,
+    save_path=None,
+):
+    """
+    Simple scatter plot with optional subplots for multiple x columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    x_col : str or list of str
+        One or more columns for the x-axis. If a list, one subplot per column.
+    y_col : str
+        Column for the y-axis.
+    xlabel : str or list of str or None
+        X-axis label(s). If None, uses column name(s).
+    ylabel : str or None
+        Y-axis label. If None, uses column name.
+    log_x : bool
+    log_y : bool
+    alpha : float
+    size : float
+        Marker size.
+    figsize : tuple or None
+        Auto-sized if None.
+    save_path : str or None
+    """
+    if isinstance(x_col, str):
+        x_col = [x_col]
+    if isinstance(xlabel, str) or xlabel is None:
+        xlabel = [xlabel] * len(x_col)
+
+    n = len(x_col)
+    if figsize is None:
+        figsize = (4 * n, 4)
+
+    fig, axes = plt.subplots(1, n, figsize=figsize, squeeze=False)
+    axes = axes[0]
+
+    for ax, xcol, xlbl in zip(axes, x_col, xlabel):
+        plot_data = df[[xcol, y_col]].dropna()
+        ax.scatter(plot_data[xcol], plot_data[y_col],
+                   color=COLORS["mid_blue"], alpha=alpha, s=size,
+                   linewidths=0.3, edgecolors="black")
+
+        ax.set_xlabel(xlbl if xlbl is not None else xcol, fontsize=12)
+        ax.set_ylabel(ylabel if ylabel is not None else y_col, fontsize=12)
+
+        if log_x:
+            ax.set_xscale("log")
+        if log_y:
+            ax.set_yscale("log")
+
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    plt.tight_layout()
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_snp_gap_histogram(df, bins=100, log_y=False, log_x=False, cumulative=False, figsize=(8, 4), save_path=None):
+    """
+    Plot a histogram or declining CDF of inter-SNP gap lengths pooled across all junctions and blocks.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Output of core_block_snp_gaps(). Must contain column 'gap_lengths'.
+        Each entry can be a list or a string representation of a list.
+    bins : int
+    log_y : bool
+    log_x : bool
+    cumulative : bool
+        If True, plot a declining cumulative distribution (fraction of gaps >= x).
+    figsize : tuple
+    save_path : str or None
+    """
+    import ast
+
+    all_gaps = []
+    for val in df["gap_lengths"]:
+        if isinstance(val, str):
+            val = ast.literal_eval(val)
+        all_gaps.extend(val)
+
+    all_gaps = np.array(all_gaps)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if cumulative:
+        sorted_gaps = np.sort(all_gaps)
+        y = np.arange(len(sorted_gaps), 0, -1) / len(sorted_gaps)
+        ax.plot(sorted_gaps, y, color=COLORS["mid_blue"], linewidth=1.5)
+        ax.set_ylabel("Fraction of gaps ≥ x", fontsize=11)
+    else:
+        ax.hist(all_gaps, bins=bins, color=COLORS["mid_blue"], edgecolor="white", linewidth=0.5)
+        ax.set_ylabel("Count", fontsize=11)
+
+    ax.set_xlabel("Gap length between SNPs (bp)", fontsize=11)
+    if log_y:
+        ax.set_yscale("log")
+    if log_x:
+        ax.set_xscale("log")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_snp_position_cdfs(df, figsize=(8, 4), alpha=0.3, highlight_junctions=None, save_path=None):
+    """
+    For each row in `df`, normalize SNP positions to [0, 1] using aln_length
+    and plot a cumulative distribution curve. All curves are shown in the same axes.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Output of core_block_snp_gaps(). Must contain columns
+        'snp_positions', 'aln_length', and 'junction_name'. Each entry in
+        'snp_positions' can be a list or a string representation of a list.
+    figsize : tuple
+    alpha : float
+        Transparency of individual curves. Default: 0.3.
+    highlight_junctions : list of str or None
+        Junction names to highlight in red. All others are plotted in mid blue.
+    save_path : str or None
+    """
+    import ast
+
+    highlight_set = set(highlight_junctions) if highlight_junctions else set()
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for _, row in df.iterrows():
+        snp_pos = row["snp_positions"]
+        if isinstance(snp_pos, str):
+            snp_pos = ast.literal_eval(snp_pos)
+        if len(snp_pos) == 0:
+            continue
+
+        aln_length = row["aln_length"]
+        normalized = np.sort(np.array(snp_pos) / aln_length)
+        y = np.arange(1, len(normalized) + 1) / len(normalized)
+
+        jname = row.get("junction_name", "")
+        color = COLORS["reddish"] if jname in highlight_set else COLORS["mid_blue"]  # reddish or mid blue
+        ax.plot(normalized, y, color=color, alpha=alpha, linewidth=0.8)
+
+    ax.set_xlabel("Normalized SNP position (0 = start, 1 = end)", fontsize=11)
+    ax.set_ylabel("Cumulative fraction of SNPs", fontsize=11)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+def plot_all_junctions_pairwise_distances_zoom(
+    distances_df,
+    exclude=None,
+    bins=100,
+    figsize=(8, 4.2),
+    vline=None,
+    vline_kwargs=None,
+    log_y=False,
+    percentage=False,
+    cumulative=False,
+    log_x=False,
+    distance_col="distance",
+    title="default",
+    xlabel=None,
+    ylabel=None,
+    legend_title=None,
+    save_path=None,
+    zoom_xlim=None,
+    zoom_ylim=None,
+    inset=True,
+    inset_loc="upper right",
+    inset_width="38%",
+    inset_height="48%",
+):
+    """
+    Plot pooled pairwise distances across all junctions.
+
+    If zoom_xlim is given and inset=True, add a zoomed inset panel.
+    """
+    df = distances_df.copy()
+    if exclude is not None:
+        df = df[~df["junction_name"].isin(exclude)]
+
+    distances = df[distance_col].dropna().values
+    if len(distances) == 0:
+        print("No distances to plot.")
+        return
+
+    n_junctions = df["junction_name"].nunique()
+
+    if vline_kwargs is None:
+        vline_kwargs = dict(color="black", linestyle="--", linewidth=2.5)
+
+    if title == "default":
+        title = f"Core genome pairwise distances ({n_junctions} junctions)"
+
+    x_label = xlabel if xlabel is not None else "Pairwise patristic distance (substitutions per site)"
+    if ylabel is not None:
+        y_label = ylabel
+    else:
+        if cumulative:
+            y_label = "% of pairwise distances ≥ x" if percentage else "Fraction of pairwise distances ≥ x"
+        elif percentage:
+            y_label = "% of pairwise distances"
+        else:
+            y_label = "Count"
+
+    bar_color = COLORS["mid_blue"]
+
+    def _draw(ax, show_legend=True):
+        ax.yaxis.grid(True, color="0.9", linewidth=0.8, zorder=0)
+        ax.set_axisbelow(True)
+
+        if cumulative:
+            sorted_d = np.sort(distances)
+            y = np.arange(len(sorted_d), 0, -1) / len(sorted_d)
+            if percentage:
+                y *= 100
+            ax.plot(sorted_d, y, color=bar_color, linewidth=2.5, zorder=2)
+        elif percentage:
+            counts, edges = np.histogram(distances, bins=bins)
+            pcts = counts / counts.sum() * 100
+            widths = np.diff(edges)
+            ax.bar(
+                edges[:-1],
+                pcts,
+                width=widths,
+                align="edge",
+                color=bar_color,
+                edgecolor="white",
+                linewidth=0.5,
+                zorder=2,
+            )
+        else:
+            ax.hist(
+                distances,
+                bins=bins,
+                density=False,
+                color=bar_color,
+                edgecolor="white",
+                linewidth=0.5,
+                zorder=2,
+            )
+
+        if vline is not None:
+            default_label = f"Branch length cutoff for\nhomologous recombination ({vline})"
+            ax.axvline(
+                vline,
+                label=legend_title if legend_title is not None else default_label,
+                **vline_kwargs,
+            )
+            if show_legend:
+                ax.legend(frameon=False, fontsize=18, loc="upper right", bbox_to_anchor=(0.4, 0.2))
+
+        if log_y:
+            ax.set_yscale("log")
+        if log_x:
+            ax.set_xscale("log")
+
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(labelsize=16)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    _draw(ax, show_legend=True)
+
+    ax.set_xlabel(x_label, fontsize=20)
+    ax.set_ylabel(y_label, fontsize=20)
+    if title is not None:
+        ax.set_title(title, fontsize=22)
+
+    if zoom_xlim is not None and inset:
+        axins = inset_axes(
+            ax,
+            width="38%",
+            height="48%",
+            loc="upper left",
+            bbox_to_anchor=(1.02, 0.0, 1.0, 1.0),
+            bbox_transform=ax.transAxes,
+            borderpad=0,
+        )
+        _draw(axins, show_legend=False)
+
+        axins.set_xlim(*zoom_xlim)
+        if zoom_ylim is not None:
+            axins.set_ylim(*zoom_ylim)
+
+        if log_x:
+            axins.set_xscale("log")
+        if log_y:
+            axins.set_yscale("log")
+
+        axins.tick_params(labelsize=16)
+        axins.set_title("Zoom", fontsize=18, pad=4)
+
+        # slightly softer inset styling
+        for spine in axins.spines.values():
+            spine.set_linewidth(0.8)
+            spine.set_edgecolor("0.4")
+
+        mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.5", lw=0.8)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_clustering_threshold_sweep(df, figsize=(7,4), save_path=None, normalize=False):
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    metrics = [
+        "n_junctions_with_clusters",
+        "n_additional_clusters",
+        "n_events",
+        "n_insertions",
+        "n_deletions",
+        "n_translocations",
+        "n_inversions",
+        "n_inconsistant_cluster",
+        "n_inconsistant_junctions"
+    ]
+
+    plot_df = df.copy()
+
+    # convert thresholds to numeric so x-axis reflects real positions
+    plot_df["threshold"] = plot_df["threshold"].astype(float)
+    plot_df = plot_df.sort_values("threshold")
+
+    if normalize:
+        for m in metrics:
+            max_v = plot_df[m].max()
+            if max_v != 0:
+                plot_df[m] = plot_df[m] / max_v
+
+    for metric in metrics:
+        ax.plot(
+            plot_df["threshold"],
+            plot_df[metric],
+            marker="o",
+            markersize=4,
+            linewidth=1.5,
+            label=metric.replace("_", " ")
+        )
+
+    ax.set_xlabel("branch-length threshold", fontsize=11)
+
+    if normalize:
+        ax.set_ylabel("normalized value (value / max)", fontsize=11)
+        ax.set_ylim(0, 1.05)
+    else:
+        ax.set_ylabel("count", fontsize=11)
+
+    # show ticks exactly at the thresholds
+    ax.set_xticks(plot_df["threshold"])
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax.legend(frameon=False, fontsize=9)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()

@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import math
 import re
+import copy
 
 from pathlib import Path
 from IPython.display import display
@@ -9,13 +10,13 @@ from IPython.display import display
 from itertools import combinations
 from collections import Counter, defaultdict, OrderedDict
 
-from Bio import Phylo
+from Bio import Phylo, SeqIO
 import pypangraph as pp
 import junction_analysis.pangraph_utils as pu
 from junction_analysis.plotting import plot_junction_pangraph_interactive, plot_pairwise_distance_hist, plot_snp_pos_distribution, plot_block_distance_distribution
 from junction_analysis.junction_trees import build_tree_from_block_list, cluster_tree_by_branch_length, compute_pairwise_distances
 from junction_analysis.helpers import get_block_length, snp_positions, build_subtree, repo_root
-from junction_analysis.block_alignment import create_block_msas_for_cluster, summarize_block_msas
+from junction_analysis.block_alignment import create_block_msas_for_cluster, summarize_block_msas, avg_pairwise_distance
 
 
 def find_invertible_ids(paths: dict) -> set:
@@ -669,28 +670,43 @@ def fitch_ancestral_reconstruction(tree, binary_encodings):
     
     # one could add a top down pass to refine ambiguities for lower level sequences but its not needed at the moment
 
-def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, path_dict_cluster_dedup=None, individual_gain_thresh = 0.01, verbose = False):
+def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, path_dict_cluster_dedup=None, individual_gain_thresh = 0.001, verbose = False):
+    """
+    Returns
+    -------
+    root_states : list[set]
+        Updated root states after ambiguity resolution.
+    stats : dict
+        Keys:
+          n_ambiguous        – total number of ambiguous blocks
+          n_single_isolate   – ambiguous blocks with only one isolate (undecidable, defaulted to gain)
+          n_decided_loss     – blocks decided as loss (low diversity)
+          n_decided_gain     – blocks decided as gain (high diversity)
+    """
+    stats = dict(n_total_blocks=len(blocks), n_ambiguous=0, n_single_isolate=0, n_decided_loss=0, n_decided_gain=0, avg_pairwise_dists=[])
     ambiguous_blocks = [block for block, state in zip(blocks, root_states) if len(state) > 1]
+    stats["n_ambiguous"] = len(ambiguous_blocks)
 
-    # don't run followig analysis if there are no ambiguous blocks
+    # don't run following analysis if there are no ambiguous blocks
     if ambiguous_blocks == []:
         print("No ambiguous blocks.")
-        return root_states
+        return root_states, stats
 
     create_block_msas_for_cluster(junction_name, isolate_list, cl, ambiguous_blocks,
                                   path_dict_cluster_dedup=path_dict_cluster_dedup)
     df, pair_dists = summarize_block_msas(junction_name, cl, return_pairwise_dists=True, context_sensitive=True)
 
-    # if all blocks only appear once
+    # if all blocks only appear once → all undecidable, default to gain
     if df.empty:
         for block in ambiguous_blocks:
             pos = block2idx[block]
             root_states[pos] = {0}
-        return root_states
+        stats["n_single_isolate"] = len(ambiguous_blocks)
+        return root_states, stats
 
     if verbose:
         display(df)
-        plot_block_distance_distribution(pair_dists, [block.id for block in ambiguous_blocks], bins=70, cols=4, figsize=(14, 10), vline=0.01, vline_kwargs={"color": "black", "linestyle": "--"})
+        plot_block_distance_distribution(pair_dists, [(block.id, block.context) for block in ambiguous_blocks], bins=70, cols=4, figsize=(14, 10), vline=individual_gain_thresh, vline_kwargs={"color": "black", "linestyle": "--"})
 
     for block in ambiguous_blocks:
         pos = block2idx[block]
@@ -700,16 +716,22 @@ def decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, blo
         # block not found in df, probably because it only exists once → default to gain (ancestral state 0)
         if row.empty:
             root_states[pos] = {0}
+            stats["n_single_isolate"] += 1
             continue
 
+        val = row.iloc[0]
+        stats["avg_pairwise_dists"].append(val)
+
         # loss: low diversity → block present in ancestor
-        if row.iloc[0] < individual_gain_thresh:
+        if val < individual_gain_thresh:
             root_states[pos] = {1}
+            stats["n_decided_loss"] += 1
         # gain: high diversity → block absent in ancestor
         else:
             root_states[pos] = {0}
+            stats["n_decided_gain"] += 1
 
-    return root_states
+    return root_states, stats
 
 def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, consensus_criterium = 'core_genome_tree', tree_path = None, block_freq_thresh = 0.5, rare_context_thresh = 0.2, min_anchor_fraction = 0.6, min_anchor_fraction_relaxed = 0.3, min_cluster_retention = 0.8, plot_consensus = False, plot_annotations = False, plot_pair_dist = False, plot_snp_dist = False, plot_ambiguities = False):
     """
@@ -780,6 +802,11 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
     all_root_states_unique : dict[cluster_id -> list[set]]
         Root states after ambiguity resolution.
         Only returned when ``consensus_criterium='core_genome_tree'``.
+    ambiguity_stats_df : pd.DataFrame
+        One row per (junction, cluster) with columns:
+        junction_name, cluster_id, n_ambiguous, n_single_isolate,
+        n_decided_loss, n_decided_gain.
+        Only returned when ``consensus_criterium='core_genome_tree'``.
     """
     # create deduplicated paths dict
     root = repo_root()
@@ -827,6 +854,7 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
         consensus_paths_core = {}
         all_root_states = {}
         all_root_states_unique = {}
+        ambiguity_stats_rows = []
 
         # Pre-compute valid isolates at the strict threshold
         valid_strict = set(filter_isolates_by_anchor_fraction(
@@ -876,7 +904,8 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
             fitch_ancestral_reconstruction(subtree, binary_encodings)
             root_states = subtree.root._state_sets  # list of {0}/{1}
             print(root_states)
-            root_states_unique = decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, path_dict_cluster_dedup=path_dict_cluster_dedup, individual_gain_thresh=0.01, verbose = plot_ambiguities)
+            root_states_unique, amb_stats = decide_ambiguities(root_states, isolate_list, junction_name, cl, blocks, block2idx, path_dict_cluster_dedup=path_dict_cluster_dedup, individual_gain_thresh=0.001, verbose = plot_ambiguities)
+            ambiguity_stats_rows.append(dict(junction_name=junction_name, cluster_id=cl, n_isolates_in_cluster=len(isolate_list), **amb_stats))
 
             filter_set = {block for block, state in zip(blocks, root_states_unique) if 0 in state}
             filtered_cluster_paths = filter_deduplicated_paths(path_dict_cluster_dedup, filter_set, strand_sensitive=False)
@@ -937,7 +966,8 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
         plot_snp_pos_distribution(snp_pos, left_core_block_length, bins=70, title="SNP Position Distribution in Core Block Alignment")
 
     if consensus_criterium == 'core_genome_tree':
-        return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unique
+        ambiguity_stats_df = pd.DataFrame(ambiguity_stats_rows, columns=["junction_name", "cluster_id", "n_isolates_in_cluster", "n_total_blocks", "n_ambiguous", "n_single_isolate", "n_decided_loss", "n_decided_gain", "avg_pairwise_dists"])
+        return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unique, ambiguity_stats_df
 
     return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting
 
@@ -1211,22 +1241,72 @@ def cluster_map_to_dataframe(cluster_map: dict, save_path: str = None) -> pd.Dat
     return df
 
 
-def collect_all_pairwise_distances(junction_names, results_dir,
-                                    save_path=None, load_path=None):
+def collect_all_branch_lengths(results_dir, save_path=None):
     """
-    Collect pairwise distances from the core genome tree of each junction.
+    Collect all individual branch lengths from the core genome tree of each junction.
+
+    Parameters
+    ----------
+    results_dir : str or Path
+        Base results directory; trees are expected at
+        ``results_dir/consensus_analysis/<junction_name>/core_blocks_aln.newick``.
+    save_path : str or Path or None
+        If provided, save the resulting DataFrame as a CSV to this path.
+
+    Returns
+    -------
+    pd.DataFrame with columns: junction_name, branch_length
+    """
+    results_dir = Path(results_dir)
+    rows = []
+    skipped = []
+
+    for tree_path in sorted((results_dir / "consensus_analysis").glob("*/core_blocks_aln.newick")):
+        jname = tree_path.parent.name
+        try:
+            tree = Phylo.read(str(tree_path), "newick")
+            for clade in tree.find_clades():
+                if clade.branch_length is not None:
+                    rows.append({"junction_name": jname, "branch_length": clade.branch_length})
+        except Exception as e:
+            print(f"  {jname}: {e}")
+            skipped.append(jname)
+
+    if skipped:
+        print(f"Skipped {len(skipped)} junctions (file not found or error).")
+
+    df = pd.DataFrame(rows, columns=["junction_name", "branch_length"])
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(save_path, index=False)
+        print(f"Saved branch lengths to {save_path}.")
+
+    return df
+
+
+def collect_all_pairwise_distances(junction_names, results_dir,
+                                    save_path=None, load_path=None,
+                                    mode="tree"):
+    """
+    Collect pairwise distances from the core genome alignment of each junction.
 
     Parameters
     ----------
     junction_names : list of str
         Junction names to process.
     results_dir : str or Path
-        Base results directory; trees are expected at
-        ``results_dir/consensus_analysis/<junction_name>/core_blocks_aln.newick``.
+        Base results directory; files are expected at
+        ``results_dir/consensus_analysis/<junction_name>/core_blocks_aln.newick`` (tree)
+        or ``results_dir/consensus_analysis/<junction_name>/core_blocks_aln.fa`` (alignment).
     save_path : str or Path or None
         If provided, save the resulting DataFrame as a CSV to this path.
     load_path : str or Path or None
         If provided, load distances from this CSV instead of recomputing.
+    mode : str
+        ``"tree"``      — patristic distances from the Newick tree (default).
+        ``"alignment"`` — relative Hamming distances from the FASTA alignment,
+                          gap positions (``-``) ignored in both sequences of each pair.
 
     Returns
     -------
@@ -1239,26 +1319,62 @@ def collect_all_pairwise_distances(junction_names, results_dir,
         return df
 
     results_dir = Path(results_dir)
-    rows = []
+    all_jnames = []
+    all_dists = []
+    all_iso1 = []
+    all_iso2 = []
     skipped = []
 
     for jname in junction_names:
-        tree_path = results_dir / "consensus_analysis" / jname / "core_blocks_aln.newick"
-        if not tree_path.exists():
+        if mode == "tree":
+            target_path = results_dir / "consensus_analysis" / jname / "core_blocks_aln.newick"
+        else:
+            target_path = results_dir / "consensus_analysis" / jname / "core_blocks_aln.fa"
+
+        if not target_path.exists():
             skipped.append(jname)
             continue
+
         try:
-            dists = compute_pairwise_distances(str(tree_path))
-            for d in dists:
-                rows.append({"junction_name": jname, "distance": d})
+            if mode == "tree":
+                tree = Phylo.read(str(target_path), "newick")
+                tips = tree.get_terminals()
+                names = [t.name for t in tips]
+                dists = np.array([tree.distance(t1, t2) for t1, t2 in combinations(tips, 2)])
+                n1 = [names[i] for i, j in combinations(range(len(names)), 2)]
+                n2 = [names[j] for i, j in combinations(range(len(names)), 2)]
+            else:
+                records = list(SeqIO.parse(str(target_path), "fasta"))
+                names = [r.id for r in records]
+                arr = np.array([list(str(r.seq).upper()) for r in records])
+                n = len(names)
+                iu, ju = np.triu_indices(n, k=1)
+                _, dists = avg_pairwise_distance(arr)
+                # iu/ju from avg_pairwise_distance may be masked; recompute to stay in sync
+                valid = np.isin(arr, list("ACGT"))
+                pair_valid = (valid[:, None, :] & valid[None, :, :]).sum(axis=2)
+                mask = pair_valid[iu, ju] > 0
+                n1 = [names[i] for i, m in zip(iu, mask) if m]
+                n2 = [names[j] for j, m in zip(ju, mask) if m]
+
+            all_jnames.append(np.full(len(dists), jname))
+            all_dists.append(dists)
+            all_iso1.extend(n1)
+            all_iso2.extend(n2)
         except Exception as e:
             print(f"  {jname}: {e}")
             skipped.append(jname)
+        print(f"Junction {jname} successfully processed.")
 
     if skipped:
-        print(f"Skipped {len(skipped)} junctions (tree not found or error).")
+        print(f"Skipped {len(skipped)} junctions (file not found or error).")
 
-    df = pd.DataFrame(rows, columns=["junction_name", "distance"])
+    df = pd.DataFrame({
+        "junction_name": np.concatenate(all_jnames) if all_jnames else [],
+        "isolate_1": all_iso1,
+        "isolate_2": all_iso2,
+        "distance": np.concatenate(all_dists) if all_dists else [],
+    })
 
     if save_path is not None:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1266,4 +1382,103 @@ def collect_all_pairwise_distances(junction_names, results_dir,
         print(f"Saved pairwise distances to {save_path}.")
 
     return df
+
+
+def fitch_parsimony_steps_per_cluster(cluster_df, tree_path, junction_col="junction_name", save_path=None):
+    """
+    Count certain parsimonious gains per cluster for each junction using
+    bottom-up multi-state Fitch only.
+
+    A gain of cluster c is counted on edge parent -> child if:
+        c not in Fitch_set(parent) and c in Fitch_set(child)
+
+    This keeps ambiguity unresolved and only counts gains that are supported
+    without forcing a specific ancestral reconstruction.
+    """
+    full_tree = Phylo.read(tree_path, "newick")
+    full_tree_tips = {tip.name for tip in full_tree.get_terminals()}
+
+    meta_cols = {junction_col, "n_clusters", "n_isolates"}
+    isolate_cols = [c for c in cluster_df.columns if c not in meta_cols]
+    isolate_cols = [c for c in isolate_cols if c in full_tree_tips]
+
+    rows = []
+
+    for _, row in cluster_df.iterrows():
+        junction_name = row[junction_col]
+        n_isolates = int(row["n_isolates"])
+        n_clusters = int(row["n_clusters"])
+
+        iso_to_cluster = {
+            iso: int(row[iso])
+            for iso in isolate_cols
+            if pd.notna(row[iso])
+        }
+
+        present_isolates = set(iso_to_cluster.keys())
+        if len(present_isolates) == 0 or n_clusters == 0:
+            continue
+
+        observed_clusters = sorted(set(iso_to_cluster.values()))
+
+        tree = copy.deepcopy(full_tree)
+        for tip in list(tree.get_terminals()):
+            if tip.name not in present_isolates:
+                tree.prune(tip)
+
+        parent_map = {}
+        for clade in tree.find_clades(order="preorder"):
+            for child in clade.clades:
+                parent_map[child] = clade
+
+        # Bottom-up Fitch sets
+        state_sets = {}
+        for clade in tree.find_clades(order="postorder"):
+            if clade.is_terminal():
+                state_sets[clade] = {iso_to_cluster[clade.name]}
+            else:
+                child_sets = [state_sets[child] for child in clade.clades]
+                inter = set.intersection(*child_sets)
+                state_sets[clade] = inter if inter else set.union(*child_sets)
+
+        # Count certain gains only
+        cluster_steps = {cl: 0 for cl in observed_clusters}
+
+        for clade in tree.find_clades(order="level"):
+            if clade is tree.root:
+                continue
+
+            parent = parent_map[clade]
+            parent_state = state_sets[parent]
+            child_state = state_sets[clade]
+
+            for cl in child_state:
+                if cl not in parent_state:
+                    cluster_steps[cl] += 1
+
+        cluster_sizes = {}
+        for cl in observed_clusters:
+            cluster_sizes[cl] = sum(1 for c in iso_to_cluster.values() if c == cl)
+
+        for cluster_id in observed_clusters:
+            rows.append({
+                "junction_name": junction_name,
+                "n_isolates": n_isolates,
+                "n_clusters": n_clusters,
+                "cluster_id": cluster_id,
+                "n_isolates_in_cluster": cluster_sizes[cluster_id],
+                "n_parsimony_steps": cluster_steps[cluster_id],
+            })
+
+    result = pd.DataFrame(
+        rows,
+        columns=["junction_name", "n_isolates", "n_clusters", "cluster_id", "n_isolates_in_cluster", "n_parsimony_steps"]
+    )
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        result.to_csv(save_path, index=False)
+        print(f"Saved parsimony steps to {save_path}")
+
+    return result
 

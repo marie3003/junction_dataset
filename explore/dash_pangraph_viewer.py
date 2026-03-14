@@ -1,7 +1,7 @@
 import copy
 import random
 
-from dash import Dash, dcc, html, Input, Output, Patch  # CHANGED: added Patch
+from dash import Dash, dcc, html, Input, Output, Patch, State, ctx
 
 from pathlib import Path
 import sys
@@ -126,76 +126,75 @@ def make_junction_dash_app(
     """
     Creates a Dash app showing the pangraph with annotation toggles.
     """
-    # 1. Build a base figure with colored blocks (no annotations yet)
-    base_fig, y_labels, max_x, inversion_rects = plot_pangraph_base_for_dash(
-        pan=pan,
-        show_consensus=True,
-        consensus_paths=consensus_paths_plotting,
-        assignments=assignment_df_plotting,
-        order=order,
-        cluster_map=cluster_map_core,
-        add_cluster_annotation=True,
-        title=title,
-        grey_mode=False,  # Start with colored blocks
-    )
+    def _build_fig(show_consensus):
+        fig, yl, mx, inv_rects = plot_pangraph_base_for_dash(
+            pan=pan,
+            show_consensus=show_consensus,
+            consensus_paths=consensus_paths_plotting,
+            assignments=assignment_df_plotting,
+            order=order,
+            cluster_map=cluster_map_core,
+            add_cluster_annotation=True,
+            title=title,
+            grey_mode=False,
+        )
+        fig = add_annotations_for_dash(
+            fig=fig,
+            y_labels=yl,
+            show_mges_annotations=True,
+            show_int_rec_annotations=True,
+            show_trna_annotations=show_trna,
+            show_cds_annotations=True,
+            mges_gff_path=mges_gff_path,
+            annotations_gff_path=annotations_gff_path,
+            annotation_alpha=0.70,
+            cds_annotation_alpha=0.30,
+            show_indels=show_indels,
+            indels_base_path=indels_base_path,
+            junction_name=junction_name,
+            consensus_paths=consensus_paths_plotting,
+            inversion_rects=inv_rects,
+            max_x=mx,
+        )
+        fig.update_layout(
+            uirevision="junction-viewer",
+            autosize=False,
+            height=5000,
+            width=1800,
+            margin=dict(l=10, r=10, t=140, b=10),
+        )
+        return fig
 
-    # 2. Add all annotation traces to the figure (they will be hidden by default)
-    base_fig = add_annotations_for_dash(
-        fig=base_fig,
-        y_labels=y_labels,
-        show_mges_annotations=True,
-        show_int_rec_annotations=True,
-        show_trna_annotations=show_trna,
-        show_cds_annotations=True,
-        mges_gff_path=mges_gff_path,
-        annotations_gff_path=annotations_gff_path,
-        annotation_alpha=0.70,
-        cds_annotation_alpha=0.30,
-        show_indels=show_indels,
-        indels_base_path=indels_base_path,
-        junction_name=junction_name,
-        consensus_paths=consensus_paths_plotting,
-        inversion_rects=inversion_rects,
-        max_x=max_x,
-    )
+    # Pre-build both figures
+    base_fig_consensus = _build_fig(show_consensus=True)
+    base_fig_tree = _build_fig(show_consensus=False)
+    base_fig = base_fig_consensus  # default
 
-    base_fig.update_layout(
-        uirevision="junction-viewer",
-        autosize=False,
-        height=5000,
-        width=1800,
-        margin=dict(l=10, r=10, t=60, b=10),
-    )
-
-    groups, block_colors_colored, block_colors_grey = _compute_block_colors_for_figure(base_fig, pan)
-
-    # Store original hover templates for blocks to be able to restore them
-    original_hovertemplates = [base_fig.data[tidx].hovertemplate for tidx in groups["blocks"]]
-
-    # Store original hover templates for annotations
-    anno_indices = groups["mges"] + groups["intrec"] + groups["cds"] + groups["trna"]
-    original_anno_hovertemplates = {tidx: base_fig.data[tidx].hovertemplate for tidx in anno_indices}
-
-    # Store original hover templates for indels
-    indel_indices = groups["insertions"] + groups["deletions"] + groups["inversions"] + groups["translocations"]
-    original_indel_hovertemplates = {tidx: base_fig.data[tidx].hovertemplate for tidx in indel_indices}
-
-    # Build lookup: block_id -> set of trace indices for highlighting
-    block_id_to_traces = {}
-    for tidx in groups["blocks"]:
-        tr = base_fig.data[tidx]
-        for row in tr.customdata:
-            bid_str = str(row[3])
-            block_id_to_traces.setdefault(bid_str, set()).add(tidx)
-
-    # Store original line colors/widths for block traces to restore when search is cleared
-    original_block_lines = {}
-    for tidx in groups["blocks"]:
-        tr = base_fig.data[tidx]
-        original_block_lines[tidx] = {
-            "color": tr.marker.line.color,
-            "width": tr.marker.line.width,
+    def _precompute(fig):
+        grps, colored, grey = _compute_block_colors_for_figure(fig, pan)
+        orig_hover = [fig.data[tidx].hovertemplate for tidx in grps["blocks"]]
+        anno_idx = grps["mges"] + grps["intrec"] + grps["cds"] + grps["trna"]
+        orig_anno_hover = {tidx: fig.data[tidx].hovertemplate for tidx in anno_idx}
+        indel_idx = grps["insertions"] + grps["deletions"] + grps["inversions"] + grps["translocations"]
+        orig_indel_hover = {tidx: fig.data[tidx].hovertemplate for tidx in indel_idx}
+        bid_to_traces = {}
+        for tidx in grps["blocks"]:
+            for row in fig.data[tidx].customdata:
+                bid_str = str(row[3])
+                bid_to_traces.setdefault(bid_str, set()).add(tidx)
+        orig_lines = {
+            tidx: {"color": fig.data[tidx].marker.line.color, "width": fig.data[tidx].marker.line.width}
+            for tidx in grps["blocks"]
         }
+        return grps, colored, grey, orig_hover, anno_idx, orig_anno_hover, indel_idx, orig_indel_hover, bid_to_traces, orig_lines
+
+    precomputed_consensus = _precompute(base_fig_consensus)
+    precomputed_tree = _precompute(base_fig_tree)
+
+    # unpack defaults (consensus view)
+    groups, block_colors_colored, block_colors_grey, original_hovertemplates, \
+        anno_indices, original_anno_hovertemplates, indel_indices, \
+        original_indel_hovertemplates, block_id_to_traces, original_block_lines = precomputed_consensus
 
     app = Dash(__name__)
     app.layout = html.Div(
@@ -219,15 +218,16 @@ def make_junction_dash_app(
                         persistence=True,
                         persistence_type="memory",
                     ),
-                    html.Div("Hover options:", style={"fontWeight": "bold", "marginLeft": "20px", "whiteSpace": "nowrap"}),
+                    html.Div("Options:", style={"fontWeight": "bold", "marginLeft": "20px", "whiteSpace": "nowrap"}),
                     dcc.Checklist(
                         id="hover-toggle",
                         options=[
                             {"label": "Disable block hover", "value": "disable_block_hover"},
                             {"label": "Disable annotation hover", "value": "disable_anno_hover"},
                             {"label": "Disable indel hover", "value": "disable_indel_hover"},
+                            {"label": "Show consensus", "value": "show_consensus"},
                         ],
-                        value=[],
+                        value=["show_consensus"],
                         inline=True,
                         persistence=True,
                         persistence_type="memory",
@@ -249,27 +249,58 @@ def make_junction_dash_app(
         ],
     )
 
+    app.layout.children.insert(0, dcc.Store(id="consensus-store", data=True))
+
     @app.callback(
         Output("graph", "figure"),
         Output("search-count", "children"),
+        Output("consensus-store", "data"),
         Input("anno-toggle", "value"),
         Input("hover-toggle", "value"),
         Input("block-search", "value"),
+        State("consensus-store", "data"),
     )
-    def update_figure(selected_annos, selected_options, search_query):
+    def update_figure(selected_annos, selected_options, search_query, prev_consensus):
         selected_annos = set(selected_annos or [])
         selected_options = set(selected_options or [])
         any_on = len(selected_annos) > 0
-        # Only turn blocks grey for non-indel annotations
         non_indel_annos_on = bool(selected_annos - {"indels"})
 
-        # Determine which traces to highlight based on block ID search
+        use_consensus = "show_consensus" in selected_options
+        consensus_changed = use_consensus != prev_consensus
+
+        if use_consensus:
+            (groups, block_colors_colored, block_colors_grey, original_hovertemplates,
+             anno_indices, original_anno_hovertemplates, indel_indices,
+             original_indel_hovertemplates, block_id_to_traces, original_block_lines) = precomputed_consensus
+        else:
+            (groups, block_colors_colored, block_colors_grey, original_hovertemplates,
+             anno_indices, original_anno_hovertemplates, indel_indices,
+             original_indel_hovertemplates, block_id_to_traces, original_block_lines) = precomputed_tree
+
         search_query = (search_query or "").strip()
         highlighted_traces = set()
         if search_query:
             for bid, tidxs in block_id_to_traces.items():
                 if search_query in bid:
                     highlighted_traces.update(tidxs)
+
+        # When consensus mode switches, build a full figure copy with all states applied
+        if consensus_changed:
+            import copy as _copy
+            active_fig = _copy.deepcopy(base_fig_consensus if use_consensus else base_fig_tree)
+            colors = block_colors_grey if non_indel_annos_on else block_colors_colored
+            for j, tidx in enumerate(groups["blocks"]):
+                active_fig.data[tidx].marker.color = colors[j]
+            for tidx in groups["mges"]: active_fig.data[tidx].visible = "mges" in selected_annos
+            for tidx in groups["intrec"]: active_fig.data[tidx].visible = "intrec" in selected_annos
+            for tidx in groups["cds"]: active_fig.data[tidx].visible = "cds" in selected_annos
+            for tidx in groups["trna"]: active_fig.data[tidx].visible = "trna" in selected_annos
+            for tidx in groups["insertions"] + groups["deletions"] + groups["inversions"] + groups["translocations"]:
+                active_fig.data[tidx].visible = "indels" in selected_annos
+            active_fig.layout.barmode = "overlay" if any_on else "stack"
+            search_msg = f"{len(highlighted_traces)} traces matched" if search_query else ""
+            return active_fig, search_msg, use_consensus
 
         patch = Patch()
 
@@ -345,7 +376,7 @@ def make_junction_dash_app(
         if search_query:
             search_msg = f"{len(highlighted_traces)} traces matched"
 
-        return patch, search_msg
+        return patch, search_msg, use_consensus
 
     return app
 
@@ -353,12 +384,18 @@ def make_junction_dash_app(
 if __name__ == "__main__":
     
     #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # consensus definition very conservative here, investigate
+    #junction_name = "ITEMFVYTUE_r__JVDYVQZUBR_r"
+    #junction_name = "MUWGUWCDTU_r__UTYAQKFQDH_r"
     #junction_name = "PLTCZQCVRD_f__RYYAQMEJGY_f"
     #junction_name = "NOAJDCSIVA_f__NZXBIFMPMA_r"
     #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
     #junction_name = "GPKQYOCEJI_r__NKVSUZGURN_f"
-    junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f"
+    #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f" # --> look up again, its the prophage one that would get two clusters
+    junction_name = "AFFODHUCNW_r__VRDEBAMMSO_r"
     #junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
+    #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # --> wild junctions with 12 clusters
+    #junction_name = "JPYVXRYZLU_f__UUBXUCAQCF_f"
+    #junction_name = "NPQDSPAYII_f__VJEJDHVKTM_f"
     #junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
     #junction_name = "ATPWUNKKID_f__KKPYPKGMXA_f"
     #junction_name = 'KGWWUZQEKD_r__UXLELLOQVR_r'

@@ -17,9 +17,19 @@ from junction_analysis.helpers import write_isolate_fasta, repo_root
 
 
 # create block fasta files
-def create_block_msas(example_junction): # 2 min 14
-
+def create_block_msas(example_junction, only_core=False): # 2 min 14
+    """
+    Parameters
+    ----------
+    example_junction : str
+    only_core : bool
+        If True, only write and align core blocks. Default: False.
+    """
     example_pangraph = pp.Pangraph.from_json(f"../results/junction_pangraphs/{example_junction}.json")
+
+    if only_core:
+        blockstats_df = example_pangraph.to_blockstats_df()
+        core_ids = set(blockstats_df[blockstats_df["core"] == True].index)
 
     parent_dir = Path(f"../results/block_fastas/{example_junction}")
     parent_dir.mkdir(parents=True, exist_ok=True)
@@ -28,12 +38,14 @@ def create_block_msas(example_junction): # 2 min 14
     aligned_dir.mkdir(parents=True, exist_ok=True)
 
     for block in example_pangraph.blocks:
+        if only_core and block.id not in core_ids:
+            continue
         output_path = parent_dir / f"block_{block.id}_sequences.fa"
         write_isolate_fasta(example_pangraph, block, output_path)
 
     for fasta_file in parent_dir.glob("block_*_sequences.fa"):
         aln_file = aligned_dir / fasta_file.name.replace("_sequences.fa", "_aln.fa")
-        
+
         # Run MAFFT quietly (you can remove '--quiet' if you want verbose output)
         subprocess.run(
             ["mafft", "--quiet", str(fasta_file)],

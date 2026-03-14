@@ -1,4 +1,5 @@
 import scipy.cluster.hierarchy as sch
+import pypangraph as pp
 from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 from Bio import Phylo, SeqIO, Align, AlignIO
@@ -339,6 +340,104 @@ def snp_positions(alignment_file, fmt="fasta"):
 
     return snps
 
+def snp_gap_lengths(alignment_file, fmt="fasta"):
+    """
+    Calculate the gap lengths between consecutive SNP positions in an alignment.
+
+    Parameters
+    ----------
+    alignment_file : str or Path
+    fmt : str
+        Alignment format. Default: "fasta".
+
+    Returns
+    -------
+    dict with keys:
+        snp_positions  : list of int  — column indices of SNP positions
+        gap_lengths    : list of int  — distances between consecutive SNPs
+                         (len = len(snp_positions) - 1)
+        aln_length     : int          — total alignment length
+    """
+    alignment = AlignIO.read(alignment_file, fmt)
+    aln_length = alignment.get_alignment_length()
+
+    snps = []
+    for i in range(aln_length):
+        column = set(alignment[:, i]) - {"-"}
+        if len(column) > 1:
+            snps.append(i)
+
+    gaps = []
+    if snps:
+        gaps.append(snps[0])                                          # before first SNP
+        gaps.extend(snps[i + 1] - snps[i] for i in range(len(snps) - 1))  # between SNPs
+        gaps.append(aln_length - 1 - snps[-1])                       # after last SNP
+
+    return {
+        "snp_positions": snps,
+        "gap_lengths": gaps,
+        "aln_length": aln_length,
+    }
+
+
+def core_block_snp_gaps(results_dir: str, save_path: str = None) -> pd.DataFrame:
+    """
+    For each junction in results/block_alignments, identify core blocks via the
+    pangraph, then compute SNP positions and inter-SNP gap lengths for each.
+
+    Parameters
+    ----------
+    results_dir : str or Path
+        Base results directory. Expects:
+          - ``results_dir/block_alignments/<junction>/block_<id>_aln.fa``
+          - ``results_dir/junction_pangraphs/<junction>.json``
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        junction_name, block_id, aln_length, snp_positions, gap_lengths
+    One row per core block per junction.
+    """
+    results_dir = Path(results_dir)
+    aln_base = results_dir / "block_alignments"
+    pangraph_base = results_dir / "junction_pangraphs"
+
+    rows = []
+    for junction_dir in sorted(aln_base.iterdir()):
+        if not junction_dir.is_dir():
+            continue
+        jname = junction_dir.name
+
+        pangraph_path = pangraph_base / f"{jname}.json"
+        if not pangraph_path.exists():
+            continue
+
+        pangraph = pp.Pangraph.from_json(str(pangraph_path))
+        blockstats = pangraph.to_blockstats_df()
+        core_ids = set(blockstats[blockstats["core"] == True].index.astype(str))
+
+        for aln_file in sorted(junction_dir.glob("block_*_aln.fa")):
+            # extract block id from filename: block_<id>_aln.fa
+            block_id = aln_file.stem.removeprefix("block_").removesuffix("_aln")
+            if block_id not in core_ids:
+                continue
+            result = snp_gap_lengths(str(aln_file))
+            rows.append(dict(
+                junction_name=jname,
+                block_id=block_id,
+                aln_length=result["aln_length"],
+                snp_positions=result["snp_positions"],
+                gap_lengths=result["gap_lengths"],
+            ))
+        print(f"Successfully processed junction {junction_dir}")
+
+    df = pd.DataFrame(rows)
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(save_path, index=False)
+    return df
+
+
 def get_block_length(alignment_file, fmt="fasta"):
     alignment = AlignIO.read(alignment_file, fmt)
     return alignment.get_alignment_length()
@@ -456,14 +555,31 @@ def read_gff3_trna(gff_path: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def count_trna_per_junction(annotations_dir: str) -> pd.DataFrame:
+def count_trna_per_junction(
+    annotations_dir: str,
+    category_bins: list = None,
+    category_labels: list = None,
+) -> pd.DataFrame:
     """
     For each junction GFF file in annotations_dir, count the number of
     annotated tRNA and tmRNA entries.
 
     Returns a DataFrame with columns:
-        junction_name, n_tRNA, n_tmRNA, n_total
-    sorted by n_total descending.
+        junction_name, n_tRNA, n_tmRNA, n_total_trna
+    sorted by n_total_trna descending.
+
+    If `category_bins` is provided, also adds:
+        trna_cat : ordered categorical column based on n_total_trna
+
+    Parameters
+    ----------
+    annotations_dir : str
+    category_bins : list of numeric or None
+        Bin edges passed to pd.cut (e.g. [-1, 0, 9, 49, inf]).
+        The first edge should be below 0 so that 0 falls in the first bin.
+    category_labels : list of str or None
+        Labels for each bin. Must have length len(category_bins) - 1.
+        Defaults to string representations of the bin edges.
     """
     rows = []
     for gff_path in sorted(Path(annotations_dir).glob("*.gff")):
@@ -478,9 +594,14 @@ def count_trna_per_junction(annotations_dir: str) -> pd.DataFrame:
             junction_name=junction_name,
             n_tRNA=n_trna,
             n_tmRNA=n_tmrna,
-            n_total=n_trna + n_tmrna,
+            n_total_trna=n_trna + n_tmrna,
         ))
-    return pd.DataFrame(rows).sort_values("n_total", ascending=False).reset_index(drop=True)
+    df = pd.DataFrame(rows).sort_values("n_total_trna", ascending=False).reset_index(drop=True)
+
+    if category_bins is not None:
+        df["trna_cat"] = pd.cut(df["n_total_trna"], bins=category_bins, labels=category_labels)
+
+    return df
 
 
 def read_gff3_cds_products(gff_path: str) -> pd.DataFrame:
@@ -520,3 +641,351 @@ def read_gff3_cds_products(gff_path: str) -> pd.DataFrame:
             ))
 
     return pd.DataFrame(rows)
+
+
+
+def compute_within_between_cluster_distances(
+    cluster_df: pd.DataFrame,
+    dist_df: pd.DataFrame,
+    save_path: str = None
+) -> pd.DataFrame:
+    """
+    For each junction, compute the average pairwise distance within clusters
+    and between clusters.
+
+    Parameters
+    ----------
+    cluster_df : pd.DataFrame
+        Output of cluster_map_to_dataframe(). Columns: junction_name, n_clusters,
+        n_isolates, then one column per isolate with cluster ID (float) or NaN.
+    dist_df : pd.DataFrame
+        DataFrame with columns: junction_name, isolate_1, isolate_2, distance.
+    save_path : str or None
+        Optional path to save the resulting table as CSV.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        junction_name, n_clusters, mean_within_dist, mean_between_dist
+    """
+    meta_cols = {"junction_name", "n_clusters", "n_isolates"}
+    isolate_cols = [c for c in cluster_df.columns if c not in meta_cols]
+
+    rows = []
+
+    for _, jrow in cluster_df.iterrows():
+        jname = jrow["junction_name"]
+
+        # isolate -> cluster mapping, skipping isolates not present in this junction
+        iso_to_cl = {
+            iso: int(jrow[iso])
+            for iso in isolate_cols
+            if pd.notna(jrow[iso])
+        }
+
+        jdist = dist_df[dist_df["junction_name"] == jname].copy()
+        if jdist.empty:
+            continue
+
+        # keep only pairs where both isolates are present in this junction
+        jdist = jdist[
+            jdist["isolate_1"].isin(iso_to_cl) &
+            jdist["isolate_2"].isin(iso_to_cl)
+        ].copy()
+
+        if jdist.empty:
+            continue
+
+        # assign cluster IDs
+        jdist["cl_1"] = jdist["isolate_1"].map(iso_to_cl)
+        jdist["cl_2"] = jdist["isolate_2"].map(iso_to_cl)
+
+        within = jdist[jdist["cl_1"] == jdist["cl_2"]]
+        between = jdist[jdist["cl_1"] != jdist["cl_2"]]
+
+        rows.append({
+            "junction_name": jname,
+            "n_clusters": int(jrow["n_clusters"]),
+            "mean_within_dist": within["distance"].mean() if not within.empty else np.nan,
+            "mean_between_dist": between["distance"].mean() if not between.empty else np.nan,
+        })
+
+    result = pd.DataFrame(rows)
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        result.to_csv(save_path, index=False)
+
+    return result
+
+
+
+def silhouette_score_from_ab(a: float, b: float) -> float:
+    """
+    Compute silhouette score from pre-computed a and b values.
+
+    Parameters
+    ----------
+    a : float
+        Mean intra-cluster distance.
+    b : float
+        Mean nearest-cluster distance.
+
+    Returns
+    -------
+    float : silhouette score (b - a) / max(a, b), or NaN if inputs are NaN.
+    """
+    # only one cluster (no between-cluster distance) → silhouette is 0
+    if np.isnan(b):
+        return 0.0
+    # within is NaN (e.g. all clusters are singletons) → undefined
+    if np.isnan(a):
+        return np.nan
+    denom = max(a, b)
+    if denom == 0:
+        return 0.0
+    return (b - a) / denom
+
+
+def add_silhouette_scores(
+    df: pd.DataFrame,
+    within_col: str = "mean_within_dist",
+    between_col: str = "mean_between_dist",
+    is_similarity: bool = False,
+    result_col: str = "silhouette_score",
+) -> pd.DataFrame:
+    """
+    Add a silhouette score column to a DataFrame.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    within_col : str
+        Column to use as a (intra-cluster distance/similarity).
+    between_col : str
+        Column to use as b (inter-cluster distance/similarity).
+    is_similarity : bool
+        If True, converts similarity to distance via 1 - value before scoring.
+    result_col : str
+        Name of the output column.
+
+    Returns
+    -------
+    pd.DataFrame with added silhouette score column.
+    """
+    result = df.copy()
+    a = result[within_col]
+    b = result[between_col]
+    if is_similarity:
+        a = 1 - a
+        b = 1 - b
+    result[result_col] = [silhouette_score_from_ab(ai, bi) for ai, bi in zip(a, b)]
+    return result
+
+
+def summarize_clustering_thresholds(results_dir: str, save_path: str = None) -> pd.DataFrame:
+    """
+    Read all cluster_maps_*.csv files in results_dir/consensus_analysis/, extract
+    the branch-length threshold from the filename, and compute the total number of
+    additional clusters (n_clusters summed over all junctions minus the number of
+    junctions, since every junction has at least 1 cluster).
+
+    Parameters
+    ----------
+    results_dir : str or Path
+    save_path : str or None
+
+    Returns
+    -------
+    pd.DataFrame with columns: threshold, n_additional_clusters
+    sorted by threshold ascending.
+    """
+    rows = []
+    pattern = re.compile(r"cluster_maps_(\d+)_(\d+)\.csv")
+
+    for csv_path in sorted((Path(results_dir) / "consensus_analysis").glob("cluster_maps_*.csv")):
+        m = pattern.match(csv_path.name)
+        if not m:
+            continue
+        threshold = float(f"{m.group(1)}.{m.group(2)}")
+        df = pd.read_csv(csv_path, usecols=["n_clusters"])
+        n_additional = int(df["n_clusters"].sum()) - len(df)
+        rows.append({"threshold": threshold, "n_additional_clusters": n_additional})
+
+    result = pd.DataFrame(rows).sort_values("threshold").reset_index(drop=True)
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        result.to_csv(save_path, index=False)
+
+    return result
+
+
+def extract_biosample_ids(gbk_dir: str, plasmids_dir: str) -> pd.DataFrame:
+    """
+    Extract BioSample IDs for each isolate from chromosome and plasmid GBK files.
+
+    Scans:
+      - `gbk_dir`      : flat folder of <isolate_id>.gbk files (chromosomes)
+      - `plasmids_dir` : folder with one subfolder per isolate (<isolate_id>/<plasmid_id>.gbk)
+
+    Returns a DataFrame with columns:
+        isolate_id, accession, type (chromosome/plasmid), biosample
+    """
+    rows = []
+
+    def _parse_biosample(gbk_path: str) -> str | None:
+        with open(gbk_path) as fh:
+            for line in fh:
+                m = re.match(r'\s+BioSample:\s+(\S+)', line)
+                if m:
+                    return m.group(1)
+                # stop searching after KEYWORDS line (BioSample is always before it)
+                if line.startswith("KEYWORDS"):
+                    break
+        return None
+
+    # Chromosomes
+    for gbk_path in sorted(Path(gbk_dir).glob("*.gbk")):
+        isolate_id = gbk_path.stem
+        biosample = _parse_biosample(str(gbk_path))
+        rows.append(dict(isolate_id=isolate_id, accession=isolate_id, type="chromosome", biosample=biosample))
+
+    # Plasmids
+    for isolate_dir in sorted(Path(plasmids_dir).iterdir()):
+        if not isolate_dir.is_dir():
+            continue
+        isolate_id = isolate_dir.name
+        for gbk_path in sorted(isolate_dir.glob("*.gbk")):
+            accession = gbk_path.stem
+            biosample = _parse_biosample(str(gbk_path))
+            rows.append(dict(isolate_id=isolate_id, accession=accession, type="plasmid", biosample=biosample))
+
+    return pd.DataFrame(rows)
+
+
+def get_core_alignment_lengths(
+    consensus_analysis_dir: str,
+    results_dir: str = None,
+    save_path: str = None,
+    block_save_path: str = None,
+) -> tuple:
+    """
+    For each junction in `consensus_analysis_dir`, read core_blocks_aln.fa
+    and record the alignment length with and without gaps.
+
+    If `results_dir` is provided, also iterates over
+    ``results_dir/block_alignments/<junction>/block_<id>_aln.fa`` and returns
+    per-block lengths for core blocks (identified via the pangraph).
+
+    Parameters
+    ----------
+    consensus_analysis_dir : str
+    results_dir : str or None
+        Base results directory containing block_alignments/ and junction_pangraphs/.
+    save_path : str or None
+        If provided, save the junction-level DataFrame as CSV.
+    block_save_path : str or None
+        If provided, save the per-block DataFrame as CSV.
+
+    Returns
+    -------
+    junction_df : pd.DataFrame
+        Columns: junction_name, aln_length, aln_length_nogap
+    block_df : pd.DataFrame or None
+        Columns: junction_name, block_id, aln_length, aln_length_nogap
+        (only if results_dir is provided)
+    """
+    rows = []
+    for aln_path in sorted(Path(consensus_analysis_dir).glob("*/core_blocks_aln.fa")):
+        junction_name = aln_path.parent.name
+        seqs = [str(r.seq) for r in SeqIO.parse(str(aln_path), "fasta")]
+        aln_length = len(seqs[0])
+        aln_length_nogap = sum(
+            1 for i in range(aln_length)
+            if all(s[i] != "-" for s in seqs)
+        )
+        rows.append(dict(
+            junction_name=junction_name,
+            aln_length=aln_length,
+            aln_length_nogap=aln_length_nogap,
+        ))
+    junction_df = pd.DataFrame(rows).sort_values("junction_name").reset_index(drop=True)
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        junction_df.to_csv(save_path, index=False)
+
+    block_df = None
+    if results_dir is not None:
+        results_dir = Path(results_dir)
+        aln_base = results_dir / "block_alignments"
+        pangraph_base = results_dir / "junction_pangraphs"
+
+        block_rows = []
+        for junction_dir in sorted(aln_base.iterdir()):
+            if not junction_dir.is_dir():
+                continue
+            jname = junction_dir.name
+
+            pangraph_path = pangraph_base / f"{jname}.json"
+            if not pangraph_path.exists():
+                continue
+
+            pangraph = pp.Pangraph.from_json(str(pangraph_path))
+            blockstats = pangraph.to_blockstats_df()
+            core_ids = set(blockstats[blockstats["core"] == True].index.astype(str))
+
+            for aln_file in sorted(junction_dir.glob("block_*_aln.fa")):
+                block_id = aln_file.stem.removeprefix("block_").removesuffix("_aln")
+                if block_id not in core_ids:
+                    continue
+                seqs = [str(r.seq) for r in SeqIO.parse(str(aln_file), "fasta")]
+                aln_length = len(seqs[0])
+                aln_length_nogap = sum(
+                    1 for i in range(aln_length)
+                    if all(s[i] != "-" for s in seqs)
+                )
+                block_rows.append(dict(
+                    junction_name=jname,
+                    block_id=block_id,
+                    aln_length=aln_length,
+                    aln_length_nogap=aln_length_nogap,
+                ))
+
+        block_df = pd.DataFrame(block_rows).sort_values(["junction_name", "block_id"]).reset_index(drop=True)
+        if block_save_path is not None:
+            Path(block_save_path).parent.mkdir(parents=True, exist_ok=True)
+            block_df.to_csv(block_save_path, index=False)
+
+    return junction_df, block_df
+
+
+def load_all_block_alignment_stats(results_dir: str, save_path: str = None) -> pd.DataFrame:
+    """
+    Load avg_pairwise_dist (and other alignment stats) for every block across all
+    junctions by reading the per-junction alignment stats CSVs:
+      results_dir/block_alignments/<junction>/<junction>_alignment_stats.csv
+
+    Returns
+    -------
+    pd.DataFrame with all columns from the stats CSVs plus a junction_name column.
+    """
+    results_dir = Path(results_dir)
+    aln_base = results_dir / "block_alignments"
+
+    dfs = []
+    for junction_dir in sorted(aln_base.iterdir()):
+        if not junction_dir.is_dir():
+            continue
+        csv_path = junction_dir / f"{junction_dir.name}_alignment_stats.csv"
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        df.insert(0, "junction_name", junction_dir.name)
+        dfs.append(df)
+
+    result = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        result.to_csv(save_path, index=False)
+    return result
