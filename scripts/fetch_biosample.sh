@@ -5,7 +5,7 @@ INPUT_FILE="${1:?give input file}"
 OUTPUT_FILE="${2:-biosample_summary.tsv}"
 
 INITIAL_BATCH_SIZE=100
-MAX_ROUNDS=4
+MAX_ROUNDS=10
 
 tmp_dir=$(mktemp -d)
 tmp_ids="$tmp_dir/ids.txt"
@@ -56,7 +56,7 @@ batch_query_file() {
             echo "Round $round: batch failed: $(basename "$chunk")" >&2
         fi
 
-        sleep 0.5
+        sleep $((RANDOM % 10 + 5))
     done
 }
 
@@ -65,13 +65,7 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
         break
     fi
 
-    case "$round" in
-        1) batch_size=$INITIAL_BATCH_SIZE ;;
-        2) batch_size=25 ;;
-        3) batch_size=5 ;;
-        4) batch_size=1 ;;
-        *) batch_size=1 ;;
-    esac
+    batch_size=$INITIAL_BATCH_SIZE
 
     batch_query_file "$tmp_remaining" "$batch_size" "$round"
 
@@ -89,7 +83,7 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
     found_count=$(wc -l < "$tmp_found_ids")
     echo "After round $round: found=$found_count remaining=$remaining_count" >&2
 
-    sleep 1
+    sleep $((RANDOM % 30 + 20))
 done
 
 # final lookup map

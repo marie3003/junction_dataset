@@ -649,25 +649,6 @@ def compute_within_between_cluster_distances(
     dist_df: pd.DataFrame,
     save_path: str = None
 ) -> pd.DataFrame:
-    """
-    For each junction, compute the average pairwise distance within clusters
-    and between clusters.
-
-    Parameters
-    ----------
-    cluster_df : pd.DataFrame
-        Output of cluster_map_to_dataframe(). Columns: junction_name, n_clusters,
-        n_isolates, then one column per isolate with cluster ID (float) or NaN.
-    dist_df : pd.DataFrame
-        DataFrame with columns: junction_name, isolate_1, isolate_2, distance.
-    save_path : str or None
-        Optional path to save the resulting table as CSV.
-
-    Returns
-    -------
-    pd.DataFrame with columns:
-        junction_name, n_clusters, mean_within_dist, mean_between_dist
-    """
     meta_cols = {"junction_name", "n_clusters", "n_isolates"}
     isolate_cols = [c for c in cluster_df.columns if c not in meta_cols]
 
@@ -675,19 +656,20 @@ def compute_within_between_cluster_distances(
 
     for _, jrow in cluster_df.iterrows():
         jname = jrow["junction_name"]
+        n_clusters = int(jrow["n_clusters"])
 
-        # isolate -> cluster mapping, skipping isolates not present in this junction
         iso_to_cl = {
             iso: int(jrow[iso])
             for iso in isolate_cols
             if pd.notna(jrow[iso])
         }
+        if not iso_to_cl:
+            continue
 
         jdist = dist_df[dist_df["junction_name"] == jname].copy()
         if jdist.empty:
             continue
 
-        # keep only pairs where both isolates are present in this junction
         jdist = jdist[
             jdist["isolate_1"].isin(iso_to_cl) &
             jdist["isolate_2"].isin(iso_to_cl)
@@ -696,19 +678,73 @@ def compute_within_between_cluster_distances(
         if jdist.empty:
             continue
 
-        # assign cluster IDs
-        jdist["cl_1"] = jdist["isolate_1"].map(iso_to_cl)
-        jdist["cl_2"] = jdist["isolate_2"].map(iso_to_cl)
+        dist_lookup = {}
+        for _, r in jdist.iterrows():
+            dist_lookup[(r["isolate_1"], r["isolate_2"])] = r["distance"]
+            dist_lookup[(r["isolate_2"], r["isolate_1"])] = r["distance"]
 
-        within = jdist[jdist["cl_1"] == jdist["cl_2"]]
-        between = jdist[jdist["cl_1"] != jdist["cl_2"]]
+        cl_to_isos = {}
+        for iso, cl in iso_to_cl.items():
+            cl_to_isos.setdefault(cl, []).append(iso)
 
-        rows.append({
-            "junction_name": jname,
-            "n_clusters": int(jrow["n_clusters"]),
-            "mean_within_dist": within["distance"].mean() if not within.empty else np.nan,
-            "mean_between_dist": between["distance"].mean() if not between.empty else np.nan,
-        })
+        for iso, cl in iso_to_cl.items():
+            same_cl = [o for o in cl_to_isos[cl] if o != iso]
+
+            if not same_cl:
+                rows.append({
+                    "junction_name": jname,
+                    "n_clusters": n_clusters,
+                    "isolate": iso,
+                    "cluster": cl,
+                    "a": np.nan,
+                    "b": np.nan,
+                    "silhouette": np.nan
+                })
+                continue
+
+            same_dists = [dist_lookup[(iso, o)] for o in same_cl if (iso, o) in dist_lookup]
+            a = np.mean(same_dists) if same_dists else np.nan
+
+            other_cls = [c for c in cl_to_isos if c != cl]
+            if not other_cls:
+                rows.append({
+                    "junction_name": jname,
+                    "n_clusters": n_clusters,
+                    "isolate": iso,
+                    "cluster": cl,
+                    "a": a,
+                    "b": np.nan,
+                    "silhouette": np.nan
+                })
+                continue
+
+            mean_dists = []
+            for other_cl in other_cls:
+                dists = [dist_lookup[(iso, o)] for o in cl_to_isos[other_cl] if (iso, o) in dist_lookup]
+                if dists:
+                    mean_dists.append(np.mean(dists))
+
+            b = min(mean_dists) if mean_dists else np.nan
+
+            if pd.notna(a) and pd.notna(b):
+                denom = max(a, b)
+                if denom > 0:
+                    s = (b - a) / denom
+                else:
+                    # all distances are zero → no cluster separation
+                    s = 0.0
+            else:
+                s = np.nan
+
+            rows.append({
+                "junction_name": jname,
+                "n_clusters": n_clusters,
+                "isolate": iso,
+                "cluster": cl,
+                "a": a,
+                "b": b,
+                "silhouette": s
+            })
 
     result = pd.DataFrame(rows)
 
@@ -717,7 +753,6 @@ def compute_within_between_cluster_distances(
         result.to_csv(save_path, index=False)
 
     return result
-
 
 
 def silhouette_score_from_ab(a: float, b: float) -> float:

@@ -142,23 +142,37 @@ def _deduplicate_path_dict(path_dict: dict, pangraph, duplicated_ids: set, rare_
     -------
     deduplicated_paths : dict[isolate -> Path(DeduplicatedNode,...)]
     freq               : dict[DeduplicatedNode -> int]
+    dedup_stats        : list[dict]
+        One dict per isolate with keys: isolate, n_blocks, n_ambiguous_blocks.
+        A block is counted as ambiguous when its context suffix count > 1,
+        i.e. two or more copies of the same duplicated block share the same
+        context anchor.
     """
     deduplicated_paths: dict = {}
     freq = Counter()
+    dedup_stats = []
 
     for isolate, path in path_dict.items():
         last_non_dup: str | None = None
         context_counts: dict[str, int] = {}
+        n_blocks = 0
+        n_duplicated = 0
+        n_ambiguous = 0
 
         dedup_nodes = []
         for idx, n in enumerate(path):
             block_nid = pangraph.paths[isolate].nodes[idx]
+            n_blocks += 1
             if n.id in duplicated_ids:
                 if last_non_dup is None:
                     raise ValueError("last_non_dup must not be None when encountering a duplicated node")
 
+                n_duplicated += 1
                 count = context_counts.get(n.id, 0) + 1
                 context_counts[n.id] = count
+
+                if count > 1:
+                    n_ambiguous += 1
 
                 context = f"{last_non_dup}_{count}"
                 dn = pu.DeduplicatedNode(n.id, n.strand, context, block_nid)
@@ -173,8 +187,9 @@ def _deduplicate_path_dict(path_dict: dict, pangraph, duplicated_ids: set, rare_
             freq[dn] += 1
 
         deduplicated_paths[isolate] = pu.Path(dedup_nodes)
+        dedup_stats.append(dict(isolate=isolate, n_blocks=n_blocks, n_duplicated_blocks=n_duplicated, n_ambiguous_blocks=n_ambiguous))
 
-    return deduplicated_paths, dict(freq)
+    return deduplicated_paths, dict(freq), dedup_stats
 
 
 def make_deduplicated_paths(pangraph, rare_context_thresh=0.1) -> dict:
@@ -195,7 +210,8 @@ def make_deduplicated_paths(pangraph, rare_context_thresh=0.1) -> dict:
     rare_ids = set(blockstats_df.loc[blockstats_df['count'] < rare_context_thresh_abs].index)
     invertible_ids = find_invertible_ids(path_dict)
 
-    return _deduplicate_path_dict(path_dict, pangraph, duplicated_ids, rare_ids, invertible_ids)
+    deduplicated_paths, freq, dedup_stats = _deduplicate_path_dict(path_dict, pangraph, duplicated_ids, rare_ids, invertible_ids)
+    return deduplicated_paths, freq, dedup_stats
 
 
 def remap_consensus_to_global_contexts(consensus_path, filtered_cluster_paths, path_dict_cluster_dedup, path_dict):
@@ -276,7 +292,8 @@ def rededuplicate_cluster_paths(path_dict_cluster: dict, pangraph, rare_context_
     duplicated_ids, rare_ids, invertible_ids = _compute_path_dict_stats(
         path_dict_cluster, rare_context_thresh
     )
-    return _deduplicate_path_dict(path_dict_cluster, pangraph, duplicated_ids, rare_ids, invertible_ids)
+    deduplicated_paths, freq, dedup_stats = _deduplicate_path_dict(path_dict_cluster, pangraph, duplicated_ids, rare_ids, invertible_ids)
+    return deduplicated_paths, freq, dedup_stats
 
 def count_edges(dedup_paths: dict) -> dict:
     """
@@ -807,6 +824,11 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
         junction_name, cluster_id, n_ambiguous, n_single_isolate,
         n_decided_loss, n_decided_gain.
         Only returned when ``consensus_criterium='core_genome_tree'``.
+    dedup_stats_df : pd.DataFrame
+        One row per (junction, dedup_step, isolate) with columns:
+        junction_name, dedup_step, isolate, n_blocks, n_ambiguous_blocks.
+        dedup_step is "global" for the full-dataset deduplication and
+        "cluster_<id>" for the per-cluster rededuplication.
     """
     # create deduplicated paths dict
     root = repo_root()
@@ -816,7 +838,11 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
 
     pangraph_path = results_dir / "junction_pangraphs" / f"{junction_name}.json"
     pangraph = pp.Pangraph.from_json(str(pangraph_path))
-    path_dict, block_freq = make_deduplicated_paths(pangraph)
+    path_dict, block_freq, global_dedup_stats = make_deduplicated_paths(pangraph)
+    for row in global_dedup_stats:
+        row["junction_name"] = junction_name
+        row["dedup_step"] = "global"
+    all_dedup_stats = list(global_dedup_stats)
 
     # create tree and do clustering based on core blocks
     blockstats_df = pangraph.to_blockstats_df()
@@ -891,7 +917,11 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
                 print(f"Cluster {cl}: all isolates filtered out by anchor fraction, skipping.")
                 continue
             path_dict_cluster = {iso: path_dict[iso] for iso in isolate_list}
-            path_dict_cluster_dedup, freq_cluster = rededuplicate_cluster_paths(path_dict_cluster, pangraph, rare_context_thresh=rare_context_thresh)
+            path_dict_cluster_dedup, freq_cluster, cluster_dedup_stats = rededuplicate_cluster_paths(path_dict_cluster, pangraph, rare_context_thresh=rare_context_thresh)
+            for row in cluster_dedup_stats:
+                row["junction_name"] = junction_name
+                row["dedup_step"] = f"cluster_{cl}"
+            all_dedup_stats.extend(cluster_dedup_stats)
 
             blocks, block2idx = build_block_index(path_dict_cluster_dedup, strand_sensitive=False)
             binary_encodings = encode_paths_binary(path_dict_cluster_dedup, block2idx, strand_sensitive=False)
@@ -967,9 +997,11 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
 
     if consensus_criterium == 'core_genome_tree':
         ambiguity_stats_df = pd.DataFrame(ambiguity_stats_rows, columns=["junction_name", "cluster_id", "n_isolates_in_cluster", "n_total_blocks", "n_ambiguous", "n_single_isolate", "n_decided_loss", "n_decided_gain", "avg_pairwise_dists"])
-        return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unique, ambiguity_stats_df
+        dedup_stats_df = pd.DataFrame(all_dedup_stats, columns=["junction_name", "dedup_step", "isolate", "n_blocks", "n_duplicated_blocks", "n_ambiguous_blocks"])
+        return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unique, ambiguity_stats_df, dedup_stats_df
 
-    return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting
+    dedup_stats_df = pd.DataFrame(all_dedup_stats, columns=["junction_name", "dedup_step", "isolate", "n_blocks", "n_duplicated_blocks", "n_ambiguous_blocks"])
+    return cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, dedup_stats_df
 
 
 def save_consensus_cache(path, cluster_map_core, consensus_paths_plotting, assignment_df_plotting):

@@ -257,10 +257,12 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         inversions:     dict of isolate -> list of pu.Path objects
         translocations: dict of isolate -> list of pu.Path objects
     """
-    insertions     = {}
-    deletions      = {}
-    inversions     = {}
-    translocations = {}
+    insertions            = {}
+    ambiguous_insertions  = {}
+    deletions             = {}
+    inversions            = {}
+    translocations        = {}
+    context_stats         = []  # one dict per isolate
 
     for isolate, path in deduplicated_paths.items():
         c_nodes   = list(consensus_path.nodes)
@@ -300,6 +302,11 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                         region_counts = Counter()
                     cur = n.id
             return ctxs
+
+        def _count_ambiguous(nodes, ctxs):
+            """Count blocks that received a count suffix > 1 (ambiguous context)."""
+            n_ambiguous = sum(1 for ctx in ctxs if "_" in ctx and ctx.rsplit("_", 1)[-1].isdigit() and int(ctx.rsplit("_", 1)[-1]) > 1)
+            return len(nodes), n_ambiguous
 
         def _detect_translocations_iterative(initial_anchor_ids):
             """Iterative preliminary pass: each time a new block id is identified as
@@ -355,10 +362,23 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         iso_id_ctx_strand = {(n.id, ctx): n.strand for n, ctx in zip(iso_nodes, iso_ctxs)}
         matched = {key for key in c_id_ctx_strand if key in iso_id_ctx_strand}
 
+        iso_n_blocks, iso_n_ambiguous = _count_ambiguous(iso_nodes, iso_ctxs)
+        iso_n_duplicated = sum(1 for n in iso_nodes if iso_id_counts[n.id] > 1)
+
         c_ctx_by_id = defaultdict(list)
         for n, ctx in zip(c_nodes, c_ctxs):
             if (n.id, ctx) not in matched:
                 c_ctx_by_id[n.id].append(ctx)
+
+        def _base_ctx(ctx):
+            parts = ctx.rsplit("_", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                return parts[0]
+            return ctx
+
+        c_id_to_base_ctxs = defaultdict(set)
+        for n, ctx in zip(c_nodes, c_ctxs):
+            c_id_to_base_ctxs[n.id].add(_base_ctx(ctx))
 
         iso_id_ctx_to_node = {(n.id, ctx): n for n, ctx in zip(iso_nodes, iso_ctxs)}
 
@@ -367,28 +387,48 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         # ------------------------------------------------------------------ #
         current_insertion     = []
         current_insertion_first_ctx = None
+        current_ins_has_dup_ambiguous = False
         current_translocation = []
         current_translocation_first_ctx = None
+        current_trans_has_ambiguous = False
+        n_insertions_isolate = 0
+        n_ambiguous_ins_isolate = 0
+        n_trans_isolate = 0
+        n_ambiguous_trans_isolate = 0
 
         def flush_ins():
             nonlocal current_insertion, current_insertion_first_ctx
+            nonlocal n_insertions_isolate, n_ambiguous_ins_isolate, current_ins_has_dup_ambiguous
             if current_insertion:
                 insertions.setdefault(isolate, []).append({
                     "path": pu.Path(list(current_insertion)),
                     "ctx": current_insertion_first_ctx,
                 })
+                n_insertions_isolate += 1
+                if current_ins_has_dup_ambiguous:
+                    n_ambiguous_ins_isolate += 1
+                    ambiguous_insertions.setdefault(isolate, []).append({
+                        "path": pu.Path(list(current_insertion)),
+                        "ctx": current_insertion_first_ctx,
+                    })
                 current_insertion = []
                 current_insertion_first_ctx = None
+                current_ins_has_dup_ambiguous = False
 
         def flush_trans():
             nonlocal current_translocation, current_translocation_first_ctx
+            nonlocal n_trans_isolate, n_ambiguous_trans_isolate, current_trans_has_ambiguous
             if current_translocation:
                 translocations.setdefault(isolate, []).append({
                     "path": pu.Path(list(current_translocation)),
                     "ctx": current_translocation_first_ctx,
                 })
+                n_trans_isolate += 1
+                if current_trans_has_ambiguous:
+                    n_ambiguous_trans_isolate += 1
                 current_translocation = []
                 current_translocation_first_ctx = None
+                current_trans_has_ambiguous = False
 
         for n, ctx in zip(iso_nodes, iso_ctxs):
             if (n.id, ctx) in matched:
@@ -398,6 +438,8 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
 
             avail = c_ctx_by_id.get(n.id, [])
             if avail:
+                if len(avail) > 1:
+                    current_trans_has_ambiguous = True
                 c_ctx = avail.pop(0)
                 matched.add((n.id, c_ctx))
                 matched.add((n.id, ctx))
@@ -410,10 +452,23 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 flush_trans()
                 if not current_insertion:
                     current_insertion_first_ctx = ctx
+                if _base_ctx(ctx) in c_id_to_base_ctxs.get(n.id, set()):
+                    current_ins_has_dup_ambiguous = True
                 current_insertion.append(n)
 
         flush_ins()
         flush_trans()
+
+        context_stats.append(dict(
+            isolate=isolate,
+            n_blocks=iso_n_blocks,
+            n_duplicated_blocks=iso_n_duplicated,
+            n_ambiguous_blocks=iso_n_ambiguous,
+            n_insertions=n_insertions_isolate,
+            n_ambiguous_insertions=n_ambiguous_ins_isolate,
+            n_translocations=n_trans_isolate,
+            n_ambiguous_translocations=n_ambiguous_trans_isolate,
+        ))
 
         # ------------------------------------------------------------------ #
         # Pass 2: walk consensus — deletions                                  #
@@ -488,7 +543,7 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
 
         flush_inv()
 
-    return insertions, deletions, inversions, translocations
+    return insertions, ambiguous_insertions, deletions, inversions, translocations, context_stats
 
 
 def get_isolate_sequence_from_fasta(fasta_path, isolate_name):
@@ -566,6 +621,46 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
     return insertions_df
 
 
+def summarize_ambiguous_insertions(example_junction, pangraph, ambiguous_insertions, consensus=1, parent_dir="../results/atb_lookup/insertions", save_df=False):
+    """
+    Build a summary DataFrame for ambiguous insertions (potential duplications).
+    No sequences are extracted or FASTA files written.
+    """
+    results = []
+
+    for isolate, inserted_paths in ambiguous_insertions.items():
+        for idx, ins_entry in enumerate(inserted_paths):
+            inserted_path = ins_entry["path"]
+            ctx = ins_entry["ctx"]
+            start_pos = pangraph.nodes[inserted_path.nodes[0].nid].start
+            end_pos = pangraph.nodes[inserted_path.nodes[-1].nid].end
+
+            results.append({
+                "junction_name": example_junction,
+                "consensus": f"consensus_{consensus}",
+                "genome_name": isolate,
+                "path": str(inserted_path),
+                "insertion": f"segment_{idx}",
+                "length": abs(end_pos - start_pos),
+                "strand": "+" if inserted_path.nodes[0].strand else "-",
+                "start_pos": start_pos,
+                "end_pos": end_pos,
+                "ctx": ctx,
+            })
+
+    if not results:
+        return None
+
+    ambiguous_insertions_df = pd.DataFrame(results)
+
+    if save_df:
+        out_dir = f"{parent_dir}/{example_junction}/consensus{consensus}"
+        os.makedirs(out_dir, exist_ok=True)
+        ambiguous_insertions_df.to_csv(os.path.join(out_dir, "ambiguous_insertions_summary.csv"), index=False)
+
+    return ambiguous_insertions_df
+
+
 def print_insertions_deletions(insertions, deletions, inversions=None, translocations=None):
     def _path(entry):
         return entry["path"] if isinstance(entry, dict) else entry
@@ -594,20 +689,27 @@ def print_insertions_deletions(insertions, deletions, inversions=None, transloca
             for seg in segs:
                 print(isolate, "TRANSLOCATED:", _path(seg))
 
-def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, deduplicated_paths, consensus = 1, verbose = True):
-    # get isolates belonging to consensus 1
+def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, deduplicated_paths, consensus=1, verbose=True, junction_name=None):
+    # get isolates belonging to this consensus
     isolates_1 = assignment_df[assignment_df['best_consensus'] == f"consensus_{consensus}"].index.tolist()
     # only keep deduplicated paths for these isolates
     deduplicated_paths = {iso: path for iso, path in deduplicated_paths.items() if iso in isolates_1}
 
-    # compare deduplicated paths to consensus paths to find deviations, consensus paths are already deduplicated
-    insertions, deletions, inversions, translocations = get_insertions_deletions_v2(deduplicated_paths, consensus_paths[consensus - 1])
+    # compare deduplicated paths to consensus paths to find deviations
+    insertions, ambiguous_insertions, deletions, inversions, translocations, context_stats = get_insertions_deletions_v2(deduplicated_paths, consensus_paths[consensus - 1])
+
+    # annotate stats with junction name and consensus id
+    for row in context_stats:
+        row["junction_name"] = junction_name
+        row["consensus"] = consensus
+
+    context_stats_df = pd.DataFrame(context_stats, columns=["junction_name", "consensus", "isolate", "n_blocks", "n_duplicated_blocks", "n_ambiguous_blocks", "n_insertions", "n_ambiguous_insertions", "n_translocations", "n_ambiguous_translocations"])
 
     # Print results
     if verbose:
         print_insertions_deletions(insertions, deletions, inversions, translocations)
 
-    return insertions, deletions, inversions, translocations
+    return insertions, ambiguous_insertions, deletions, inversions, translocations, context_stats_df
 
 def write_sgenome_ids(atb_hits_df, output_file):
     sgenome_ids = atb_hits_df.sgenome.to_list()
@@ -1119,6 +1221,46 @@ def load_all_insertions_summaries(parent_dir, junction_name, save_df=False):
     return complete_df
 
 
+def load_all_ambiguous_insertions_summaries(parent_dir, junction_name, save_df=False):
+    """
+    Read and combine all ambiguous_insertions_summary.csv files from
+    {parent_dir}/{junction_name}/consensus*/ambiguous_insertions_summary.csv
+
+    Returns
+    -------
+    pd.DataFrame
+        One long DataFrame with all ambiguous insertions combined.
+    """
+    base_dir = os.path.join(parent_dir, junction_name)
+    all_dfs = []
+
+    if not os.path.isdir(base_dir):
+        print(f"No insertions directory found for {junction_name}, skipping.")
+        return pd.DataFrame()
+
+    for subdir in sorted(os.listdir(base_dir)):
+        if not subdir.startswith("consensus"):
+            continue
+
+        csv_path = os.path.join(base_dir, subdir, "ambiguous_insertions_summary.csv")
+        if os.path.isfile(csv_path):
+            df = pd.read_csv(csv_path)
+            all_dfs.append(df)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    complete_df = pd.concat(all_dfs, ignore_index=True)
+
+    if save_df:
+        complete_df.to_csv(
+            os.path.join(base_dir, "all_ambiguous_insertions_summary.csv"),
+            index=False,
+        )
+
+    return complete_df
+
+
 def summarize_translocations_consensus(
     translocations,
     junction_name,
@@ -1288,20 +1430,21 @@ def combine_all_junctions_summaries(parent_dir, save_df=False):
     each mapping to a pd.DataFrame (empty if nothing was found).
     """
     type_cfg = {
-        "insertions":     load_all_insertions_summaries,
-        "deletions":      load_all_deletions_summaries,
-        "translocations": load_all_translocations_summaries,
-        "inversions":     load_all_inversions_summaries,
+        "insertions":            (load_all_insertions_summaries,            "insertions"),
+        "ambiguous_insertions":  (load_all_ambiguous_insertions_summaries,  "insertions"),
+        "deletions":             (load_all_deletions_summaries,             "deletions"),
+        "translocations":        (load_all_translocations_summaries,        "translocations"),
+        "inversions":            (load_all_inversions_summaries,            "inversions"),
     }
 
     results = {}
 
-    for dtype, loader in type_cfg.items():
-        type_dir = os.path.join(parent_dir, dtype)
+    for dtype, (loader, subdir_name) in type_cfg.items():
+        type_dir = os.path.join(parent_dir, subdir_name)
         all_dfs = []
 
         if not os.path.isdir(type_dir):
-            print(f"No {dtype} directory found at {type_dir}, skipping.")
+            print(f"No {subdir_name} directory found at {type_dir}, skipping.")
             results[dtype] = pd.DataFrame()
             continue
 
@@ -1362,10 +1505,11 @@ def deduplicate_events(summaries, save_path=None):
     """
     # Maps summaries dict keys (plural, match directory names) to singular event_type labels
     event_type_map = {
-        "insertions":     "insertion",
-        "deletions":      "deletion",
-        "translocations": "translocation",
-        "inversions":     "inversion",
+        "insertions":           "insertion",
+        "ambiguous_insertions": "ambiguous_insertion",
+        "deletions":            "deletion",
+        "translocations":       "translocation",
+        "inversions":           "inversion",
     }
     parts = []
 
@@ -1425,7 +1569,7 @@ def count_events_per_junction(deduped_df, min_length=200, save_path=None):
         One row per junction_name with columns:
         junction_name, n_insertions, n_deletions, n_translocations, n_inversions
     """
-    event_types = ["insertion", "deletion", "translocation", "inversion"]
+    event_types = ["insertion", "ambiguous_insertion", "deletion", "translocation", "inversion"]
 
     # Apply length filter on a view — original df is untouched
     if min_length is not None and "length" in deduped_df.columns:
@@ -1459,8 +1603,9 @@ def count_events_per_junction(deduped_df, min_length=200, save_path=None):
     count_cols = [f"n_{t}" for t in event_types]
     counts = counts.reindex(columns=["junction_name"] + count_cols, fill_value=0)
 
-    # Total events per junction
-    counts["n_events"] = counts[count_cols].sum(axis=1)
+    # Total events per junction (ambiguous_insertions excluded)
+    sum_cols = [c for c in count_cols if c != "n_ambiguous_insertion"]
+    counts["n_events"] = counts[sum_cols].sum(axis=1)
 
     # Mean length per (junction, event_type) and overall
     if "length" in df.columns:

@@ -14,7 +14,7 @@ conda activate awscli
 CHUNKS_DIR="$1"
 
 # Get the chunk file for this array task (sorted, 1-indexed)
-CHUNK_FILE=$(ls "$CHUNKS_DIR"/chunk_[0-9]* | sort | sed -n "${SLURM_ARRAY_TASK_ID}p")
+CHUNK_FILE=$(ls "$CHUNKS_DIR"/chunk_[0-9][0-9][0-9][0-9] 2>/dev/null | sort | sed -n "${SLURM_ARRAY_TASK_ID}p")
 if [[ -z "$CHUNK_FILE" ]]; then
     echo "No chunk file found for task $SLURM_ARRAY_TASK_ID" >&2
     exit 1
