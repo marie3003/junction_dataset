@@ -1024,3 +1024,133 @@ def load_all_block_alignment_stats(results_dir: str, save_path: str = None) -> p
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         result.to_csv(save_path, index=False)
     return result
+
+
+def add_singleton_gain_loss_isolate_columns(jdf_all, pangraph_dir="../results/junction_pangraphs"):
+    """
+    Add columns:
+      - singleton_gain_isolate
+      - singleton_loss_isolate
+
+    Values:
+      - isolate name if detected
+      - comma-separated isolate names if multiple blocks point to different isolates
+      - pd.NA otherwise
+
+    Rules:
+    - non-singleton junctions -> pd.NA
+    - singleton junctions with n_iso == 2 -> pd.NA
+    - inspect all non-core blocks in the pangraph
+    """
+    jdf_all = jdf_all.copy()
+
+    jdf_all["singleton_gain_isolate"] = pd.Series(pd.NA, index=jdf_all.index, dtype="object")
+    jdf_all["singleton_loss_isolate"] = pd.Series(pd.NA, index=jdf_all.index, dtype="object")
+
+    singleton_mask = jdf_all["singleton"]
+
+    for idx, row in jdf_all.loc[singleton_mask].iterrows():
+        junction_name = row["junction_name"]
+        n_iso = int(row["n_iso"])
+
+        if n_iso == 2:
+            continue
+
+        pangraph_path = Path(pangraph_dir) / f"{junction_name}.json"
+        if not pangraph_path.exists():
+            print(f"Skipping {junction_name}: file not found")
+            continue
+
+        try:
+            pangraph = pp.Pangraph.from_json(str(pangraph_path))
+
+            blockstats_df = pangraph.to_blockstats_df()
+            blockcount_df = pangraph.to_blockcount_df()
+
+            accessory_block_ids = blockstats_df.loc[~blockstats_df["core"]].index
+
+            gain_isolates = set()
+            loss_isolates = set()
+
+            for block_id in accessory_block_ids:
+                counts = blockcount_df.loc[block_id]   # Series: isolate_name -> count
+
+                # Most common copy number across isolates
+                baseline = counts.mode().iloc[0]
+
+                gain_candidates = counts[counts == baseline + 1].index.tolist()
+                loss_candidates = counts[counts == baseline - 1].index.tolist()
+
+                # Only call it singleton if exactly one isolate deviates that way
+                if len(gain_candidates) == 1:
+                    gain_isolates.add(gain_candidates[0])
+
+                if len(loss_candidates) == 1:
+                    loss_isolates.add(loss_candidates[0])
+
+            if len(gain_isolates) == 1:
+                jdf_all.at[idx, "singleton_gain_isolate"] = next(iter(gain_isolates))
+            elif len(gain_isolates) > 1:
+                jdf_all.at[idx, "singleton_gain_isolate"] = ",".join(sorted(gain_isolates))
+
+            if len(loss_isolates) == 1:
+                jdf_all.at[idx, "singleton_loss_isolate"] = next(iter(loss_isolates))
+            elif len(loss_isolates) > 1:
+                jdf_all.at[idx, "singleton_loss_isolate"] = ",".join(sorted(loss_isolates))
+
+        except Exception as e:
+            print(f"Skipping {junction_name}: {e}")
+
+    return jdf_all
+
+def add_singleton_has_own_cluster(jdf_all, cluster_df):
+    """
+    Adds column:
+        - singleton_has_own_cluster
+
+    True  -> singleton isolate is alone in its cluster
+    False -> cluster contains other isolates
+    <NA>  -> not applicable (non-singleton or n_iso == 2 or no isolate info)
+    """
+    jdf_all = jdf_all.copy()
+    jdf_all["singleton_has_own_cluster"] = pd.Series(pd.NA, index=jdf_all.index, dtype="boolean")
+
+    # isolate columns = everything except metadata
+    meta_cols = {"junction_name", "n_clusters", "n_isolates"}
+    isolate_cols = [c for c in cluster_df.columns if c not in meta_cols]
+
+    # make lookup faster
+    cluster_df = cluster_df.set_index("junction_name")
+
+    for idx, row in jdf_all.iterrows():
+        if not row["singleton"] or row["n_iso"] == 2:
+            continue
+
+        junction = row["junction_name"]
+
+        # get singleton isolate (prefer gain, else loss)
+        isolate = row.get("singleton_gain_isolate")
+        if pd.isna(isolate):
+            isolate = row.get("singleton_loss_isolate")
+
+        if pd.isna(isolate):
+            continue
+
+        if junction not in cluster_df.index:
+            continue
+
+        cluster_row = cluster_df.loc[junction]
+
+        if isolate not in isolate_cols:
+            continue
+
+        cluster_id = cluster_row[isolate]
+        if pd.isna(cluster_id):
+            continue
+
+        # count how many isolates share this cluster
+        same_cluster = (cluster_row[isolate_cols] == cluster_id).sum()
+
+        jdf_all.at[idx, "singleton_has_own_cluster"] = (same_cluster == 1)
+
+    return jdf_all

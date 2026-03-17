@@ -5,7 +5,7 @@ INPUT_FILE="${1:?give input file}"
 OUTPUT_FILE="${2:-biosample_summary.tsv}"
 
 INITIAL_BATCH_SIZE=100
-MAX_ROUNDS=10
+MAX_ROUNDS=15
 
 tmp_dir=$(mktemp -d)
 tmp_ids="$tmp_dir/ids.txt"
@@ -85,6 +85,16 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
 
     sleep $((RANDOM % 30 + 20))
 done
+
+# write unresolved IDs to a file next to the output
+FAILED_FILE="${OUTPUT_FILE%.tsv}_failed_ids.txt"
+if [[ -s "$tmp_remaining" ]]; then
+    cp "$tmp_remaining" "$FAILED_FILE"
+    echo "$(wc -l < "$FAILED_FILE") IDs could not be resolved after $MAX_ROUNDS rounds. Written to $FAILED_FILE" >&2
+else
+    : > "$FAILED_FILE"
+    echo "All IDs resolved." >&2
+fi
 
 # final lookup map
 awk -F'\t' 'BEGIN{OFS="\t"} !seen[$1]++ {print}' "$tmp_found" > "$tmp_dir/final_found.tsv"

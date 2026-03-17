@@ -25,6 +25,8 @@ COLORS = {
     "mid_blue":   "#7394c2",
     "gray":       "#7a7a7a",
     "wine":       "#7a2030",
+    "rosa":     "#c8a2c8",
+
 }
 import pypangraph as pp
 from scipy.cluster.hierarchy import dendrogram
@@ -4096,4 +4098,149 @@ def plot_clustering_threshold_sweep(df, figsize=(7,4), save_path=None, normalize
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"Saved figure to {save_path}")
     else:
+        plt.show()
+
+
+def plot_fitch_tree(tree, iso_to_cluster, state_sets, junction_name, ax=None, save_path=None):
+    """
+    Plot a phylogenetic tree with branches colored by Fitch parsimony cluster assignment.
+
+    A branch (parent -> child) is drawn in a cluster's color if state_sets[child]
+    is a singleton {c}, meaning all tips below that child share the same cluster c.
+    Mixed branches (state_sets has >1 element) are drawn in gray.
+
+    Parameters
+    ----------
+    tree : Bio.Phylo tree
+        Pruned tree containing only the isolates present at this junction.
+    iso_to_cluster : dict
+        Mapping isolate_name -> cluster_id (int).
+    state_sets : dict
+        Mapping clade -> set of cluster ids, from the Fitch bottom-up pass.
+    junction_name : str
+        Used as the plot title.
+    ax : matplotlib Axes or None
+        If None, a new figure is created.
+    save_path : str or None
+        If provided, save figure to this path instead of showing.
+    """
+    import matplotlib.patches as mpatches
+
+    n_tips = len(iso_to_cluster)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, max(3, n_tips * 0.18)))
+        created_fig = True
+    else:
+        fig = ax.figure
+        created_fig = False
+
+    # --- cluster color palette ---
+    cluster_ids = sorted(set(iso_to_cluster.values()))
+    palette = [
+        COLORS["teal"], COLORS["reddish"], COLORS["dark_blue"],
+        COLORS["purple"], COLORS["pink"], COLORS["mid_blue"],
+        COLORS["wine"], COLORS["light_blue"], COLORS["rosa"],
+    ]
+    cl_color = {cl: palette[i % len(palette)] for i, cl in enumerate(cluster_ids)}
+    mixed_color = COLORS["gray"]
+
+    # --- build parent map ---
+    parent_map = {}
+    for clade in tree.find_clades(order="preorder"):
+        for child in clade.clades:
+            parent_map[child] = clade
+
+    # --- y positions: tips in pre-order traversal order ---
+    tips_in_order = [c for c in tree.find_clades(order="preorder") if c.is_terminal()]
+    tip_y = {tip: i for i, tip in enumerate(tips_in_order)}
+
+    # --- x positions: cumulative branch lengths from root ---
+    node_x = {tree.root: 0.0}
+    for clade in tree.find_clades(order="preorder"):
+        for child in clade.clades:
+            bl = child.branch_length if child.branch_length is not None else 0.0
+            node_x[child] = node_x[clade] + bl
+
+    # --- y positions for internal nodes: midpoint of children's y range ---
+    node_y = {}
+    for clade in tree.find_clades(order="postorder"):
+        if clade.is_terminal():
+            node_y[clade] = tip_y[clade]
+        else:
+            child_ys = [node_y[c] for c in clade.clades]
+            node_y[clade] = (min(child_ys) + max(child_ys)) / 2.0
+
+    def _clade_color(clade):
+        ss = state_sets.get(clade, set())
+        return cl_color[next(iter(ss))] if len(ss) == 1 else mixed_color
+
+    # --- draw branches and vertical connectors ---
+    lw = 1.8
+    for clade in tree.find_clades(order="preorder"):
+        # vertical connector at internal nodes
+        if not clade.is_terminal():
+            # sort children by y position
+            children_sorted = sorted(clade.clades, key=lambda c: node_y[c])
+            # draw segments between consecutive children, split at midpoint
+            for i in range(len(children_sorted) - 1):
+                lower = children_sorted[i]
+                upper = children_sorted[i + 1]
+                y_lo = node_y[lower]
+                y_hi = node_y[upper]
+                y_mid = (y_lo + y_hi) / 2.0
+                c_lo = _clade_color(lower)
+                c_hi = _clade_color(upper)
+                ax.plot([node_x[clade], node_x[clade]], [y_lo, y_mid],
+                        color=c_lo, linewidth=lw, solid_capstyle="butt")
+                ax.plot([node_x[clade], node_x[clade]], [y_mid, y_hi],
+                        color=c_hi, linewidth=lw, solid_capstyle="butt")
+
+        # horizontal branch from parent to this node
+        if clade is tree.root:
+            continue
+        parent = parent_map[clade]
+        color = _clade_color(clade)
+        ax.plot(
+            [node_x[parent], node_x[clade]],
+            [node_y[clade], node_y[clade]],
+            color=color, linewidth=lw, solid_capstyle="butt",
+        )
+
+    # --- tip labels colored by cluster ---
+    max_x = max(node_x.values())
+    for tip in tips_in_order:
+        cl = iso_to_cluster.get(tip.name)
+        color = cl_color[cl] if cl is not None else mixed_color
+        ax.text(
+            max_x * 1.01, node_y[tip], tip.name,
+            va="center", ha="left", fontsize=7, color=color,
+        )
+
+    # --- legend (top left) ---
+    handles = [
+        mpatches.Patch(color=cl_color[cl], label=f"cluster {cl}")
+        for cl in cluster_ids
+    ]
+    ax.legend(handles=handles, fontsize=11, frameon=False,
+              loc="upper left", bbox_to_anchor=(0, 1))
+
+    ax.set_title(junction_name, fontsize=14, pad=4)
+    ax.set_xlabel("branch length", fontsize=12)
+    ax.tick_params(axis="x", labelsize=11)
+    ax.set_yticks([])
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.set_xlim(left=0, right=max_x * 1.35)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved Fitch tree plot to {save_path}")
+        if created_fig:
+            plt.close(fig)
+    elif created_fig:
         plt.show()

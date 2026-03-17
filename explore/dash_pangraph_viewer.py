@@ -393,7 +393,7 @@ if __name__ == "__main__":
     #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f" # --> look up again, its the prophage one that would get two clusters
     #junction_name = "AFFODHUCNW_r__VRDEBAMMSO_r"
     #junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
-    junction_name = "ADIVNXMSJF_f__SKCSCYCISB_f"
+    junction_name = "OURQVJZAZZ_f__UTYAQKFQDH_f"
     #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # --> wild junctions with 12 clusters
     #junction_name = "JPYVXRYZLU_f__UUBXUCAQCF_f"
     #junction_name = "NPQDSPAYII_f__VJEJDHVKTM_f"

@@ -13,7 +13,7 @@ from collections import Counter, defaultdict, OrderedDict
 from Bio import Phylo, SeqIO
 import pypangraph as pp
 import junction_analysis.pangraph_utils as pu
-from junction_analysis.plotting import plot_junction_pangraph_interactive, plot_pairwise_distance_hist, plot_snp_pos_distribution, plot_block_distance_distribution
+from junction_analysis.plotting import plot_junction_pangraph_interactive, plot_pairwise_distance_hist, plot_snp_pos_distribution, plot_block_distance_distribution, plot_fitch_tree
 from junction_analysis.junction_trees import build_tree_from_block_list, cluster_tree_by_branch_length, compute_pairwise_distances
 from junction_analysis.helpers import get_block_length, snp_positions, build_subtree, repo_root
 from junction_analysis.block_alignment import create_block_msas_for_cluster, summarize_block_msas, avg_pairwise_distance
@@ -1416,7 +1416,7 @@ def collect_all_pairwise_distances(junction_names, results_dir,
     return df
 
 
-def fitch_parsimony_steps_per_cluster(cluster_df, tree_path, junction_col="junction_name", save_path=None):
+def fitch_parsimony_steps_per_cluster(cluster_df, tree_path, junction_col="junction_name", save_path=None, plot_tree=False, plot_dir=None):
     """
     Count certain parsimonious gains per cluster for each junction using
     bottom-up multi-state Fitch only.
@@ -1453,6 +1453,11 @@ def fitch_parsimony_steps_per_cluster(cluster_df, tree_path, junction_col="junct
 
         observed_clusters = sorted(set(iso_to_cluster.values()))
 
+        # remap cluster ids to consecutive 0, 1, 2, ...
+        cl_remap = {old: new for new, old in enumerate(observed_clusters)}
+        iso_to_cluster = {iso: cl_remap[cl] for iso, cl in iso_to_cluster.items()}
+        observed_clusters = list(range(len(observed_clusters)))
+
         tree = copy.deepcopy(full_tree)
         for tip in list(tree.get_terminals()):
             if tip.name not in present_isolates:
@@ -1472,6 +1477,14 @@ def fitch_parsimony_steps_per_cluster(cluster_df, tree_path, junction_col="junct
                 child_sets = [state_sets[child] for child in clade.clades]
                 inter = set.intersection(*child_sets)
                 state_sets[clade] = inter if inter else set.union(*child_sets)
+
+        # Optionally plot the tree colored by Fitch cluster assignment
+        if plot_tree and (plot_tree is True or junction_name in plot_tree):
+            tree_save = None
+            if plot_dir is not None:
+                Path(plot_dir).mkdir(parents=True, exist_ok=True)
+                tree_save = str(Path(plot_dir) / f"{junction_name}_fitch_tree.png")
+            plot_fitch_tree(tree, iso_to_cluster, state_sets, junction_name, save_path=tree_save)
 
         # Count certain gains only
         cluster_steps = {cl: 0 for cl in observed_clusters}
