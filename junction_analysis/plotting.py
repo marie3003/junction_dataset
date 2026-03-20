@@ -9,8 +9,10 @@ import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset 
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
 from matplotlib.gridspec import GridSpec
+from matplotlib.colors import to_rgba, LinearSegmentedColormap, LogNorm, Normalize, PowerNorm
+from matplotlib.cm import ScalarMappable
 import colorsys
 
 import pandas as pd
@@ -433,7 +435,8 @@ def plot_junction_pangraph_interactive(
         if ann.empty or "feature" not in ann.columns:
             ann = pd.DataFrame(columns=["seqid", "feature", "start", "end", "attrs", "is_subtype"])
 
-        DEF_COLOR = "rgb(152,78,163)"  # purple, far from inversion red
+        DEF_COLOR = "rgb(152,78,163)"    # medium purple
+        INT_COLOR = "rgb(196,150,210)"   # lighter purple for integrons
         PROPH_COLOR = "rgb(27,158,119)"
         IS_BASE = (55, 126, 184)
 
@@ -491,6 +494,19 @@ def plot_junction_pangraph_interactive(
                     name="Defense system",
                     end=ds["end"].tolist(),
                     length=ds["length"].tolist(),
+                )
+
+            # add integron annotations (CALIN feature type)
+            it = sub[sub["feature"].isin(["integron", "CALIN"])]
+            if not it.empty:
+                _add_anno_bar(
+                    x=(it["end"] - it["start"]).tolist(),
+                    y=[label] * len(it),
+                    base=(it["start"]).tolist(),
+                    color_rgb=INT_COLOR,
+                    name="Integron",
+                    end=it["end"].tolist(),
+                    length=it["length"].tolist(),
                 )
 
             # add IS annotations
@@ -617,36 +633,20 @@ def plot_junction_pangraph_interactive(
         if os.path.exists(deletions_file):
             del_df = pd.read_csv(deletions_file)
 
-            # Collect all deletion markers, grouping by (label, position)
-            del_grouped = {}  # (label, position) -> list of row dicts
-
+            del_xs, del_ys, del_customdata = [], [], []
             for label in y_labels:
                 sub_del = del_df[del_df["genome_name"] == label]
                 if sub_del.empty:
                     continue
-
                 for _, row in sub_del.iterrows():
-                    key = (label, row["position"])
                     del_name = row["deletion"]
-                    del_num = del_name.replace("deletion", "") if "deletion" in del_name else del_name
+                    del_num = del_name.replace("deletion", "") if "deletion" in str(del_name) else del_name
                     n_blocks = str(row.get("path", "")).count("[")
-                    del_grouped.setdefault(key, []).append({
-                        "num": del_num, "length": row["length"], "strand": row.get("strand", ""), "blocks": n_blocks,
-                    })
-
-            if del_grouped:
-                del_xs = []
-                del_ys = []
-                del_hovertexts = []
-
-                for (label, pos), entries in del_grouped.items():
-                    del_xs.append(pos)
+                    del_xs.append(row["position"])
                     del_ys.append(label)
-                    lines = [f"<b>Deletion (#{e['num']})</b> Length={e['length']:g} Strand={e['strand']} Blocks={e['blocks']}" for e in entries]
-                    pos_str = "N/A" if (pos != pos) else str(int(pos))  # NaN check
-                    hover = f"Position = {pos_str}<br>" + "<br>".join(lines)
-                    del_hovertexts.append(hover)
+                    del_customdata.append([del_num, row["length"], row.get("strand", ""), n_blocks])
 
+            if del_xs:
                 fig.add_trace(go.Scatter(
                     x=del_xs,
                     y=del_ys,
@@ -659,8 +659,15 @@ def plot_junction_pangraph_interactive(
                     ),
                     name="Deletion",
                     showlegend=True,
-                    hovertemplate="%{text}<extra></extra>",
-                    text=del_hovertexts,
+                    customdata=del_customdata,
+                    hovertemplate=(
+                        "<b>Deletion (#%{customdata[0]})</b>"
+                        "<br>Position = %{x:d}"
+                        "<br>Length = %{customdata[1]:d}"
+                        "<br>Strand = %{customdata[2]}"
+                        "<br>Blocks = %{customdata[3]}"
+                        "<extra></extra>"
+                    ),
                 ))
 
         # Load inversions
@@ -1611,7 +1618,7 @@ def plot_pangraph_base_for_dash(
     return fig, y_labels, max_x, inversion_rects
 
 
-def plot_cluster_count_distribution(df, figsize=(7, 4), save_path=None):
+def plot_cluster_count_distribution(df, figsize=(6, 4), save_path=None):
     """
     Plot the distribution of the number of clusters per junction as a bar chart.
 
@@ -1623,23 +1630,50 @@ def plot_cluster_count_distribution(df, figsize=(7, 4), save_path=None):
     save_path : str or None
         If provided, save the figure instead of showing it.
     """
-    counts = df["n_clusters"].value_counts().sort_index()
+    _n_clusters_palette = {
+        0: COLORS["gray"],
+        1: COLORS["light_blue"],
+        2: COLORS["mid_blue"],
+        3: COLORS["teal"],
+        4: COLORS["dark_blue"],
+        5: COLORS["purple"],
+        6: COLORS["pink"],
+        7: COLORS["reddish"],
+        8: COLORS["wine"],
+    }
+
+    counts = (df["n_clusters"] - 1).value_counts().sort_index()
+    bar_colors = [_n_clusters_palette.get(v, COLORS["wine"]) for v in counts.index]
 
     fig, ax = plt.subplots(figsize=figsize)
-    ax.bar(counts.index, counts.values, color=COLORS["mid_blue"], edgecolor="white", linewidth=0.5)
-    ax.set_xlabel("Number of clusters per junction")
-    ax.set_ylabel("Number of junctions")
-    ax.set_title("Distribution of cluster counts across junctions")
-    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax.bar(counts.index, counts.values, color=bar_colors,
+           edgecolor="white", linewidth=0.6, width=0.85)
+
+    # annotate each bar with its count
+    for x, y in zip(counts.index, counts.values):
+        ax.text(x, y + counts.values.max() * 0.01, str(y),
+                ha="center", va="bottom", fontsize=12, color="black")
+
+    ax.set_xlabel("n. additional clusters per junction", fontsize=16)
+    ax.set_ylabel("n. junctions", fontsize=16)
+    ax.tick_params(labelsize=14)
+    x_max_tick = max(counts.index.max(), 10)
+    all_ticks = list(range(counts.index.min(), x_max_tick + 1))
+    ax.set_xticks(all_ticks)
+    ax.set_xticklabels([str(v) for v in all_ticks])
     ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    ax.yaxis.grid(True, color="0.92", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.set_xlim(counts.index.min() - 0.6, x_max_tick + 0.6)
 
     plt.tight_layout()
 
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(save_path, bbox_inches="tight")
         print(f"Saved figure to {save_path}")
     else:
         plt.show()
@@ -2308,14 +2342,22 @@ def plot_event_length_distribution(
     y_max=None,
     x_max=None,
     filter_below_threshold=False,
-    figsize=(10, 8),
+    color_by_mge=False,
+    insertions_only=False,
+    insertions_by_is_family=False,
+    deletions_only=False,
+    ccdf_event=None,
+    color_by_majority_organism=False,
+    color_by_species_counts=False,
+    n_species=5,
+    legend_title=None,
+    figsize=None,
     save_path=None,
 ):
     """
-    Plot the length distribution of each event type as 4 histograms stacked
-    vertically, using the same colour scheme as plot_event_counts_distribution.
+    Plot the length distribution of each event type as histograms.
 
-    All subplots share the same x- and y-scales. A vertical red dashed line
+    All subplots share the same x- and y-scales. A vertical dashed line
     is drawn at `min_length_threshold` to mark the filtering cutoff.
 
     Parameters
@@ -2323,38 +2365,399 @@ def plot_event_length_distribution(
     deduped_df : pd.DataFrame
         Output of deduplicate_events(). Must have columns 'event_type' and 'length'.
     min_length_threshold : int or None
-        Position of the red dashed cutoff line. Pass None to omit. Default: 200.
+        Position of the cutoff line. Pass None to omit. Default: 200.
     bins : int
         Number of histogram bins. Default: 50.
     log_x : bool
         If True, use a log scale on the x-axis with log-spaced bin edges.
-        Default: False.
     log_y : bool
         If True, use a log scale on the y-axis. Default: True.
     y_max : float or None
-        If provided, cap the y-axis at this value. Default: None.
+        If provided, cap the y-axis at this value.
     x_max : float or None
-        If provided, cap the x-axis at this value. Default: None.
+        If provided, cap the x-axis at this value.
     filter_below_threshold : bool
-        If True, events with length < min_length_threshold are excluded from
-        the plot. Has no effect if min_length_threshold is None. Default: False.
-    figsize : tuple
-        Matplotlib figure size.
+        If True, exclude events shorter than min_length_threshold.
+    color_by_mge : bool
+        If True, stack bars by MGE association using the same colors as
+        plot_event_mge_stacked_bar. Default: False.
+    insertions_only : bool
+        If True, show only a single panel for insertions. Default: False.
+    figsize : tuple or None
+        Figure size. Defaults to (6, 4) for insertions_only, (10, 8) otherwise.
     save_path : str or None
         If provided, save the figure; otherwise call plt.show().
     """
+    # MGE colors + alphas matching plot_event_mge_stacked_bar
+    _MGE_STYLE = {
+        "Prophage":              ("#a6444f", 1.0),
+        "Prophage (associated)": ("#c98087", 1.0),
+        "IS":                    ("#7394c2", 1.0),
+        "IS (associated)":       ("#b5d2f2", 1.0),
+        "Defense system":        ("#80557e", 1.0),
+        "Integron":              ("#d991b4", 1.0),
+        "None":                  ("#7a7a7a", 1.0),
+    }
+    _MGE_DISPLAY_NAME = {
+        "Defense system": "Defense system (associated)",
+        "Integron":       "Integron (associated)",
+    }
+    mge_order = ["None", "IS (associated)", "IS",
+                 "Defense system", "Integron",
+                 "Prophage (associated)", "Prophage"]
+
     event_cfg = [
-        ("insertion",     "#4C72B0"),
+        ("insertion",     "#7394c2"),
         ("deletion",      "#DD8452"),
         ("translocation", "#55A868"),
         ("inversion",     "#C44E52"),
     ]
 
-    plot_df = deduped_df.copy()
+    plot_df = deduped_df[
+        deduped_df["event_type"] != "ambiguous_insertion"
+    ].copy()
     if filter_below_threshold and min_length_threshold is not None:
         plot_df = plot_df[plot_df["length"] >= min_length_threshold]
 
-    all_lengths = plot_df["length"].dropna().values
+    # --- single-event CCDF shortcut ---------------------------------------------
+    _ccdf_event = None
+    if deletions_only:
+        _ccdf_event = "deletion"
+    elif ccdf_event is not None:
+        _ccdf_event = ccdf_event
+
+    if _ccdf_event is not None:
+        _etype_label = {
+            "deletion":      "Deletion",
+            "translocation": "Translocation",
+            "inversion":     "Inversion",
+            "insertion":     "Insertion",
+        }.get(_ccdf_event, _ccdf_event.capitalize())
+
+        lengths = plot_df[plot_df["event_type"] == _ccdf_event]["length"].dropna().sort_values().values
+        if len(lengths) == 0:
+            return
+        if figsize is None:
+            figsize = (6, 4)
+        fig, ax = plt.subplots(figsize=figsize)
+        ccdf = 1 - np.arange(0, len(lengths)) / len(lengths)
+        ax.plot(lengths, ccdf, color="#7394c2", linewidth=2.5)
+        ax.fill_between(lengths, ccdf, alpha=0.12, color="#7394c2")
+        if x_max is not None:
+            ax.set_xlim(right=x_max)
+        ax.set_xlim(left=lengths.min())
+        ax.set_ylim(0, 1.02)
+        if log_x:
+            ax.set_xscale("log")
+        ax.set_xlabel(f"{_etype_label} length (bp)", fontsize=15)
+        ax.set_ylabel(f"Fraction of {_etype_label.lower()}s ≥ length", fontsize=15)
+        ax.tick_params(axis="both", labelsize=13, length=4)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.6, alpha=0.45, zorder=0)
+        ax.xaxis.grid(False)
+        ax.set_axisbelow(True)
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+        ax.spines["left"].set_linewidth(0.8)
+        ax.spines["bottom"].set_linewidth(0.8)
+        plt.tight_layout()
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+            fig.savefig(save_path, bbox_inches="tight")
+            print(f"Saved figure to {save_path}")
+        else:
+            plt.show()
+        return fig, ax
+
+    # --- insertions by IS family shortcut ---------------------------------------
+    if insertions_by_is_family:
+        sub = plot_df[plot_df["event_type"] == "insertion"].copy()
+        if sub.empty:
+            return
+        if figsize is None:
+            figsize = (6, 4)
+
+        IS_BASE = (55, 126, 184)
+
+        # collect IS families from is_family + is_families_associated columns
+        full_families = sorted(sub["is_family"].dropna().unique()) if "is_family" in sub.columns else []
+        assoc_families = sorted({
+            f for cell in sub.get("is_families_associated", pd.Series(dtype=object)).dropna()
+            for f in (cell if isinstance(cell, list) else [])
+        })
+        all_families = sorted(set(full_families) | set(assoc_families))
+
+        # lightest shade reserved for "IS (associated)" (no specific family)
+        n_shades = max(len(all_families), 1)
+        shades = _shades_from_base_rgb(IS_BASE, n_shades)
+
+        # family → shade (darkest shades for named families, lightest for associated)
+        def _hex_from_rgb_str(s):
+            vals = [int(v) for v in s.replace("rgb(", "").replace(")", "").split(",")]
+            return "#{:02x}{:02x}{:02x}".format(*vals)
+
+        family_color = {fam: _hex_from_rgb_str(shades[i]) for i, fam in enumerate(all_families)}
+        assoc_color  = COLORS["rosa"]   # rosa, clearly distinct from blue IS family shades
+        none_color   = COLORS["gray"]
+
+        def _row_label(row):
+            if "is_family" in row and pd.notna(row["is_family"]):
+                return row["is_family"]
+            assoc = row.get("is_families_associated", None)
+            if isinstance(assoc, list) and assoc:
+                return "__associated__"
+            return "__none__"
+
+        sub["_is_label"] = sub.apply(_row_label, axis=1)
+
+        # stack order: none → associated → named families (darkest on top)
+        stack_order = ["__none__", "__associated__"] + all_families
+        color_map = {"__none__": none_color, "__associated__": assoc_color, **family_color}
+        display_map = {"__none__": "Not associated", "__associated__": "IS (associated)"}
+
+        all_ins_lengths = sub["length"].dropna().values
+        x_min_i = max(all_ins_lengths.min(), 1) if log_x else all_ins_lengths.min()
+        x_max_i = x_max if x_max is not None else all_ins_lengths.max()
+        if log_x:
+            bin_edges_i = np.logspace(np.log10(x_min_i), np.log10(x_max_i), bins + 1)
+        else:
+            bin_edges_i = np.linspace(x_min_i, x_max_i, bins + 1)
+
+        fig, ax = plt.subplots(figsize=figsize)
+        bottoms = np.zeros(len(bin_edges_i) - 1)
+        handles = []
+        for lbl in stack_order:
+            lengths = sub.loc[sub["_is_label"] == lbl, "length"].dropna().values
+            if len(lengths) == 0:
+                continue
+            vals, _ = np.histogram(lengths, bins=bin_edges_i)
+            ax.bar(
+                bin_edges_i[:-1], vals, width=np.diff(bin_edges_i),
+                bottom=bottoms, align="edge",
+                color=color_map[lbl], edgecolor="white", linewidth=0.4,
+            )
+            handles.append((plt.Rectangle((0, 0), 1, 1, color=color_map[lbl], linewidth=0),
+                             display_map.get(lbl, lbl)))
+            bottoms = bottoms + vals
+
+        if min_length_threshold is not None and not filter_below_threshold:
+            ax.axvline(min_length_threshold, color="#7a7a7a", linestyle="--", linewidth=1.2)
+
+        h, l = zip(*reversed(handles))
+        ax.legend(h, l, frameon=False, fontsize=11,
+                  title=legend_title if legend_title is not None else "IS family", title_fontsize=12,
+                  loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
+
+
+        ax.set_xlabel("Event length (bp)", fontsize=14)
+        ax.set_ylabel("Count", fontsize=14)
+        if log_y:
+            ax.set_yscale("log")
+        if log_x:
+            ax.set_xscale("log")
+        if y_max is not None:
+            ax.set_ylim(top=y_max)
+        if x_max is not None:
+            ax.set_xlim(right=x_max)
+        ax.tick_params(axis="both", labelsize=12, length=3)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout()
+        fig.subplots_adjust(right=0.72)
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+            fig.savefig(save_path, bbox_inches="tight")
+            print(f"Saved figure to {save_path}")
+        else:
+            plt.show()
+        return fig, ax
+
+    # --- shared helper for organism coloring modes ------------------------------
+    def _organism_stacked_bar(sub, bin_edges_s, stack_order, color_map, legend_title_str):
+        fig, ax = plt.subplots(figsize=figsize)
+        bottoms = np.zeros(len(bin_edges_s) - 1)
+        handles = []
+        for lbl in stack_order:
+            lengths = sub.loc[sub["_species_label"] == lbl, "length"].dropna().values
+            if len(lengths) == 0:
+                continue
+            vals, _ = np.histogram(lengths, bins=bin_edges_s)
+            ax.bar(
+                bin_edges_s[:-1], vals, width=np.diff(bin_edges_s),
+                bottom=bottoms, align="edge",
+                color=color_map[lbl], edgecolor="white", linewidth=0.4,
+            )
+            handles.append((plt.Rectangle((0, 0), 1, 1, color=color_map[lbl], linewidth=0), lbl))
+            bottoms = bottoms + vals
+
+        if min_length_threshold is not None and not filter_below_threshold:
+            ax.axvline(min_length_threshold, color="#7a7a7a", linestyle="--", linewidth=1.2)
+
+        h, l = zip(*reversed(handles))
+        ax.legend(h, l, frameon=False, fontsize=11,
+                  title=legend_title_str, title_fontsize=12,
+                  loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
+        ax.set_xlabel("Insertion length (bp)", fontsize=14)
+        ax.set_ylabel("Count", fontsize=14)
+        if log_y:
+            ax.set_yscale("log")
+        if log_x:
+            ax.set_xscale("log")
+        if y_max is not None:
+            ax.set_ylim(top=y_max)
+        if x_max is not None:
+            ax.set_xlim(right=x_max)
+        ax.tick_params(axis="both", labelsize=12, length=3)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout()
+        fig.subplots_adjust(right=0.72)
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+            fig.savefig(save_path, bbox_inches="tight")
+            print(f"Saved figure to {save_path}")
+        else:
+            plt.show()
+        return fig, ax
+
+    _species_palette = [COLORS["light_blue"], COLORS["mid_blue"], COLORS["dark_blue"],
+                        COLORS["purple"], COLORS["rosa"], COLORS["reddish"], COLORS["wine"]]
+
+    # --- mode 1: color each insertion by its majority_organism column -----------
+    if color_by_majority_organism:
+        sub = plot_df[plot_df["event_type"] == "insertion"].copy()
+        if sub.empty:
+            return
+        if figsize is None:
+            figsize = (6, 4)
+
+        if "majority_organism" in sub.columns:
+            sub["_species"] = sub["majority_organism"].apply(
+                lambda x: " ".join(str(x).split()[:2]) if pd.notna(x) else None
+            )
+        else:
+            sub["_species"] = None
+
+        species_counts = sub["_species"].value_counts()
+        all_species = list(species_counts.index)
+        sub["_species_label"] = sub["_species"].apply(
+            lambda x: x if pd.notna(x) else "unknown"
+        )
+
+        stack_order = all_species + (["unknown"] if sub["_species_label"].eq("unknown").any() else [])
+        color_map = {s: _species_palette[i % len(_species_palette)] for i, s in enumerate(all_species)}
+        color_map["unknown"] = COLORS["gray"]
+
+        all_lengths = sub["length"].dropna().values
+        x_min_s = max(all_lengths.min(), 1) if log_x else all_lengths.min()
+        x_max_s = x_max if x_max is not None else all_lengths.max()
+        bin_edges_s = (
+            np.logspace(np.log10(x_min_s), np.log10(x_max_s), bins + 1)
+            if log_x else np.linspace(x_min_s, x_max_s, bins + 1)
+        )
+        return _organism_stacked_bar(sub, bin_edges_s, stack_order, color_map, "Majority organism")
+
+    # --- mode 2: color each bar by relative species hit counts ------------------
+    if color_by_species_counts:
+        sub = plot_df[plot_df["event_type"] == "insertion"].copy()
+        if sub.empty:
+            return
+        if figsize is None:
+            figsize = (6, 4)
+
+        known_cats = {"n_hits_own_chromosome", "n_hits_own_plasmid", "n_hits_other_chromosome",
+                      "n_hits_other_plasmid", "n_hits_external"}
+        _exclude = {"bacterium", "Candidatus bacterium"}
+        species_cols = [c for c in sub.columns if c.startswith("n_hits_") and c not in known_cats
+                        and c.replace("n_hits_", "").replace("_", " ") not in _exclude]
+
+        species_totals = sub[species_cols].sum().sort_values(ascending=False)
+        top_species_cols = list(species_totals.index[:n_species])
+        other_species_cols = [c for c in species_cols if c not in top_species_cols]
+        top_species_labels = [c.replace("n_hits_", "").replace("_", " ") for c in top_species_cols]
+
+        color_map = {c: _species_palette[i % len(_species_palette)] for i, c in enumerate(top_species_cols)}
+        color_map["_other"] = COLORS["gray"]
+
+        all_lengths = sub["length"].dropna().values
+        x_min_s = max(all_lengths.min(), 1) if log_x else all_lengths.min()
+        x_max_s = x_max if x_max is not None else all_lengths.max()
+        bin_edges_s = (
+            np.logspace(np.log10(x_min_s), np.log10(x_max_s), bins + 1)
+            if log_x else np.linspace(x_min_s, x_max_s, bins + 1)
+        )
+
+        bin_idx = np.digitize(all_lengths, bin_edges_s) - 1
+        bin_idx = np.clip(bin_idx, 0, len(bin_edges_s) - 2)
+        sub = sub.loc[sub["length"].dropna().index].copy()
+        sub["_bin"] = bin_idx
+
+        bar_counts, _ = np.histogram(all_lengths, bins=bin_edges_s)
+        total_per_bin = np.array([sub[sub["_bin"] == b][species_cols].sum(axis=1).sum()
+                                  for b in range(len(bin_edges_s) - 1)])
+
+        fig, ax = plt.subplots(figsize=figsize)
+        bottoms = np.zeros(len(bin_edges_s) - 1)
+        handles = []
+
+        for sc in top_species_cols + ["_other"]:
+            bin_totals = np.array([
+                sub[sub["_bin"] == b][other_species_cols].sum(axis=1).sum()
+                if sc == "_other"
+                else sub[sub["_bin"] == b][sc].sum()
+                for b in range(len(bin_edges_s) - 1)
+            ])
+            rel = np.where(total_per_bin > 0, bin_totals / total_per_bin, 0)
+            heights = rel * bar_counts
+            label = "Other" if sc == "_other" else sc.replace("n_hits_", "").replace("_", " ")
+            ax.bar(bin_edges_s[:-1], heights, width=np.diff(bin_edges_s),
+                   bottom=bottoms, align="edge",
+                   color=color_map[sc], edgecolor="white", linewidth=0.4)
+            handles.append((plt.Rectangle((0, 0), 1, 1, color=color_map[sc], linewidth=0), label))
+            bottoms = bottoms + heights
+
+        if min_length_threshold is not None and not filter_below_threshold:
+            ax.axvline(min_length_threshold, color="#7a7a7a", linestyle="--", linewidth=1.2)
+
+        h, l = zip(*reversed(handles))
+        ax.legend(h, l, frameon=False, fontsize=11,
+                  title=legend_title if legend_title is not None else "Species (hit counts)",
+                  title_fontsize=12, loc="upper right")
+        ax.set_xlabel("Insertion length (bp)", fontsize=14)
+        ax.set_ylabel("Count", fontsize=14)
+        if log_y:
+            ax.set_yscale("log")
+        if log_x:
+            ax.set_xscale("log")
+        if y_max is not None:
+            ax.set_ylim(top=y_max)
+        if x_max is not None:
+            ax.set_xlim(right=x_max)
+        ax.tick_params(axis="both", labelsize=12, length=3)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout()
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+            fig.savefig(save_path, bbox_inches="tight")
+            print(f"Saved figure to {save_path}")
+        else:
+            plt.show()
+        return fig, ax
+
+    if insertions_only:
+        active_cfg = [c for c in event_cfg if c[0] == "insertion"]
+    else:
+        active_cfg = event_cfg
+
+    all_lengths = plot_df[
+        plot_df["event_type"].isin([e for e, _ in active_cfg])
+    ]["length"].dropna().values
     if len(all_lengths) == 0:
         return
 
@@ -2366,44 +2769,98 @@ def plot_event_length_distribution(
     else:
         bin_edges = np.linspace(x_min, x_max_data, bins + 1)
 
-    fig, axes_grid = plt.subplots(2, 2, figsize=figsize, sharex=True, sharey=True)
-    fig.subplots_adjust(hspace=0.25, wspace=0.1)
-    axes = axes_grid.flatten()
+    if insertions_only:
+        if figsize is None:
+            figsize = (6, 4)
+        fig, ax_single = plt.subplots(figsize=figsize)
+        axes_list = [ax_single]
+        axes_grid = None
+    else:
+        if figsize is None:
+            figsize = (10, 8)
+        fig, axes_grid = plt.subplots(2, 2, figsize=figsize, sharex=True, sharey=True)
+        fig.subplots_adjust(hspace=0.3, wspace=0.12)
+        axes_list = axes_grid.flatten()
 
-    for ax, (etype, color) in zip(axes, event_cfg):
+    for ax, (etype, color) in zip(axes_list, active_cfg):
         sub = plot_df[plot_df["event_type"] == etype]
+
         if not sub.empty and "length" in sub.columns:
-            lengths = sub["length"].dropna().values
-            ax.hist(lengths, bins=bin_edges, color=color, alpha=0.85, edgecolor="none")
+            if color_by_mge:
+                lengths_by_label = {
+                    lbl: sub.loc[sub["mge_label"] == lbl, "length"].dropna().values
+                    for lbl in mge_order
+                }
+                active_labels = [lbl for lbl in mge_order if len(lengths_by_label[lbl]) > 0]
+                colors = [_MGE_STYLE[lbl][0] for lbl in active_labels]
+                alphas = [_MGE_STYLE[lbl][1] for lbl in active_labels]
+
+                # matplotlib stacked hist doesn't support per-bar alpha;
+                # draw layers manually from bottom up
+                bottoms = np.zeros(len(bin_edges) - 1)
+                handles = []
+                for lbl, c, a in zip(active_labels, colors, alphas):
+                    vals, _ = np.histogram(lengths_by_label[lbl], bins=bin_edges)
+                    ax.bar(
+                        bin_edges[:-1], vals, width=np.diff(bin_edges),
+                        bottom=bottoms, align="edge",
+                        color=c, alpha=a, edgecolor="white", linewidth=0.4,
+                    )
+                    handles.append(plt.Rectangle((0, 0), 1, 1, color=c, alpha=a, linewidth=0))
+                    bottoms = bottoms + vals
+
+                display_labels = [_MGE_DISPLAY_NAME.get(l, l) for l in active_labels]
+                ax.legend(
+                    handles[::-1], display_labels[::-1],
+                    frameon=False, fontsize=11,
+                    title=legend_title if legend_title is not None else "Mobile genetic elements", title_fontsize=12,
+                )
+            else:
+                ax.hist(
+                    sub["length"].dropna().values, bins=bin_edges,
+                    color=color, edgecolor="white", linewidth=0.4,
+                )
+
         if min_length_threshold is not None and not filter_below_threshold:
-            ax.axvline(min_length_threshold, color="red", linestyle="--", linewidth=1.2,
-                       label=f"cutoff = {min_length_threshold} bp")
-            ax.legend(frameon=False, fontsize=10)
-        ax.set_title(etype.capitalize())
+            ax.axvline(
+                min_length_threshold, color="#7a7a7a",
+                linestyle="--", linewidth=1.2,
+                label=f"cutoff = {min_length_threshold} bp",
+            )
+            if not color_by_mge:
+                ax.legend(frameon=False, fontsize=10)
+
+        if not insertions_only:
+            ax.set_title(etype.capitalize(), fontsize=14, fontweight="normal", pad=6)
         if log_y:
             ax.set_yscale("log")
         if log_x:
             ax.set_xscale("log")
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-        ax.tick_params(axis="x", labelbottom=True)
+        ax.tick_params(axis="both", labelsize=12, length=3)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
+        ax.set_axisbelow(True)
 
     if y_max is not None:
-        axes[0].set_ylim(top=y_max)
+        axes_list[0].set_ylim(top=y_max)
     if x_max is not None:
-        axes[0].set_xlim(right=x_max)
+        axes_list[0].set_xlim(right=x_max)
 
-    for ax in axes_grid[1, :]:
-        ax.set_xlabel("Event length (bp)")
-    for ax in axes_grid[:, 0]:
-        ax.set_ylabel("Count")
+    if insertions_only:
+        axes_list[0].set_xlabel("Event length (bp)", fontsize=14)
+        axes_list[0].set_ylabel("Count", fontsize=14)
+    else:
+        for ax in axes_grid[1, :]:
+            ax.set_xlabel("Event length (bp)", fontsize=14)
+        for ax in axes_grid[:, 0]:
+            ax.set_ylabel("Count", fontsize=14)
 
-    fig.suptitle("Length distribution of events by type")
     plt.tight_layout()
 
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, bbox_inches="tight")
         print(f"Saved figure to {save_path}")
     else:
         plt.show()
@@ -2509,7 +2966,8 @@ def add_annotations_for_dash(
         if ann.empty or "feature" not in ann.columns:
             ann = pd.DataFrame(columns=["seqid", "feature", "start", "end", "attrs", "is_subtype"])
 
-        DEF_COLOR = "rgb(152,78,163)"  # purple, far from inversion red
+        DEF_COLOR = "rgb(152,78,163)"    # medium purple
+        INT_COLOR = "rgb(196,150,210)"   # lighter purple for integrons
         PROPH_COLOR = "rgb(27,158,119)"
         IS_BASE = (55, 126, 184)
 
@@ -2567,6 +3025,19 @@ def add_annotations_for_dash(
                     name="Defense system",
                     end=ds["end"].tolist(),
                     length=ds["length"].tolist()
+                )
+
+            # add integron annotations (CALIN feature type)
+            it = sub[sub["feature"].isin(["integron", "CALIN"])]
+            if not it.empty:
+                _add_anno_bar(
+                    x=(it["end"] - it["start"]).tolist(),
+                    y=[label] * len(it),
+                    base=(it["start"]).tolist(),
+                    color_rgb=INT_COLOR,
+                    name="Integron",
+                    end=it["end"].tolist(),
+                    length=it["length"].tolist()
                 )
 
             # add IS annotations
@@ -2690,36 +3161,20 @@ def add_annotations_for_dash(
         if os.path.exists(deletions_file):
             del_df = pd.read_csv(deletions_file)
 
-            # Collect all deletion markers, grouping by (label, position)
-            del_grouped = {}  # (label, position) -> list of row dicts
-
+            del_xs, del_ys, del_customdata = [], [], []
             for label in y_labels:
                 sub_del = del_df[del_df["genome_name"] == label]
                 if sub_del.empty:
                     continue
-
                 for _, row in sub_del.iterrows():
-                    key = (label, row["position"])
                     del_name = row["deletion"]
                     del_num = del_name.replace("deletion", "") if "deletion" in str(del_name) else del_name
                     n_blocks = str(row.get("path", "")).count("[")
-                    del_grouped.setdefault(key, []).append({
-                        "num": del_num, "length": row["length"], "strand": row.get("strand", ""), "blocks": n_blocks,
-                    })
-
-            if del_grouped:
-                del_xs = []
-                del_ys = []
-                del_hovertexts = []
-
-                for (label, pos), entries in del_grouped.items():
-                    del_xs.append(pos)
+                    del_xs.append(row["position"])
                     del_ys.append(label)
-                    lines = [f"<b>Deletion (#{e['num']})</b> Length={e['length']:g} Strand={e['strand']} Blocks={e['blocks']}" for e in entries]
-                    pos_str = "N/A" if (pos != pos) else str(int(pos))  # NaN check
-                    hover = f"Position = {pos_str}<br>" + "<br>".join(lines)
-                    del_hovertexts.append(hover)
+                    del_customdata.append([del_num, row["length"], row.get("strand", ""), n_blocks])
 
+            if del_xs:
                 fig.add_trace(go.Scatter(
                     x=del_xs,
                     y=del_ys,
@@ -2732,8 +3187,15 @@ def add_annotations_for_dash(
                     ),
                     name="Deletion",
                     showlegend=True,
-                    hovertemplate="%{text}<extra></extra>",
-                    text=del_hovertexts,
+                    customdata=del_customdata,
+                    hovertemplate=(
+                        "<b>Deletion (#%{customdata[0]})</b>"
+                        "<br>Position = %{x:d}"
+                        "<br>Length = %{customdata[1]:d}"
+                        "<br>Strand = %{customdata[2]}"
+                        "<br>Blocks = %{customdata[3]}"
+                        "<extra></extra>"
+                    ),
                 ))
 
         # Load inversions
@@ -2907,6 +3369,8 @@ def plot_marginal_scatter(
     show_histograms: bool = True,
     subplot_arrangement: tuple = None,
     shared_colorbar: bool = True,
+    colorbar_label: str = None,
+    save_path: str = None,
 ):
     """
     Scatter plot with marginal histograms, similar to panel (b),
@@ -2967,11 +3431,6 @@ def plot_marginal_scatter(
     # Multi-panel mode                                                     #
     # ------------------------------------------------------------------ #
     if subplot_arrangement is not None:
-        from matplotlib.colors import (
-            to_rgba, LinearSegmentedColormap, LogNorm, Normalize,
-        )
-        from matplotlib.cm import ScalarMappable
-
         if not isinstance(color_by_event_count, list):
             raise ValueError(
                 "When subplot_arrangement is given, color_by_event_count must be a list."
@@ -3018,8 +3477,7 @@ def plot_marginal_scatter(
             figsize=figsize,
             squeeze=False,
         )
-        right_margin = 0.88 if shared_colorbar else 0.97
-        fig.subplots_adjust(right=right_margin, hspace=0.45, wspace=0.35)
+        fig.subplots_adjust(hspace=0.5, wspace=0.38)
 
         for idx, col in enumerate(event_cols):
             ax = axes[idx // ncols][idx % ncols]
@@ -3037,13 +3495,13 @@ def plot_marginal_scatter(
 
             # gray for zero
             if (~nonzero_mask).any():
-                gray_fc = (*to_rgba("#999999")[:3], fill_alpha) if filled else (0, 0, 0, 0)
-                gray_ec = (*to_rgba("#999999")[:3], edge_alpha)
+                gray_fc = (*to_rgba("#cccccc")[:3], fill_alpha) if filled else (0, 0, 0, 0)
+                gray_ec = (*to_rgba("#aaaaaa")[:3], edge_alpha)
                 ax.scatter(
                     data.loc[~nonzero_mask, x_col],
                     data.loc[~nonzero_mask, "_y_jittered"],
                     s=scatter_size, facecolors=gray_fc, edgecolors=gray_ec,
-                    linewidths=point_linewidth,
+                    linewidths=point_linewidth, zorder=1,
                 )
 
             # colored for non-zero
@@ -3056,21 +3514,25 @@ def plot_marginal_scatter(
                 ax.scatter(
                     nd[x_col], nd["_y_jittered"],
                     s=scatter_size, facecolors=face_colors, edgecolors=edge_colors,
-                    linewidths=point_linewidth,
+                    linewidths=point_linewidth, zorder=2,
                 )
 
             ax.set_xscale("log")
             ax.set_yscale("log")
-            ax.set_title(_cbar_labels.get(col, col), fontsize=12)
-            ax.set_xlabel(_axis_labels.get(x_col, x_col))
-            ax.set_ylabel(_axis_labels.get(y_col, y_col))
+            ax.set_title(_cbar_labels.get(col, col), fontsize=14, pad=6)
+            ax.set_xlabel(_axis_labels.get(x_col, x_col), fontsize=13)
+            ax.set_ylabel(_axis_labels.get(y_col, y_col), fontsize=13)
+            ax.tick_params(axis="both", labelsize=11)
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
+            ax.grid(True, which="major", linestyle="--", linewidth=0.4, alpha=0.4)
 
             if not shared_colorbar:
                 sm_panel = ScalarMappable(cmap=event_cmap, norm=panel_norm)
                 sm_panel.set_array([])
-                fig.colorbar(sm_panel, ax=ax, fraction=0.046, pad=0.04)
+                cbar = fig.colorbar(sm_panel, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label(_cbar_labels.get(col, col), fontsize=11)
+                cbar.ax.tick_params(labelsize=10)
 
         # hide unused axes
         for idx in range(len(event_cols), nrows * ncols):
@@ -3080,10 +3542,15 @@ def plot_marginal_scatter(
         if shared_colorbar:
             sm = ScalarMappable(cmap=event_cmap, norm=norm)
             sm.set_array([])
-            cbar_ax = fig.add_axes([0.90, 0.15, 0.025, 0.7])
+            cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
             cbar = fig.colorbar(sm, cax=cbar_ax)
-            cbar.set_label("n. events", fontsize=9)
+            cbar.set_label("n. events", fontsize=12)
+            cbar.ax.tick_params(labelsize=11)
 
+        if save_path is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+            fig.savefig(save_path, bbox_inches="tight")
+            print(f"Saved figure to {save_path}")
         return fig, axes
 
     # ------------------------------------------------------------------ #
@@ -3150,7 +3617,6 @@ def plot_marginal_scatter(
     if color_by_n_clusters:
         for v in cluster_values:
             mask = data["n_clusters"] == v
-            from matplotlib.colors import to_rgba
             fc = (*to_rgba(cluster_colors[v])[:3], fill_alpha) if filled else (0, 0, 0, 0)
             ec = (*to_rgba(cluster_colors[v])[:3], edge_alpha)
             ax_scatter.scatter(
@@ -3165,14 +3631,12 @@ def plot_marginal_scatter(
         # legend added after layout below
         pass
     elif color_by_event_count is not None:
-        from matplotlib.colors import to_rgba, LinearSegmentedColormap
         if power_norm_color_scale:
             _event_cmap_colors = ["#b5d2f2", "#7394c2", "#a6444f"]
         else:
             _event_cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
         event_cmap = LinearSegmentedColormap.from_list("event_cmap", _event_cmap_colors)
 
-        from matplotlib.colors import LogNorm, Normalize, PowerNorm
         event_vals = data[color_by_event_count].values
         nonzero_mask = event_vals > 0
         vmax = event_vals.max() if event_vals.max() > 0 else 1
@@ -3209,7 +3673,6 @@ def plot_marginal_scatter(
                 linewidths=point_linewidth,
             )
     else:
-        from matplotlib.colors import to_rgba
         fc = (*to_rgba("0.5")[:3], fill_alpha) if filled else (0, 0, 0, 0)
         ec = (*to_rgba("0.5")[:3], edge_alpha)
         ax_scatter.scatter(
@@ -3229,8 +3692,10 @@ def plot_marginal_scatter(
         ax_scatter.set_xscale("log")
     if log_y:
         ax_scatter.set_yscale("log")
-    ax_scatter.set_xlabel(_axis_labels.get(x_col, x_col))
-    ax_scatter.set_ylabel(_axis_labels.get(y_col, y_col))
+    ax_scatter.set_xlabel(_axis_labels.get(x_col, x_col), fontsize=15)
+    ax_scatter.set_ylabel(_axis_labels.get(y_col, y_col), fontsize=15)
+    ax_scatter.tick_params(axis="both", labelsize=13)
+    ax_scatter.grid(True, which="major", linestyle="--", linewidth=0.5, alpha=0.4)
 
     if show_histograms:
         # histograms from original, non-jittered data
@@ -3245,16 +3710,15 @@ def plot_marginal_scatter(
                 [data.loc[data["n_clusters"] == v, x_col] for v in cluster_values],
                 bins=x_bins,
                 color=[cluster_colors[v] for v in cluster_values],
-                stacked=True, edgecolor="none",
+                stacked=True, edgecolor="white", linewidth=0.4,
             )
             ax_histy.hist(
                 [data.loc[data["n_clusters"] == v, y_col] for v in cluster_values],
                 bins=y_bins, orientation="horizontal",
                 color=[cluster_colors[v] for v in cluster_values],
-                stacked=True, edgecolor="none",
+                stacked=True, edgecolor="white", linewidth=0.4,
             )
         elif color_by_event_count is not None:
-            from matplotlib.colors import LinearSegmentedColormap
             _hcmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
             hcmap = LinearSegmentedColormap.from_list("event_cmap", _hcmap_colors)
             hnorm = log_norm
@@ -3264,28 +3728,33 @@ def plot_marginal_scatter(
                     mask = (data[col] >= bins[i]) & (data[col] < bins[i + 1])
                     if not mask.any():
                         continue
-                    mean_val = data.loc[mask, color_by_event_count].mean()
-                    color = "#999999" if mean_val <= 0 else hcmap(hnorm(mean_val))
+                    median_val = data.loc[mask, color_by_event_count].median()
+                    color = "#999999" if median_val <= 0 else hcmap(hnorm(median_val))
                     count = mask.sum()
                     w = bins[i + 1] - bins[i]
                     if orientation == "vertical":
-                        ax.bar(bins[i], count, width=w, align="edge", color=color, edgecolor="none")
+                        ax.bar(bins[i], count, width=w, align="edge", color=color,
+                               edgecolor="white", linewidth=0.4)
                     else:
-                        ax.barh(bins[i], count, height=w, align="edge", color=color, edgecolor="none")
+                        ax.barh(bins[i], count, height=w, align="edge", color=color,
+                                edgecolor="white", linewidth=0.4)
 
             _colored_hist(ax_histx, x_col, x_bins, orientation="vertical")
             _colored_hist(ax_histy, y_col, y_bins, orientation="horizontal")
         else:
-            ax_histx.hist(data[x_col], bins=x_bins, color="0.7", edgecolor="0.55")
+            ax_histx.hist(data[x_col], bins=x_bins, color=COLORS["mid_blue"],
+                          edgecolor="white", linewidth=0.4)
             ax_histy.hist(data[y_col], bins=y_bins, orientation="horizontal",
-                          color="0.7", edgecolor="0.55")
+                          color=COLORS["mid_blue"], edgecolor="white", linewidth=0.4)
 
         if log_x:
             ax_histx.set_xscale("log")
         if log_y:
             ax_histy.set_yscale("log")
-        ax_histx.set_ylabel("n. junctions")
-        ax_histy.set_xlabel("n. junctions")
+        ax_histx.set_ylabel("n. junctions", fontsize=13)
+        ax_histy.set_xlabel("n. junctions", fontsize=13)
+        ax_histx.tick_params(axis="y", labelsize=12)
+        ax_histy.tick_params(axis="x", labelsize=12)
         plt.setp(ax_histx.get_xticklabels(), visible=False)
         plt.setp(ax_histy.get_yticklabels(), visible=False)
 
@@ -3294,16 +3763,15 @@ def plot_marginal_scatter(
         ax.spines["right"].set_visible(False)
 
     if color_by_n_clusters:
-        fig.subplots_adjust(right=0.78)
+        fig.subplots_adjust(right=0.76)
         handles, labels = ax_scatter.get_legend_handles_labels()
         fig.legend(handles, labels,
                    title="n. additional\nclusters",
-                   frameon=False, fontsize=8,
+                   title_fontsize=13,
+                   frameon=False, fontsize=13,
                    loc="center left",
-                   bbox_to_anchor=(0.80, 0.45))
+                   bbox_to_anchor=(0.78, 0.38))
     elif color_by_event_count is not None:
-        from matplotlib.cm import ScalarMappable
-        from matplotlib.colors import LogNorm, Normalize, LinearSegmentedColormap
         if power_norm_color_scale:
             _event_cmap_colors = ["#b5d2f2", "#7394c2", "#a6444f"]
         else:
@@ -3324,7 +3792,14 @@ def plot_marginal_scatter(
             "n_translocation":"n. translocations",
             "n_inversion":    "n. inversions",
         }
-        cbar.set_label(_cbar_labels.get(color_by_event_count, color_by_event_count), fontsize=9)
+        _label = colorbar_label if colorbar_label is not None else _cbar_labels.get(color_by_event_count, color_by_event_count)
+        cbar.set_label(_label, fontsize=14)
+        cbar.ax.tick_params(labelsize=13)
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        fig.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
 
     if show_histograms:
         return fig, (ax_scatter, ax_histx, ax_histy)
@@ -4126,6 +4601,12 @@ def plot_fitch_tree(tree, iso_to_cluster, state_sets, junction_name, ax=None, sa
     """
     import matplotlib.patches as mpatches
 
+    # remap cluster ids to consecutive 0, 1, 2, ...
+    observed_clusters = sorted(set(iso_to_cluster.values()))
+    cl_remap = {old: new for new, old in enumerate(observed_clusters)}
+    iso_to_cluster = {iso: cl_remap[cl] for iso, cl in iso_to_cluster.items()}
+    state_sets = {clade: {cl_remap[c] for c in ss} for clade, ss in state_sets.items()}
+
     n_tips = len(iso_to_cluster)
 
     if ax is None:
@@ -4244,3 +4725,566 @@ def plot_fitch_tree(tree, iso_to_cluster, state_sets, junction_name, ax=None, sa
             plt.close(fig)
     elif created_fig:
         plt.show()
+
+
+def plot_path_comparison_lengths(
+    path_comparison_df,
+    cols=("shared_length", "exclusive_length_1", "exclusive_length_2", "exclusive_length"),
+    labels=("shared", "exclusive (cluster 1)", "exclusive (cluster 2)", "exclusive (combined)"),
+    bins=40,
+    histogram=True,
+    cumulative=True,
+    log_x=False,
+    log_y=False,
+    figsize=None,
+    save_path=None,
+):
+    """
+    Plot histogram and/or reverse CDF of path comparison lengths.
+
+    Parameters
+    ----------
+    path_comparison_df : pd.DataFrame
+        Output of compare_consensus_paths loop, one row per junction.
+    cols : sequence of str
+        Columns to plot.
+    labels : sequence of str
+        Legend labels corresponding to each column.
+    bins : int
+    histogram : bool
+        If True, plot the histogram panel.
+    cumulative : bool
+        If True, plot the reverse CDF panel.
+    log_x, log_y : bool
+    figsize : tuple or None
+        Defaults to (5, 4) per panel.
+    save_path : str or None
+    """
+    n_panels = int(histogram) + int(cumulative)
+    if n_panels == 0:
+        return
+
+    if figsize is None:
+        figsize = (5 * n_panels, 4)
+
+    fig, axes = plt.subplots(1, n_panels, figsize=figsize)
+    if n_panels == 1:
+        axes = [axes]
+
+    panel_iter = iter(axes)
+    ax_hist = next(panel_iter) if histogram else None
+    ax_cdf  = next(panel_iter) if cumulative else None
+
+    color_list = [
+        COLORS["mid_blue"], COLORS["reddish"], COLORS["reddish"],
+        COLORS["reddish"], COLORS["reddish"], COLORS["reddish"],
+    ]
+
+    for ax in axes:
+        ax.yaxis.grid(True, color="0.92", linewidth=0.8, zorder=0)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    for col, label, color in zip(cols, labels, color_list):
+        if col not in path_comparison_df.columns:
+            continue
+        vals = path_comparison_df[col].dropna().values
+
+        if ax_hist is not None:
+            weights = np.ones(len(vals)) / len(vals) * 100
+            ax_hist.hist(vals, bins=bins, color=color, edgecolor="white", linewidth=0.5,
+                         alpha=0.75, label=label, weights=weights)
+
+        if ax_cdf is not None:
+            sv = np.sort(vals)
+            y = np.arange(len(sv), 0, -1) / len(sv) * 100
+            # prepend a point at x=0 so the fill covers the full width of the line
+            sv_fill = np.concatenate([[0], sv])
+            y_fill = np.concatenate([[100], y])
+            ax_cdf.plot(sv, y, color=color, linewidth=2.0, label=label)
+            ax_cdf.fill_between(sv_fill, y_fill, alpha=0.12, color=color)
+
+    if ax_hist is not None:
+        ax_hist.set_xlabel("Length (bp)", fontsize=16)
+        ax_hist.set_ylabel("Relative frequency (%)", fontsize=16)
+        ax_hist.tick_params(labelsize=14)
+        if len(cols) > 1:
+            ax_hist.legend(fontsize=13, frameon=False)
+
+    if ax_cdf is not None:
+        ax_cdf.set_xlabel("Length (bp)", fontsize=16)
+        ax_cdf.set_ylabel("Fraction of junctions ≥ x (%)", fontsize=16)
+        ax_cdf.tick_params(labelsize=14)
+        ax_cdf.set_ylim(0, 102)
+        if len(cols) > 1:
+            ax_cdf.legend(fontsize=13, frameon=False)
+
+    for ax in axes:
+        if log_x:
+            ax.set_xscale("log")
+        if log_y:
+            ax.set_yscale("log")
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+
+def plot_event_mge_heatmap(
+    deduplicated_events_df,
+    figsize=(7, 5),
+    save_path=None,
+):
+    """
+    Heatmap of event types vs. MGE association.
+
+    For each event type (rows) and MGE category (columns), shows the count of
+    events associated with that MGE type. Events with n_mge == 0 are shown in
+    a 'None' column. Annotated with counts. Color scale matches plot_marginal_scatter.
+
+    Parameters
+    ----------
+    deduplicated_events_df : pd.DataFrame
+        Output of deduplicate_events(), must contain 'event_type', 'n_prophage',
+        'n_integron', 'n_defense_system', 'n_is', 'n_mge'.
+    figsize : tuple
+    save_path : str or None
+    """
+    df = deduplicated_events_df[
+        deduplicated_events_df["event_type"] != "ambiguous_insertion"
+    ].copy()
+
+    event_order = ["insertion", "deletion", "translocation", "inversion"]
+    event_order = [e for e in event_order if e in df["event_type"].unique()]
+
+    mge_cols = {
+        "Prophage":              "n_prophage",
+        "Integron":              "n_integron",
+        "Defense system":        "n_defense_system",
+        "IS":                    "n_is",
+        "Prophage (associated)": "n_prophage_associated",
+        "IS (associated)":       "n_is_associated",
+    }
+
+    rows = []
+    for etype in event_order:
+        sub = df[df["event_type"] == etype]
+        row = {}
+        for label, col in mge_cols.items():
+            row[label] = int((sub[col] > 0).sum()) if col in sub.columns else 0
+        row["None"] = int((sub["n_mge"] == 0).sum()) if "n_mge" in sub.columns else len(sub)
+        rows.append(row)
+
+    heatmap_df = pd.DataFrame(rows, index=event_order)
+    col_order = ["Integron", "Prophage", "IS", "Defense system",
+                 "Prophage (associated)", "IS (associated)", "None"]
+    heatmap_df = heatmap_df[col_order]
+
+    _cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
+    cmap = LinearSegmentedColormap.from_list("event_mge_cmap", _cmap_colors)
+    cmap.set_bad(color="#aaaaaa")  # grey for zero / masked cells
+
+    values = heatmap_df.values.astype(float)
+    vmin = max(values[values > 0].min(), 1) if (values > 0).any() else 1
+    vmax = values.max()
+    norm = LogNorm(vmin=vmin, vmax=vmax)
+
+    # mask zeros so they render as grey
+    masked_values = np.ma.masked_where(values == 0, values)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(masked_values, aspect="auto", cmap=cmap, norm=norm)
+
+    # draw grey background for zero cells explicitly
+    ax.imshow(np.where(values == 0, 1, np.nan), aspect="auto",
+              cmap=LinearSegmentedColormap.from_list("grey_only", ["#aaaaaa", "#aaaaaa"]),
+              vmin=0, vmax=1, zorder=0)
+
+    ax.set_xticks(range(len(col_order)))
+    ax.set_xticklabels(col_order, fontsize=13, rotation=40, ha="right", rotation_mode="anchor")
+    ax.set_yticks(range(len(event_order)))
+    ax.set_yticklabels([e.capitalize() for e in event_order], fontsize=13)
+
+    # annotate cells with counts; use log-normalized brightness to pick text color
+    for i in range(len(event_order)):
+        for j in range(len(col_order)):
+            val = heatmap_df.iloc[i, j]
+            if val == 0:
+                text_color = "white"
+            else:
+                normed = norm(val)
+                text_color = "white" if normed > 0.6 else "black"
+            ax.text(j, i, str(val), ha="center", va="center",
+                    fontsize=11, color=text_color, fontweight="bold")
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("n. events", fontsize=13)
+    cbar.ax.tick_params(labelsize=12)
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(length=0)
+    ax.set_xlabel("MGE category", fontsize=14, labelpad=10)
+    ax.set_ylabel("Event type", fontsize=14, labelpad=8)
+    ax.xaxis.set_label_position("bottom")
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        fig.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+    return fig, ax
+
+
+def plot_event_mge_stacked_bar(
+    deduplicated_events_df,
+    figsize=(7, 5),
+    save_path=None,
+):
+    """
+    Stacked bar chart of event types vs. MGE association.
+
+    Each bar shows the count of events per event type, stacked by MGE category.
+    Full associations (Prophage, IS) are shown in solid colors; associated/partial
+    and always-associated categories (Defense system, Integron) are shown
+    semi-transparent. None is grey.
+    """
+    # --- color / style config ---------------------------------------------------
+    _CAT_STYLE = {
+        # label          : (hex_color,  alpha)
+        "Prophage":              ("#a6444f", 1.0),   # reddish, solid
+        "Prophage (associated)": ("#c98087", 1.0),   # lighter reddish, solid
+        "IS":                    ("#7394c2", 1.0),   # mid_blue, solid
+        "IS (associated)":       ("#b5d2f2", 1.0),   # light_blue, solid
+        "Defense system":        ("#80557e", 1.0),   # purple, solid
+        "Integron":              ("#d991b4", 1.0),   # pink, solid
+        "None":                  ("#7a7a7a", 1.0),   # grey
+    }
+    _DISPLAY_NAME = {
+        "Defense system":        "Defense system (associated)",
+        "Integron":              "Integron (associated)",
+    }
+    # stack order bottom → top (legend shows top → bottom = Prophage first)
+    _STACK_ORDER = [
+        "None", "IS (associated)", "IS",
+        "Defense system", "Integron",
+        "Prophage (associated)", "Prophage",
+    ]
+
+    mge_cols = {
+        "Prophage":              "n_prophage",
+        "Prophage (associated)": "n_prophage_associated",
+        "IS":                    "n_is",
+        "IS (associated)":       "n_is_associated",
+        "Defense system":        "n_defense_system",
+        "Integron":              "n_integron",
+    }
+
+    df = deduplicated_events_df[
+        deduplicated_events_df["event_type"] != "ambiguous_insertion"
+    ].copy()
+
+    event_order = ["insertion", "deletion", "translocation", "inversion"]
+    event_order = [e for e in event_order if e in df["event_type"].unique()]
+
+    # build counts dataframe
+    rows = {}
+    for etype in event_order:
+        sub = df[df["event_type"] == etype]
+        row = {}
+        for label, col in mge_cols.items():
+            row[label] = int((sub[col] > 0).sum()) if col in sub.columns else 0
+        row["None"] = int((sub["n_mge"] == 0).sum()) if "n_mge" in sub.columns else len(sub)
+        rows[etype] = row
+
+    counts = pd.DataFrame(rows, index=_STACK_ORDER).T  # shape: event_order x categories
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    x = np.arange(len(event_order))
+    bottoms = np.zeros(len(event_order))
+
+    bar_handles = []
+    for cat in _STACK_ORDER:
+        color, alpha = _CAT_STYLE[cat]
+        vals = counts[cat].values.astype(float)
+        bars = ax.bar(
+            x, vals, bottom=bottoms,
+            color=color, alpha=alpha,
+            width=0.6, edgecolor="white", linewidth=0.5,
+        )
+        # legend handle with correct visual appearance
+        display = _DISPLAY_NAME.get(cat, cat)
+        handle = plt.Rectangle((0, 0), 1, 1, color=color,
+                                alpha=alpha, linewidth=0)
+        bar_handles.append((handle, display))
+        bottoms += vals
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([e.capitalize() for e in event_order], fontsize=13)
+    ax.set_ylabel("n. events", fontsize=14)
+    ax.set_xlabel("Event type", fontsize=14)
+    ax.tick_params(axis="both", labelsize=12, length=0)
+    ax.yaxis.grid(True, linestyle="--", linewidth=0.6, alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    handles, labels = zip(*reversed(bar_handles))
+    ax.legend(handles, labels, fontsize=11, frameon=False,
+              loc="upper right", title="MGE category",
+              title_fontsize=12)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        fig.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+    return fig, ax
+
+def plot_hits_distribution(
+    df,
+    column,
+    bins=50,
+    bin_width=None,
+    cumulative=False,
+    log_x=False,
+    log_y=False,
+    title=None,
+    color_by=None,
+    color_by_species=False,
+    n_species=5,
+    legend_labels=None,
+    legend_title="",
+    xlabel=None,
+    figsize=(8, 4),
+    save_path=None,
+    two_colors=False,
+    stacked=False,
+):
+    """
+    Plot the distribution of one or more hits/genomes columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing the column(s).
+    column : str or list of str
+        Column(s) to plot, e.g. 'n_hits_external' or
+        ['n_hits_external', 'n_genomes_external'].
+    bins : int
+        Number of histogram bins (ignored in cumulative mode).
+    cumulative : bool
+        If True, plot a reverse ECDF (fraction >= x) instead of a histogram.
+    log_x : bool
+        Use log scale on the x-axis. Zero values are dropped automatically.
+    log_y : bool
+        Use log scale on the y-axis.
+    title : str or None
+        Plot title; defaults to the column name (or first column if multiple).
+    color_by : str or None
+        Column name to color by (e.g. 'majority_organism'). When set, a
+        stacked histogram is drawn with one color per category. Only one
+        column may be plotted in this mode.
+    figsize : tuple
+    save_path : str or None
+    """
+    _palette = [COLORS["mid_blue"], COLORS["reddish"]] if two_colors else [
+        COLORS["light_blue"], COLORS["mid_blue"], COLORS["purple"], COLORS["dark_blue"],
+        COLORS["reddish"], COLORS["rosa"], COLORS["teal"], COLORS["wine"], COLORS["pink"]]
+    _species_default_palette = [
+        COLORS["light_blue"], COLORS["mid_blue"], COLORS["dark_blue"],
+        COLORS["purple"], COLORS["rosa"], COLORS["reddish"]]
+
+    columns = [column] if isinstance(column, str) else column
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Compute shared bin edges across all columns
+    all_values = pd.concat([df[col].dropna() for col in columns])
+    if log_x:
+        all_values = all_values[all_values > 0]
+    if log_x:
+        shared_bins = np.logspace(np.log10(all_values.min()), np.log10(all_values.max()), bins + 1)
+    elif bin_width is not None:
+        shared_bins = np.arange(all_values.min(), all_values.max() + bin_width, bin_width)
+    else:
+        shared_bins = np.linspace(all_values.min(), all_values.max(), bins + 1)
+
+    if color_by is not None:
+        col = columns[0]
+        categories = df[color_by].dropna().unique()
+        categories = sorted(categories, key=lambda x: -(df[color_by] == x).sum())
+        cat_colors = {cat: _palette[i % len(_palette)] for i, cat in enumerate(categories)}
+        # also include rows where color_by is NaN
+        if df[color_by].isna().any():
+            categories = list(categories) + [None]
+            cat_colors[None] = COLORS["gray"]
+
+        bottoms = np.zeros(len(shared_bins) - 1)
+        for cat in categories:
+            mask = df[color_by].isna() if cat is None else (df[color_by] == cat)
+            vals = df.loc[mask, col].dropna()
+            if log_x:
+                vals = vals[vals > 0]
+            counts, _ = np.histogram(vals, bins=shared_bins)
+            label = "unknown" if cat is None else cat
+            ax.bar(
+                shared_bins[:-1], counts, width=np.diff(shared_bins),
+                bottom=bottoms, align="edge",
+                color=cat_colors[cat], label=label, edgecolor="white", linewidth=0.3,
+            )
+            bottoms = bottoms + counts
+
+        # apply custom legend labels in order of categories
+        if legend_labels is not None:
+            handles, _ = ax.get_legend_handles_labels()
+            labels = list(legend_labels) + ["unknown"] * max(0, len(handles) - len(legend_labels))
+        else:
+            handles, labels = ax.get_legend_handles_labels()
+        ax.legend(handles, labels, fontsize=10, frameon=False, title=legend_title, title_fontsize=11, loc="upper right")
+        ax.set_ylabel("Count", fontsize=13)
+        ax.set_xlabel(xlabel if xlabel is not None else col, fontsize=13)
+
+    elif color_by_species:
+        col = columns[0]
+        # identify species columns (n_hits_<Genus>_<species>)
+        known_cats = {"n_hits_own_chromosome", "n_hits_own_plasmid", "n_hits_other_chromosome",
+                      "n_hits_other_plasmid", "n_hits_external"}
+        species_cols = [c for c in df.columns if c.startswith("n_hits_") and c not in known_cats
+                        and not c.startswith("n_hits_n_")]
+
+        # exclude generic/uninformative species labels
+        _exclude = {"bacterium", "Candidatus bacterium"}
+        species_cols = [c for c in species_cols if c.replace("n_hits_", "").replace("_", " ") not in _exclude]
+
+        # pick n most abundant species by total sum
+        species_totals = df[species_cols].sum().sort_values(ascending=False)
+        top_species = list(species_totals.index[:n_species])
+        other_species = [c for c in species_cols if c not in top_species]
+
+        species_labels = [c.replace("n_hits_", "").replace("_", " ") for c in top_species]
+        species_colors = {c: _species_default_palette[i % len(_species_default_palette)] for i, c in enumerate(top_species)}
+        species_colors["_other"] = COLORS["gray"]
+
+        values = df[col].dropna()
+        if log_x:
+            values = values[values > 0]
+
+        # assign each row to a bin
+        bin_idx = np.digitize(values, shared_bins) - 1
+        bin_idx = np.clip(bin_idx, 0, len(shared_bins) - 2)
+        df_plot = df.loc[values.index].copy()
+        df_plot["_bin"] = bin_idx
+
+        bar_widths = np.diff(shared_bins)
+        bottoms = np.zeros(len(shared_bins) - 1)
+
+        for i, sc in enumerate(top_species + ["_other"]):
+            bin_totals = np.zeros(len(shared_bins) - 1)
+            for b in range(len(shared_bins) - 1):
+                in_bin = df_plot[df_plot["_bin"] == b]
+                if sc == "_other":
+                    bin_totals[b] = in_bin[other_species].sum(axis=1).sum() if other_species else 0
+                else:
+                    bin_totals[b] = in_bin[sc].sum() if sc in in_bin.columns else 0
+
+            # normalize to relative within each bar
+            bar_counts, _ = np.histogram(values, bins=shared_bins)
+            total_species_per_bin = np.zeros(len(shared_bins) - 1)
+            for b in range(len(shared_bins) - 1):
+                in_bin = df_plot[df_plot["_bin"] == b]
+                total_species_per_bin[b] = in_bin[species_cols].sum(axis=1).sum()
+
+            rel = np.where(total_species_per_bin > 0, bin_totals / total_species_per_bin, 0)
+            heights = rel * bar_counts
+
+            label = "Other" if sc == "_other" else sc.replace("n_hits_", "").replace("_", " ")
+            if legend_labels is not None and i < len(legend_labels):
+                label = legend_labels[i]
+
+            color = species_colors[sc]
+            ax.bar(shared_bins[:-1], heights, width=bar_widths, bottom=bottoms,
+                   align="edge", color=color, label=label, edgecolor="white", linewidth=0.3)
+            bottoms = bottoms + heights
+
+        ax.legend(fontsize=10, frameon=False, title=legend_title, title_fontsize=11, loc="upper right")
+        ax.set_ylabel("Count", fontsize=13)
+        ax.set_xlabel(xlabel if xlabel is not None else col, fontsize=13)
+
+    else:
+        all_counts = []
+        for i, col in enumerate(columns):
+            color = _palette[i % len(_palette)]
+            values = df[col].dropna()
+            if log_x:
+                values = values[values > 0]
+            lbl = legend_labels[i] if legend_labels is not None and i < len(legend_labels) else col
+
+            if cumulative:
+                sorted_vals = np.sort(values)
+                ecdf = 1 - np.arange(0, len(sorted_vals)) / len(sorted_vals)
+                ax.plot(sorted_vals, ecdf, color=color, linewidth=1.5, label=lbl)
+            elif stacked:
+                counts, _ = np.histogram(values, bins=shared_bins)
+                all_counts.append((counts, color, lbl))
+            else:
+                ax.hist(values, bins=shared_bins, color=color, edgecolor="white",
+                        linewidth=0.4, alpha=0.7, label=lbl)
+
+        if stacked and not cumulative:
+            bottoms = np.zeros(len(shared_bins) - 1)
+            bar_widths = np.diff(shared_bins)
+            for counts, color, lbl in all_counts:
+                ax.bar(shared_bins[:-1], counts, width=bar_widths, bottom=bottoms,
+                       align="edge", color=color, label=lbl, edgecolor="white", linewidth=0.4)
+                bottoms = bottoms + counts
+
+        if cumulative:
+            ax.set_ylabel("Fraction ≥ x", fontsize=13)
+        else:
+            ax.set_ylabel("Count", fontsize=13)
+
+        if len(columns) > 1:
+            ax.legend(fontsize=11, frameon=False, title=legend_title, title_fontsize=11, loc="upper right")
+
+        ax.set_xlabel(xlabel if xlabel is not None else (columns[0] if len(columns) == 1 else ""), fontsize=13)
+
+    ax.set_title(title or "", fontsize=14)
+
+    if log_x:
+        ax.set_xscale("log")
+    if log_y:
+        ax.set_yscale("log")
+
+    ax.tick_params(axis="both", labelsize=11)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        fig.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+
+    return fig, ax

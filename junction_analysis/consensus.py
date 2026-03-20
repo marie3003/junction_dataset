@@ -1453,11 +1453,6 @@ def fitch_parsimony_steps_per_cluster(cluster_df, tree_path, junction_col="junct
 
         observed_clusters = sorted(set(iso_to_cluster.values()))
 
-        # remap cluster ids to consecutive 0, 1, 2, ...
-        cl_remap = {old: new for new, old in enumerate(observed_clusters)}
-        iso_to_cluster = {iso: cl_remap[cl] for iso, cl in iso_to_cluster.items()}
-        observed_clusters = list(range(len(observed_clusters)))
-
         tree = copy.deepcopy(full_tree)
         for tip in list(tree.get_terminals()):
             if tip.name not in present_isolates:

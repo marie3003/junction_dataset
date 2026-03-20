@@ -17,7 +17,7 @@ from Bio.SeqRecord import SeqRecord
 from pathlib import Path
 
 from junction_analysis.consensus import make_deduplicated_paths
-from junction_analysis.helpers import get_isolate_sequence, get_consensus_seq_from_alignment
+from junction_analysis.helpers import get_isolate_sequence, get_consensus_seq_from_alignment, read_gff3_annotations
 from junction_analysis import pangraph_utils as pu
 from junction_analysis.junction_trees import build_tree_from_block_list
 
@@ -942,7 +942,7 @@ def find_insertion_hits_in_plasmids(plasmid_fasta_root, insertions_seq_dir):
                         if dv < 0.01 and coverage >= 0.9:
                             count += 1
                 results.append({
-                    "junction_name": os.path.basename(os.path.dirname(os.path.dirname(dirpath))),
+                    "junction_name": os.path.basename(os.path.dirname(dirpath)),
                     "consensus": os.path.basename(dirpath),
                     "isolate_name": isolate_name,
                     "plasmid_name": plasmid_name,
@@ -1474,6 +1474,264 @@ def combine_all_junctions_summaries(parent_dir, save_df=False):
     return results
 
 
+def annotate_events_with_mges(
+    summaries,
+    mge_dir="../results/junction_mges",
+    min_length=200,
+    fill_threshold=0.8,
+):
+    """
+    Annotate structural events (insertions, deletions, translocations, inversions)
+    with overlapping MGE annotations from per-junction GFF3 files.
+
+    Coverage rules for non-deletion events (insertions / translocations / inversions):
+      - All feature types (Prophage, IS, Integron, Defense system): counted as a hit
+        if the annotation is covered by at least fill_threshold (default 80%) of its
+        own length by the event. No requirement on event coverage.
+    For deletions the position must fall within or at the border of an annotation.
+
+    Columns added per event row:
+        n_prophage       : prophage annotations meeting coverage threshold
+        n_integron       : integron/CALIN annotations meeting coverage threshold
+        n_defense_system : defense_system annotations meeting coverage threshold
+        n_is             : IS annotations meeting coverage threshold
+        is_family        : IS family of the best-overlapping IS (single string or None)
+        n_mge            : sum of all counts
+        mge_label        : priority label (Integron > Prophage > IS > Defense system > None)
+
+    Parameters
+    ----------
+    summaries : dict
+        Output of combine_all_junctions_summaries(), keyed by event type.
+    mge_dir : str
+        Directory containing per-junction GFF3 files named {junction_name}.gff3.
+    min_length : int
+        Minimum length (bp) for both events and annotations. Default: 200.
+    fill_threshold : float
+        Fraction (0–1) of annotation coverage required for a hit. Default: 0.8 (80%).
+
+    Returns
+    -------
+    annotated : dict
+        Same structure as summaries but with MGE annotation columns added.
+    mge_annotations : pd.DataFrame
+        All MGE annotation rows with 'junction_name' and 'overlaps_event' columns.
+    """
+    # event types that have start_pos / end_pos
+    pos_types = {"insertions", "ambiguous_insertions", "translocations", "inversions"}
+    # deletions only have 'position' — treat as a point interval
+    point_types = {"deletions"}
+
+    # cache GFF3 per junction to avoid re-reading
+    _gff_cache = {}
+
+    def _get_gff(junction_name):
+        if junction_name not in _gff_cache:
+            gff_path = os.path.join(mge_dir, f"{junction_name}.gff3")
+            if os.path.isfile(gff_path):
+                gff = read_gff3_annotations(gff_path)
+                if not gff.empty and "length" in gff.columns:
+                    gff = gff[gff["length"] >= min_length]
+                _gff_cache[junction_name] = gff
+            else:
+                _gff_cache[junction_name] = pd.DataFrame()
+        return _gff_cache[junction_name]
+
+    def _overlapping(gff, ev_start, ev_end):
+        """Return subset of gff rows that overlap [ev_start, ev_end] by any amount."""
+        if gff.empty or "start" not in gff.columns or "end" not in gff.columns:
+            return pd.DataFrame()
+        overlap = gff[["start", "end"]].clip(lower=ev_start, upper=ev_end)
+        overlap_len = (overlap["end"] - overlap["start"]).clip(lower=0)
+        return gff[overlap_len > 0]
+
+    def _within_or_border(gff, pos):
+        """Return subset of gff rows where pos falls within or on the border of the annotation."""
+        if gff.empty or "start" not in gff.columns or "end" not in gff.columns:
+            return pd.DataFrame()
+        return gff[(gff["start"] <= pos) & (gff["end"] >= pos)]
+
+    def _annotate_df(df, is_point=False):
+        if df is None or df.empty:
+            return df
+        if not is_point and "length" in df.columns:
+            df = df[df["length"] >= min_length].copy()
+
+        results = []
+
+        for _, row in df.iterrows():
+            gff = _get_gff(row["junction_name"])
+
+            # restrict to annotations on the same isolate sequence
+            isolate = row.get("genome_name")
+            if isolate is not None and "seqid" in gff.columns:
+                gff_iso = gff[gff["seqid"] == isolate]
+            else:
+                gff_iso = gff
+
+            empty_result = dict(
+                n_prophage=0, n_prophage_associated=0,
+                n_integron=0, n_defense_system=0,
+                n_is=0, n_is_associated=0,
+                is_family=None,
+                is_families_associated=[],
+            )
+
+            if is_point:
+                pos = row.get("position")
+                if pos is None or (isinstance(pos, float) and np.isnan(pos)):
+                    results.append(empty_result)
+                    continue
+                hits = _within_or_border(gff_iso, int(pos))
+                if hits.empty or "feature" not in hits.columns:
+                    results.append(empty_result)
+                    continue
+                # for deletions: just count, no coverage thresholds
+                res = empty_result.copy()
+                res["n_prophage"]       = int((hits["feature"] == "prophage").sum())
+                res["n_integron"]       = int(hits["feature"].isin(["integron", "CALIN"]).sum())
+                res["n_defense_system"] = int((hits["feature"] == "defense_system").sum())
+                is_hits = hits[hits["feature"] == "IS"]
+                res["n_is"] = len(is_hits)
+                if not is_hits.empty:
+                    res["is_family"] = is_hits.iloc[0]["is_subtype"]
+                results.append(res)
+                continue
+
+            # --- non-deletion events: apply coverage thresholds ---
+            ev_start  = int(row["start_pos"])
+            ev_end    = int(row["end_pos"])
+            ev_length = max(ev_end - ev_start, 1)
+
+            hits = _overlapping(gff_iso, ev_start, ev_end)
+            if hits.empty or "feature" not in hits.columns:
+                results.append(empty_result)
+                continue
+
+            res = empty_result.copy()
+            best_is_overlap  = 0
+            best_is_family   = None
+            assoc_is_families = []
+
+            for _, ann in hits.iterrows():
+                ann_start  = int(ann["start"])
+                ann_end    = int(ann["end"])
+                ann_length = max(ann_end - ann_start, 1)
+                overlap    = min(ev_end, ann_end) - max(ev_start, ann_start)
+                ann_cov    = overlap / ann_length
+                ev_cov     = overlap / ev_length
+                feature    = ann["feature"]
+
+                if feature == "prophage":
+                    if ann_cov >= fill_threshold and ev_cov >= fill_threshold:
+                        res["n_prophage"] += 1
+                    elif ann_cov >= fill_threshold:
+                        res["n_prophage_associated"] += 1
+
+                elif feature in ("integron", "CALIN"):
+                    if ann_cov >= fill_threshold:
+                        res["n_integron"] += 1
+
+                elif feature == "defense_system":
+                    if ann_cov >= fill_threshold:
+                        res["n_defense_system"] += 1
+
+                elif feature == "IS":
+                    if ann_cov >= fill_threshold and ev_cov >= fill_threshold:
+                        res["n_is"] += 1
+                        if overlap > best_is_overlap:
+                            best_is_overlap = overlap
+                            best_is_family  = ann["is_subtype"]
+                    elif ann_cov >= fill_threshold:
+                        res["n_is_associated"] += 1
+                        fam = ann["is_subtype"]
+                        if fam is not None:
+                            assoc_is_families.append(fam)
+
+            res["is_family"]              = best_is_family
+            res["is_families_associated"] = assoc_is_families
+            results.append(res)
+
+        df = df.copy()
+        for col in ("n_prophage", "n_prophage_associated", "n_integron",
+                    "n_defense_system", "n_is", "n_is_associated", "is_family",
+                    "is_families_associated"):
+            df[col] = [r[col] for r in results]
+
+        df["n_mge"] = (df["n_prophage"] + df["n_integron"] +
+                       df["n_defense_system"] + df["n_is"] + df["n_is_associated"] + df["n_prophage_associated"])
+
+        def _mge_label(row):
+            if row["n_integron"] > 0:             return "Integron"
+            if row["n_prophage"] > 0:             return "Prophage"
+            if row["n_is"] > 0:                   return "IS"
+            if row["n_defense_system"] > 0:       return "Defense system"
+            if row["n_prophage_associated"] > 0:  return "Prophage (associated)"
+            if row["n_is_associated"] > 0:        return "IS (associated)"
+            return "None"
+
+        df["mge_label"] = df.apply(_mge_label, axis=1)
+        return df
+
+    annotated = {}
+    for dtype, df in summaries.items():
+        annotated[dtype] = _annotate_df(df, is_point=(dtype in point_types))
+
+    # collect insertion and translocation intervals per (junction, isolate) for the annotation check
+    event_intervals = {}  # (junction_name, genome_name) -> [(start, end), ...]
+    for dtype in ("insertions", "translocations", "inversions"):
+        df = summaries.get(dtype)
+        if df is None or df.empty:
+            continue
+        if "length" in df.columns:
+            df = df[df["length"] >= min_length]
+        for _, row in df.iterrows():
+            key = (row["junction_name"], row["genome_name"])
+            event_intervals.setdefault(key, []).append(
+                (int(row["start_pos"]), int(row["end_pos"]))
+            )
+
+    # second output: all MGE annotations with a column indicating overlap with insertion/translocation/inversion
+    # overlap is checked per isolate using the same ann_cov >= fill_threshold logic as _annotate_df
+    all_annot_rows = []
+    for junction_name, gff in _gff_cache.items():
+        if gff.empty or "start" not in gff.columns:
+            continue
+        for _, annot_row in gff.iterrows():
+            isolate = annot_row.get("seqid")
+            a_start = annot_row["start"]
+            a_end   = annot_row["end"]
+            ann_length = max(a_end - a_start, 1)
+            feature = annot_row.get("feature", "")
+            intervals = event_intervals.get((junction_name, isolate), [])
+            overlaps_any = False
+            for iv_start, iv_end in intervals:
+                overlap = min(a_end, iv_end) - max(a_start, iv_start)
+                if overlap <= 0:
+                    continue
+                ann_cov = overlap / ann_length
+                ev_length = max(iv_end - iv_start, 1)
+                ev_cov = overlap / ev_length
+                if feature in ("prophage", "IS"):
+                    # full hit: both coverages; associated: ann_cov only
+                    if ann_cov >= fill_threshold:
+                        overlaps_any = True
+                        break
+                else:
+                    # integron, CALIN, defense_system: ann_cov only
+                    if ann_cov >= fill_threshold:
+                        overlaps_any = True
+                        break
+            r = annot_row.to_dict()
+            r["junction_name"] = junction_name
+            r["overlaps_event"] = overlaps_any
+            all_annot_rows.append(r)
+
+    mge_annotations = pd.DataFrame(all_annot_rows)
+
+    return annotated, mge_annotations
+
+
 def deduplicate_events(summaries, save_path=None):
     """
     Deduplicate all event summary DataFrames and combine into one DataFrame.
@@ -1513,6 +1771,13 @@ def deduplicate_events(summaries, save_path=None):
     }
     parts = []
 
+    annotation_cols = {
+        "n_prophage", "n_prophage_associated",
+        "n_integron", "n_defense_system",
+        "n_is", "n_is_associated",
+        "is_family", "is_families_associated", "n_mge", "mge_label",
+    }
+
     for dtype, etype_label in event_type_map.items():
         df = summaries.get(dtype)
         if df is None or df.empty:
@@ -1526,10 +1791,54 @@ def deduplicate_events(summaries, save_path=None):
         else:
             dedup_cols = ["junction_name", "path"]
 
-        df = df.drop_duplicates(subset=dedup_cols)
+        present_ann_cols = [c for c in annotation_cols if c in df.columns]
 
-        # Drop isolate column — events are no longer isolate-specific
-        df = df.drop(columns=["genome_name"], errors="ignore")
+        if present_ann_cols:
+            # For annotation columns: majority vote across all isolates sharing the same event
+            def _majority(series):
+                m = series.dropna().mode()
+                return m.iloc[0] if not m.empty else (series.iloc[0] if not series.empty else None)
+
+            def _majority_list(series):
+                n = len(series)
+                counts = Counter(fam for lst in series for fam in (lst if isinstance(lst, list) else []))
+                return [fam for fam, cnt in counts.items() if cnt > n / 2]
+
+            non_ann_cols = [c for c in df.columns if c not in annotation_cols and c != "genome_name"]
+            agg_dict = {}
+            for c in present_ann_cols:
+                if c == "is_families_associated":
+                    agg_dict[c] = _majority_list
+                else:
+                    agg_dict[c] = _majority
+
+            # take first value for all non-annotation, non-isolate columns
+            for c in non_ann_cols:
+                if c not in dedup_cols:
+                    agg_dict[c] = "first"
+
+            df = df.groupby(dedup_cols, as_index=False).agg(agg_dict)
+        else:
+            hits_cols = [c for c in df.columns if c.startswith("n_hits_") or c.startswith("n_genomes_")]
+            plasmid_hit_cols = [c for c in df.columns if c in ("hits_in_genome", "hits_in_plasmid")]
+            species_cols = [c for c in df.columns if c.startswith("n_hits_") and c not in
+                            [f"n_hits_{cat}" for cat in ("own_chromosome", "own_plasmid", "other_chromosome", "other_plasmid", "external")]]
+            numeric_cols = hits_cols + plasmid_hit_cols
+            if numeric_cols:
+                non_hits_cols = [c for c in df.columns if c not in numeric_cols and c not in ("genome_name", "isolate_name")]
+                agg_dict = {c: "first" for c in non_hits_cols if c not in dedup_cols}
+                for c in numeric_cols:
+                    agg_dict[c] = lambda s, _c=c: int(round(s.median(skipna=True))) if s.notna().any() else 0
+                if "majority_organism" in df.columns:
+                    def _majority_organism(s):
+                        normalized = s.dropna().map(lambda x: " ".join(x.split()[:2]) if isinstance(x, str) else x)
+                        m = normalized.mode()
+                        return m.iloc[0] if not m.empty else None
+                    agg_dict["majority_organism"] = _majority_organism
+                df = df.groupby(dedup_cols, as_index=False).agg(agg_dict)
+            else:
+                df = df.drop_duplicates(subset=dedup_cols)
+                df = df.drop(columns=["genome_name"], errors="ignore")
 
         df = df.reset_index(drop=True)
         df.insert(0, "event_type", etype_label)
@@ -1695,3 +2004,209 @@ def collect_hits_info_counts(search_root: str) -> pd.DataFrame:
         ))
 
     return pd.DataFrame(rows)
+
+
+def collect_hits_info_counts_with_self(
+    search_root: str,
+    sam_df: pd.DataFrame,
+    min_pident: float = 100.0,
+) -> pd.DataFrame:
+    """
+    Like collect_hits_info_counts, but uses `sam_df` (columns: isolate_id,
+    accession, type, biosample) to separate hits into self vs. external and
+    exclude all hits whose sgenome is any biosample in our own dataset from
+    the external counts.
+
+    For each query file the genome_name is matched against sam_df.accession to
+    find the owning isolate_id and its biosample(s).  Hits are then bucketed:
+
+      - own_chromosome  : sgenome == biosample of the query isolate's chromosome row(s)
+      - own_plasmid     : sgenome == biosample of the query isolate's plasmid row(s)
+      - other_chromosome: sgenome == biosample of another isolate in the dataset (chromosome)
+      - other_plasmid   : sgenome == biosample of another isolate in the dataset (plasmid)
+      - external        : sgenome not in sam_df at all
+
+    Parameters
+    ----------
+    search_root : str
+        Root directory to search for *.lexicmap.tsv files.
+    sam_df : pd.DataFrame
+        Columns: isolate_id, accession, type, biosample.
+    min_pident : float
+        Minimum percent identity (inclusive) to count a hit. Default 100.0.
+        Also filters hits used for majority organism annotation.
+
+    Returns a DataFrame with columns:
+        junction_name, consensus, genome_name, segment,
+        n_hits, n_genomes,                          # total hits / total genomes from lexicmap header
+        n_hits_own_chromosome, n_genomes_own_chromosome,
+        n_hits_own_plasmid,    n_genomes_own_plasmid,
+        n_hits_other_chromosome, n_genomes_other_chromosome,
+        n_hits_other_plasmid,    n_genomes_other_plasmid,
+        n_hits_external,         n_genomes_external,
+        majority_organism,                          # only if *.hits_info.tsv exists alongside
+        file_path
+    """
+    # Build fast lookup structures from sam_df
+    acc_to_isolate: dict = dict(zip(sam_df["accession"], sam_df["isolate_id"]))
+    iso_chr_bs: dict = (
+        sam_df[sam_df["type"] == "chromosome"]
+        .groupby("isolate_id")["biosample"]
+        .apply(set)
+        .to_dict()
+    )
+    iso_pla_bs: dict = (
+        sam_df[sam_df["type"] == "plasmid"]
+        .groupby("isolate_id")["biosample"]
+        .apply(set)
+        .to_dict()
+    )
+    all_own_biosamples: set = set(sam_df["biosample"])
+    bs_to_type: dict = dict(zip(sam_df["biosample"], sam_df["type"]))
+
+    cats = ("own_chromosome", "own_plasmid", "other_chromosome", "other_plasmid", "external")
+    rows = []
+    for p in sorted(Path(search_root).rglob("*.lexicmap.tsv")):
+        parts = p.parts
+        try:
+            ins_idx = [i for i, x in enumerate(parts) if x == "insertions"][-1]
+            junction_name = parts[ins_idx + 1]
+            consensus = parts[ins_idx + 2]
+        except (IndexError, ValueError):
+            junction_name = consensus = None
+
+        stem = p.name.replace(".lexicmap.tsv", "")
+        seg_match = re.search(r"_segment_(\d+)$", stem)
+        if seg_match:
+            segment = f"segment_{seg_match.group(1)}"
+            genome_name = stem[: seg_match.start()]
+        else:
+            segment = None
+            genome_name = stem
+
+        isolate_id = acc_to_isolate.get(genome_name)
+        own_chr_bs: set = iso_chr_bs.get(isolate_id, set()) if isolate_id else set()
+        own_pla_bs: set = iso_pla_bs.get(isolate_id, set()) if isolate_id else set()
+
+        hit_counts: dict = {c: 0 for c in cats}
+        genome_sets: dict = {c: set() for c in cats}
+        n_hits = 0
+
+        with open(p) as f:
+            header = f.readline()
+            if not header:
+                continue
+            col_names = header.strip().split("\t")
+            try:
+                sgenome_col = col_names.index("sgenome")
+            except ValueError:
+                sgenome_col = None
+            try:
+                hits_col = col_names.index("hits")  # noqa: F841 (unused after refactor)
+            except ValueError:
+                hits_col = None
+            try:
+                pident_col = col_names.index("pident")
+            except ValueError:
+                pident_col = None
+
+            for line in f:
+                fields = line.strip().split("\t")
+
+                # pident filter
+                if pident_col is not None and len(fields) > pident_col:
+                    try:
+                        if float(fields[pident_col]) < min_pident:
+                            continue
+                    except ValueError:
+                        pass
+
+                n_hits += 1
+                sg = fields[sgenome_col] if sgenome_col is not None and len(fields) > sgenome_col else None
+
+                if sg is None:
+                    continue
+                if sg in own_chr_bs:
+                    cat = "own_chromosome"
+                elif sg in own_pla_bs:
+                    cat = "own_plasmid"
+                elif sg in all_own_biosamples:
+                    t = bs_to_type.get(sg, "chromosome")
+                    cat = "other_chromosome" if t == "chromosome" else "other_plasmid"
+                else:
+                    cat = "external"
+
+                hit_counts[cat] += 1
+                genome_sets[cat].add(sg)
+
+        # Majority organism + per-species counts from companion hits_info.tsv if present
+        majority_organism = None
+        normalized_counts: dict = {}
+        info_path = Path(str(p).replace(".lexicmap.tsv", ".hits_info.tsv"))
+        if info_path.exists():
+            try:
+                with open(info_path) as f:
+                    info_header = f.readline()
+                    if info_header:
+                        info_cols = info_header.strip().split("\t")
+                        try:
+                            org_col = info_cols.index("organism")
+                            info_pident_col = info_cols.index("pident") if "pident" in info_cols else None
+                            info_sgenome_col = info_cols.index("sgenome") if "sgenome" in info_cols else None
+                        except ValueError:
+                            org_col = None
+                            info_pident_col = None
+                            info_sgenome_col = None
+                        if org_col is not None:
+                            organism_counts: dict = {}
+                            for line in f:
+                                ifields = line.strip().split("\t")
+                                if info_pident_col is not None and len(ifields) > info_pident_col:
+                                    try:
+                                        if float(ifields[info_pident_col]) < min_pident:
+                                            continue
+                                    except ValueError:
+                                        pass
+                                # exclude own chromosome and plasmid hits
+                                if info_sgenome_col is not None and len(ifields) > info_sgenome_col:
+                                    sg = ifields[info_sgenome_col]
+                                    if sg in own_chr_bs or sg in own_pla_bs:
+                                        continue
+                                if len(ifields) > org_col:
+                                    org = ifields[org_col].strip()
+                                    if org:
+                                        organism_counts[org] = organism_counts.get(org, 0) + 1
+                            if organism_counts:
+                                # normalize to species (first two words) before majority vote
+                                for org, cnt in organism_counts.items():
+                                    species = " ".join(org.split()[:2])
+                                    normalized_counts[species] = normalized_counts.get(species, 0) + cnt
+                                majority_organism = max(normalized_counts, key=normalized_counts.get)
+            except Exception:
+                pass
+
+        row = dict(
+            junction_name=junction_name,
+            consensus=consensus,
+            genome_name=genome_name,
+            segment=segment,
+            n_hits=n_hits,
+            n_genomes=len(set.union(*genome_sets.values()) if any(genome_sets.values()) else set()),
+            majority_organism=majority_organism,
+            file_path=str(p),
+        )
+        for cat in cats:
+            row[f"n_hits_{cat}"] = hit_counts[cat]
+            row[f"n_genomes_{cat}"] = len(genome_sets[cat])
+
+        for species, cnt in normalized_counts.items():
+            col_name = "_".join(species.split())
+            row[f"n_hits_{col_name}"] = cnt
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    species_cols = [c for c in df.columns if c.startswith("n_hits_") and c not in
+                    {f"n_hits_{cat}" for cat in ("own_chromosome", "own_plasmid", "other_chromosome", "other_plasmid", "external")}]
+    df[species_cols] = df[species_cols].fillna(0)
+    return df

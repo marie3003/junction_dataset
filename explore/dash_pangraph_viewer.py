@@ -19,6 +19,19 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from junction_analysis.plotting import plot_pangraph_base_for_dash, add_annotations_for_dash, _rgb_str, _shades_from_base_rgb, _rgba
 from junction_analysis.consensus import find_consensus_paths_core, save_consensus_cache, load_consensus_cache
+from junction_analysis.annotate_insertions import (
+    get_insertions_deletions_from_consensus,
+    write_insertions_fasta,
+    summarize_ambiguous_insertions,
+    summarize_deletions_consensus,
+    summarize_inversions_consensus,
+    summarize_translocations_consensus,
+    load_all_insertions_summaries,
+    load_all_ambiguous_insertions_summaries,
+    load_all_deletions_summaries,
+    load_all_inversions_summaries,
+    load_all_translocations_summaries,
+)
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -60,7 +73,7 @@ def _trace_groups_from_fig(fig):
             groups["cds"].append(i)
         elif name == "tRNA / tmRNA":
             groups["trna"].append(i)
-        elif name in ("Prophage", "Defense system") or name.startswith("IS:"):
+        elif name in ("Prophage", "Defense system", "Integron") or name.startswith("IS:"):
             groups["mges"].append(i)
         elif name == "Insertion":
             groups["insertions"].append(i)
@@ -391,12 +404,12 @@ if __name__ == "__main__":
     #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
     #junction_name = "GPKQYOCEJI_r__NKVSUZGURN_f"
     #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f" # --> look up again, its the prophage one that would get two clusters
-    #junction_name = "AFFODHUCNW_r__VRDEBAMMSO_r"
-    #junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
-    junction_name = "OURQVJZAZZ_f__UTYAQKFQDH_f"
+    #junction_name = "KYQOKYBCOW_r__XXIWNZXZTK_r"
+    junction_name = "VCAVVOUNDI_f__XIWJABIXEM_f"
+    #junction_name = "JVNRLCFAVD_f__PLTCZQCVRD_r" # example for a junction that isn't split enough
     #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # --> wild junctions with 12 clusters
-    #junction_name = "JPYVXRYZLU_f__UUBXUCAQCF_f"
-    #junction_name = "NPQDSPAYII_f__VJEJDHVKTM_f"
+    #junction_name = "OBEJYXNUDN_r__ZTHKZYHPIX_r"
+    #junction_name = "AGVTAJTYER_r__OZLYYMOKWU_f" # interesting has one insertion in its own cluster and then the same one again in a different cluster but inverted
     #junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
     #junction_name = "ATPWUNKKID_f__KKPYPKGMXA_f"
     #junction_name = 'KGWWUZQEKD_r__UXLELLOQVR_r'
@@ -407,15 +420,16 @@ if __name__ == "__main__":
     mges_gff_path = REPO_ROOT / "results" / "junction_mges" / f"{junction_name}.gff3"
     annotations_gff_path = REPO_ROOT / "results" / "junction_annotations" / f"{junction_name}.gff"
     tree_path = REPO_ROOT / "config" / "polished_tree.nwk"
-    in_del_path = REPO_ROOT / "results" / "atb_lookup" 
+    in_del_path = REPO_ROOT / "results" / "atb_lookup"
 
     cache_path = REPO_ROOT / "results" / "consensus_analysis" / junction_name / "dash_cache.json"
+    path_dict = None
     if cache_path.exists():
         print(f"Loading consensus cache from {cache_path}")
         cluster_map_core, consensus_paths_plotting, assignment_df_plotting = load_consensus_cache(cache_path)
     else:
         print("Cache not found, running find_consensus_paths_core ...")
-        cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, all_root_states, all_root_states_unqiue = find_consensus_paths_core(
+        cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, *_ = find_consensus_paths_core(
             junction_name,
             plot_consensus=False,
             plot_annotations=False,
@@ -429,6 +443,49 @@ if __name__ == "__main__":
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         save_consensus_cache(cache_path, cluster_map_core, consensus_paths_plotting, assignment_df_plotting)
         print(f"Cache saved to {cache_path}")
+
+    # compute indels on the fly if summary files are missing
+    _ins_summary = in_del_path / "insertions" / junction_name / "consensus1" / "insertions_summary.csv"
+    if not _ins_summary.exists():
+        print("Indel summaries not found, computing on the fly ...")
+        if path_dict is None:
+            print("path_dict not available from cache — re-running find_consensus_paths_core ...")
+            _, _, path_dict, *_ = find_consensus_paths_core(
+                junction_name,
+                plot_consensus=False,
+                plot_annotations=False,
+                plot_pair_dist=False,
+                plot_snp_dist=False,
+                plot_ambiguities=False,
+                clustering_bl_thresh=0.005,
+                consensus_criterium="core_genome_tree",
+                tree_path=str(tree_path),
+            )
+        for i in range(1, len(consensus_paths_plotting) + 1):
+            insertions, ambiguous_insertions, deletions, inversions, translocations, _ = \
+                get_insertions_deletions_from_consensus(
+                    assignment_df_plotting, consensus_paths_plotting, path_dict,
+                    consensus=i, junction_name=junction_name,
+                )
+            write_insertions_fasta(junction_name, pangraph, insertions, consensus=i,
+                                   save_df=True, parent_dir=str(in_del_path / "insertions"))
+            summarize_ambiguous_insertions(junction_name, pangraph, ambiguous_insertions,
+                                           consensus=i, parent_dir=str(in_del_path / "insertions"), save_df=True)
+            summarize_deletions_consensus(deletions, junction_name, pangraph, path_dict,
+                                          assignment_df_plotting, consensus_id=i,
+                                          parent_dir=str(in_del_path / "deletions"),
+                                          rerun_alignment=False, save_df=True)
+            summarize_inversions_consensus(inversions, junction_name, pangraph, consensus_id=i,
+                                           parent_dir=str(in_del_path / "inversions"), save_df=True)
+            summarize_translocations_consensus(translocations, junction_name, pangraph, consensus_id=i,
+                                               parent_dir=str(in_del_path / "translocations"), save_df=True)
+
+        load_all_insertions_summaries(str(in_del_path / "insertions"), junction_name, save_df=True)
+        load_all_ambiguous_insertions_summaries(str(in_del_path / "insertions"), junction_name, save_df=True)
+        load_all_deletions_summaries(str(in_del_path / "deletions"), junction_name, save_df=True)
+        load_all_inversions_summaries(str(in_del_path / "inversions"), junction_name, save_df=True)
+        load_all_translocations_summaries(str(in_del_path / "translocations"), junction_name, save_df=True)
+        print("Indel summaries computed and saved.")
 
     app = make_junction_dash_app(
         pan=pangraph,

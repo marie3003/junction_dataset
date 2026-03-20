@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import AgglomerativeClustering
 from pathlib import Path
+import warnings
 
 def repo_root(start: Path | None = None) -> Path:
     """
@@ -644,6 +645,66 @@ def read_gff3_cds_products(gff_path: str) -> pd.DataFrame:
 
 
 
+def compare_consensus_paths(
+    path1,
+    path2,
+    junction_name: str,
+    cluster1: str,
+    cluster2: str,
+    base_alignment_dir=None,
+) -> dict:
+    """
+    Compare two consensus paths and return shared/exclusive block lengths.
+
+    Parameters
+    ----------
+    path1, path2 : Path objects (pangraph_utils.Path)
+        The two consensus paths to compare.
+    junction_name : str
+        Junction name, used to locate the alignment stats CSV.
+    cluster1, cluster2 : str
+        Cluster labels for path1 and path2 respectively.
+    base_alignment_dir : str or Path or None
+        Root of the block_alignments directory. Defaults to
+        repo_root() / "results" / "block_alignments".
+
+    Returns
+    -------
+    dict with keys:
+        junction_name, cluster1, cluster2,
+        shared_length, exclusive_length_1, exclusive_length_2
+    """
+    if base_alignment_dir is None:
+        base_alignment_dir = repo_root() / "results" / "block_alignments"
+
+    stats_csv = Path(base_alignment_dir) / junction_name / f"{junction_name}_alignment_stats.csv"
+    stats_df = pd.read_csv(stats_csv)
+    block_length = dict(zip(stats_df["block_id"].astype(str), stats_df["alignment_len"]))
+
+    nodes1 = set(path1.nodes)
+    nodes2 = set(path2.nodes)
+
+    shared    = nodes1 & nodes2
+    only_in_1 = nodes1 - nodes2
+    only_in_2 = nodes2 - nodes1
+
+    shared_length      = sum(block_length.get(str(n.id), 0) for n in shared)
+    exclusive_length_1 = sum(block_length.get(str(n.id), 0) for n in only_in_1)
+    exclusive_length_2 = sum(block_length.get(str(n.id), 0) for n in only_in_2)
+
+    return {
+        "junction_name":      junction_name,
+        "cluster1":           cluster1,
+        "cluster2":           cluster2,
+        "n_shared_blocks":    len(shared),
+        "n_exclusive_blocks_1": len(only_in_1),
+        "n_exclusive_blocks_2": len(only_in_2),
+        "shared_length":      shared_length,
+        "exclusive_length_1": exclusive_length_1,
+        "exclusive_length_2": exclusive_length_2,
+    }
+
+
 def compute_within_between_cluster_distances(
     cluster_df: pd.DataFrame,
     dist_df: pd.DataFrame,
@@ -1152,5 +1213,174 @@ def add_singleton_has_own_cluster(jdf_all, cluster_df):
         same_cluster = (cluster_row[isolate_cols] == cluster_id).sum()
 
         jdf_all.at[idx, "singleton_has_own_cluster"] = (same_cluster == 1)
+
+    return jdf_all
+
+def add_binary_event_info(jdf_all, cluster_df, pangraph_dir="../results/junction_pangraphs"):
+    """
+    For binary junctions (n_categories == 2), add:
+      - binary_gain_isolates
+      - binary_loss_isolates
+      - binary_gain_frequency
+      - binary_loss_frequency
+      - binary_event_type
+      - binary_gain_has_own_cluster
+      - binary_loss_has_own_cluster
+      - binary_gain_in_multiple_clusters
+      - binary_loss_in_multiple_clusters
+      - binary_event_in_multiple_clusters
+
+    Event logic per non-core block:
+      - subtract the minimum count across isolates
+      - count how many isolates have adjusted count > 0
+      - if this frequency is < n_iso/2: gain in those isolates
+      - if this frequency is > n_iso/2: loss in the complementary isolates
+      - if this frequency is == n_iso/2: ambiguous
+    """
+    jdf_all = jdf_all.copy()
+
+    # output columns
+    for col in ["binary_gain_isolates", "binary_loss_isolates", "binary_event_type"]:
+        jdf_all[col] = pd.Series(pd.NA, index=jdf_all.index, dtype="object")
+
+    for col in ["binary_gain_frequency", "binary_loss_frequency"]:
+        jdf_all[col] = pd.Series(pd.NA, index=jdf_all.index, dtype="Int64")
+
+    for col in [
+        "binary_gain_has_own_cluster",
+        "binary_loss_has_own_cluster",
+        "binary_gain_in_multiple_clusters",
+        "binary_loss_in_multiple_clusters",
+        "binary_event_in_multiple_clusters",
+    ]:
+        jdf_all[col] = pd.Series(pd.NA, index=jdf_all.index, dtype="boolean")
+
+    meta_cols = {"junction_name", "n_clusters", "n_isolates"}
+    isolate_cols = [c for c in cluster_df.columns if c not in meta_cols]
+    cluster_df = cluster_df.set_index("junction_name")
+
+    def _cluster_info(cluster_row, event_isolates):
+        if not event_isolates:
+            return pd.NA, pd.NA
+
+        cluster_ids = cluster_row[event_isolates].dropna().unique()
+        if len(cluster_ids) == 0:
+            return pd.NA, pd.NA
+
+        if len(cluster_ids) > 1:
+            return False, True
+
+        cluster_id = cluster_ids[0]
+        cluster_members = set(cluster_row[isolate_cols][cluster_row[isolate_cols] == cluster_id].index)
+        return cluster_members == set(event_isolates), False
+
+    binary_mask = jdf_all["n_categories"] == 2
+
+    for idx, row in jdf_all.loc[binary_mask].iterrows():
+        junction_name = row["junction_name"]
+        n_iso = int(row["n_iso"])
+
+        if n_iso == 2:
+            continue
+
+        pangraph_path = Path(pangraph_dir) / f"{junction_name}.json"
+        if not pangraph_path.exists():
+            print(f"Skipping {junction_name}: file not found")
+            continue
+
+        try:
+            pangraph = pp.Pangraph.from_json(str(pangraph_path))
+            blockstats_df = pangraph.to_blockstats_df()
+            blockcount_df = pangraph.to_blockcount_df()
+
+            accessory_block_ids = blockstats_df.loc[~blockstats_df["core"]].index
+
+            gain_isolates = set()
+            loss_isolates = set()
+            gain_frequency = None
+            loss_frequency = None
+            ambiguous = False
+
+            for block_id in accessory_block_ids:
+                counts = blockcount_df.loc[block_id]
+                min_count = counts.min()
+                adjusted = counts - min_count
+                freq = int((adjusted > 0).sum())
+
+                if freq == 0:
+                    continue
+
+                if 2 * freq == n_iso:
+                    warnings.warn(
+                        f"Binary junction {junction_name}: block {block_id} occurs in exactly half "
+                        f"of isolates after min-subtraction. Marking as ambiguous."
+                    )
+                    ambiguous = True
+                    break
+
+                present_isolates = set(adjusted[adjusted > 0].index)
+                absent_isolates = set(counts.index) - present_isolates
+
+                if freq < n_iso / 2:
+                    if gain_frequency is None:
+                        gain_frequency = freq
+                    elif gain_frequency != freq:
+                        warnings.warn(
+                            f"Binary junction {junction_name}: inconsistent gain frequencies across blocks."
+                        )
+                        ambiguous = True
+                        break
+
+                    gain_isolates.update(present_isolates)
+
+                else:
+                    current_loss_frequency = n_iso - freq
+                    if loss_frequency is None:
+                        loss_frequency = current_loss_frequency
+                    elif loss_frequency != current_loss_frequency:
+                        warnings.warn(
+                            f"Binary junction {junction_name}: inconsistent loss frequencies across blocks."
+                        )
+                        ambiguous = True
+                        break
+
+                    loss_isolates.update(absent_isolates)
+
+            if ambiguous:
+                continue
+
+            if gain_isolates:
+                jdf_all.at[idx, "binary_gain_isolates"] = ",".join(sorted(gain_isolates))
+                jdf_all.at[idx, "binary_gain_frequency"] = gain_frequency
+
+            if loss_isolates:
+                jdf_all.at[idx, "binary_loss_isolates"] = ",".join(sorted(loss_isolates))
+                jdf_all.at[idx, "binary_loss_frequency"] = loss_frequency
+
+            if gain_isolates and loss_isolates:
+                jdf_all.at[idx, "binary_event_type"] = "gain_and_loss"
+            elif gain_isolates:
+                jdf_all.at[idx, "binary_event_type"] = "gain"
+            elif loss_isolates:
+                jdf_all.at[idx, "binary_event_type"] = "loss"
+
+            if junction_name in cluster_df.index:
+                cluster_row = cluster_df.loc[junction_name]
+
+                gain_has_own, gain_multi = _cluster_info(cluster_row, sorted(gain_isolates))
+                loss_has_own, loss_multi = _cluster_info(cluster_row, sorted(loss_isolates))
+
+                jdf_all.at[idx, "binary_gain_has_own_cluster"] = gain_has_own
+                jdf_all.at[idx, "binary_loss_has_own_cluster"] = loss_has_own
+                jdf_all.at[idx, "binary_gain_in_multiple_clusters"] = gain_multi
+                jdf_all.at[idx, "binary_loss_in_multiple_clusters"] = loss_multi
+                jdf_all.at[idx, "binary_event_in_multiple_clusters"] = (
+                    bool(gain_multi) if pd.notna(gain_multi) else False
+                ) or (
+                    bool(loss_multi) if pd.notna(loss_multi) else False
+                )
+
+        except Exception as e:
+            print(f"Skipping {junction_name}: {e}")
 
     return jdf_all
