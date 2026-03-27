@@ -444,9 +444,10 @@ if __name__ == "__main__":
         save_consensus_cache(cache_path, cluster_map_core, consensus_paths_plotting, assignment_df_plotting)
         print(f"Cache saved to {cache_path}")
 
-    # compute indels on the fly if summary files are missing
-    _ins_summary = in_del_path / "insertions" / junction_name / "consensus1" / "insertions_summary.csv"
-    if not _ins_summary.exists():
+    # compute indels on the fly only if the consensus1 folder doesn't exist yet
+    _consensus1_dir = in_del_path / "insertions" / junction_name / "consensus1"
+    _all_ins_summary = in_del_path / "insertions" / junction_name / "all_insertions_summary.csv"
+    if not _consensus1_dir.exists():
         print("Indel summaries not found, computing on the fly ...")
         if path_dict is None:
             print("path_dict not available from cache — re-running find_consensus_paths_core ...")
@@ -486,6 +487,13 @@ if __name__ == "__main__":
         load_all_inversions_summaries(str(in_del_path / "inversions"), junction_name, save_df=True)
         load_all_translocations_summaries(str(in_del_path / "translocations"), junction_name, save_df=True)
         print("Indel summaries computed and saved.")
+    elif not _all_ins_summary.exists():
+        print(
+            f"No insertion summary file found for {junction_name} "
+            f"(checked: {_all_ins_summary}). "
+            "This is either because no insertions were detected for this junction, "
+            "or the precomputed summary file is missing."
+        )
 
     app = make_junction_dash_app(
         pan=pangraph,
