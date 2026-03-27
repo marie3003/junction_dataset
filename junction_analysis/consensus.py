@@ -1318,8 +1318,7 @@ def collect_all_branch_lengths(results_dir, save_path=None):
 
 
 def collect_all_pairwise_distances(junction_names, results_dir,
-                                    save_path=None, load_path=None,
-                                    mode="tree"):
+                                    save_path=None, load_path=None):
     """
     Collect pairwise distances from the core genome alignment of each junction.
 
@@ -1329,16 +1328,11 @@ def collect_all_pairwise_distances(junction_names, results_dir,
         Junction names to process.
     results_dir : str or Path
         Base results directory; files are expected at
-        ``results_dir/consensus_analysis/<junction_name>/core_blocks_aln.newick`` (tree)
-        or ``results_dir/consensus_analysis/<junction_name>/core_blocks_aln.fa`` (alignment).
+        ``results_dir/consensus_analysis/<junction_name>/core_blocks_aln.fa``.
     save_path : str or Path or None
         If provided, save the resulting DataFrame as a CSV to this path.
     load_path : str or Path or None
         If provided, load distances from this CSV instead of recomputing.
-    mode : str
-        ``"tree"``      — patristic distances from the Newick tree (default).
-        ``"alignment"`` — relative Hamming distances from the FASTA alignment,
-                          gap positions (``-``) ignored in both sequences of each pair.
 
     Returns
     -------
@@ -1358,36 +1352,25 @@ def collect_all_pairwise_distances(junction_names, results_dir,
     skipped = []
 
     for jname in junction_names:
-        if mode == "tree":
-            target_path = results_dir / "consensus_analysis" / jname / "core_blocks_aln.newick"
-        else:
-            target_path = results_dir / "consensus_analysis" / jname / "core_blocks_aln.fa"
+        target_path = results_dir / "consensus_analysis" / jname / "core_blocks_aln.fa"
 
         if not target_path.exists():
             skipped.append(jname)
             continue
 
         try:
-            if mode == "tree":
-                tree = Phylo.read(str(target_path), "newick")
-                tips = tree.get_terminals()
-                names = [t.name for t in tips]
-                dists = np.array([tree.distance(t1, t2) for t1, t2 in combinations(tips, 2)])
-                n1 = [names[i] for i, j in combinations(range(len(names)), 2)]
-                n2 = [names[j] for i, j in combinations(range(len(names)), 2)]
-            else:
-                records = list(SeqIO.parse(str(target_path), "fasta"))
-                names = [r.id for r in records]
-                arr = np.array([list(str(r.seq).upper()) for r in records])
-                n = len(names)
-                iu, ju = np.triu_indices(n, k=1)
-                _, dists = avg_pairwise_distance(arr)
-                # iu/ju from avg_pairwise_distance may be masked; recompute to stay in sync
-                valid = np.isin(arr, list("ACGT"))
-                pair_valid = (valid[:, None, :] & valid[None, :, :]).sum(axis=2)
-                mask = pair_valid[iu, ju] > 0
-                n1 = [names[i] for i, m in zip(iu, mask) if m]
-                n2 = [names[j] for j, m in zip(ju, mask) if m]
+            records = list(SeqIO.parse(str(target_path), "fasta"))
+            names = [r.id for r in records]
+            arr = np.array([list(str(r.seq).upper()) for r in records])
+            n = len(names)
+            iu, ju = np.triu_indices(n, k=1)
+            _, dists = avg_pairwise_distance(arr)
+            # iu/ju from avg_pairwise_distance may be masked; recompute to stay in sync
+            valid = np.isin(arr, list("ACGT"))
+            pair_valid = (valid[:, None, :] & valid[None, :, :]).sum(axis=2)
+            mask = pair_valid[iu, ju] > 0
+            n1 = [names[i] for i, m in zip(iu, mask) if m]
+            n2 = [names[j] for j, m in zip(ju, mask) if m]
 
             all_jnames.append(np.full(len(dists), jname))
             all_dists.append(dists)

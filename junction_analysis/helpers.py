@@ -970,8 +970,7 @@ def get_core_alignment_lengths(
     For each junction in `consensus_analysis_dir`, read core_blocks_aln.fa
     and record the alignment length with and without gaps.
 
-    If `results_dir` is provided, also iterates over
-    ``results_dir/block_alignments/<junction>/block_<id>_aln.fa`` and returns
+    For each junction core block in ``results_dir/block_alignments/<junction>/block_<id>_aln.fa`` read block alignement fasta file and returns
     per-block lengths for core blocks (identified via the pangraph).
 
     Parameters

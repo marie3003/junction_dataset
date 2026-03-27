@@ -1484,23 +1484,46 @@ def annotate_events_with_mges(
     Annotate structural events (insertions, deletions, translocations, inversions)
     with overlapping MGE annotations from per-junction GFF3 files.
 
-    Coverage rules for non-deletion events (insertions / translocations / inversions):
-      - All feature types (Prophage, IS, Integron, Defense system): counted as a hit
-        if the annotation is covered by at least fill_threshold (default 80%) of its
-        own length by the event. No requirement on event coverage.
-    For deletions the position must fall within or at the border of an annotation.
+    Annotations are matched per isolate: the GFF3 seqid is compared to the
+    genome_name of each event row so that only annotations from the same isolate
+    are considered.
 
-    Columns added per event row:
-        n_prophage       : prophage annotations meeting coverage threshold
-        n_integron       : integron/CALIN annotations meeting coverage threshold
-        n_defense_system : defense_system annotations meeting coverage threshold
-        n_is             : IS annotations meeting coverage threshold
-        is_family        : IS family of the best-overlapping IS (single string or None)
-        n_mge            : sum of all counts
-        mge_label        : priority label (Integron > Prophage > IS > Defense system > None)
+    Coverage rules
+    --------------
+    Non-deletion events (insertions, ambiguous_insertions, translocations,
+    inversions) have start_pos/end_pos and use two coverage fractions:
+      - ann_cov  = overlap / annotation_length
+      - ev_cov   = overlap / event_length
+
+    Feature-specific thresholds (all use fill_threshold, default 0.8):
+      Prophage      : ann_cov >= threshold AND ev_cov >= threshold → n_prophage
+                      ann_cov >= threshold only                    → n_prophage_associated
+      IS            : ann_cov >= threshold AND ev_cov >= threshold → n_is
+                      ann_cov >= threshold only                    → n_is_associated
+      Integron/CALIN: ann_cov >= threshold                        → n_integron
+      Defense system: ann_cov >= threshold                        → n_defense_system
+
+    Deletions only have a single position; an annotation is counted if that
+    position falls within or on the border of the annotation (no coverage
+    threshold applied).
+
+    Columns added per event row
+    ---------------------------
+        n_prophage            : prophage annotations (full overlap)
+        n_prophage_associated : prophage annotations (partial overlap)
+        n_integron            : integron/CALIN annotations
+        n_defense_system      : defense_system annotations
+        n_is                  : IS annotations (full overlap)
+        n_is_associated       : IS annotations (partial overlap)
+        is_family             : IS subtype of the best-overlapping IS element (or None)
+        is_families_associated: list of IS subtypes from associated IS hits
+        n_mge                 : sum of all counts above
+        mge_label             : priority label assigned as
+                                Prophage > IS > Integron > Defense system >
+                                Prophage (associated) > IS (associated) > None
 
     Parameters
-    ----------
+    -------
     summaries : dict
         Output of combine_all_junctions_summaries(), keyed by event type.
     mge_dir : str
@@ -1515,10 +1538,11 @@ def annotate_events_with_mges(
     annotated : dict
         Same structure as summaries but with MGE annotation columns added.
     mge_annotations : pd.DataFrame
-        All MGE annotation rows with 'junction_name' and 'overlaps_event' columns.
+        All MGE annotation rows (from all cached GFF3 files) with an added
+        'junction_name' column and an 'overlaps_event' boolean column indicating
+        whether the annotation is covered by at least one insertion, translocation,
+        or inversion event (ann_cov >= fill_threshold) in any isolate.
     """
-    # event types that have start_pos / end_pos
-    pos_types = {"insertions", "ambiguous_insertions", "translocations", "inversions"}
     # deletions only have 'position' — treat as a point interval
     point_types = {"deletions"}
 
@@ -1554,8 +1578,10 @@ def annotate_events_with_mges(
     def _annotate_df(df, is_point=False):
         if df is None or df.empty:
             return df
-        if not is_point and "length" in df.columns:
+        if "length" in df.columns:
             df = df[df["length"] >= min_length].copy()
+        else:
+            print("No length filtering was applied because no length column was found in the dataframe.")
 
         results = []
 
@@ -1564,10 +1590,20 @@ def annotate_events_with_mges(
 
             # restrict to annotations on the same isolate sequence
             isolate = row.get("genome_name")
-            if isolate is not None and "seqid" in gff.columns:
-                gff_iso = gff[gff["seqid"] == isolate]
-            else:
+            if isolate is None or (isinstance(isolate, float) and np.isnan(isolate)):
+                raise ValueError(
+                    f"Event row for junction '{row.get('junction_name')}' has no genome_name. "
+                    "All event rows must have isolate names to match against GFF annotations."
+                )
+            if gff.empty:
                 gff_iso = gff
+            elif "seqid" not in gff.columns:
+                raise ValueError(
+                    f"GFF for junction '{row.get('junction_name')}' has no 'seqid' column. "
+                    "GFF files must contain isolate names in the seqid column."
+                )
+            else:
+                gff_iso = gff[gff["seqid"] == isolate]
 
             empty_result = dict(
                 n_prophage=0, n_prophage_associated=0,
@@ -1581,9 +1617,12 @@ def annotate_events_with_mges(
                 pos = row.get("position")
                 if pos is None or (isinstance(pos, float) and np.isnan(pos)):
                     results.append(empty_result)
+                    print(f"No position for deletion in junction {row.get("junction_name")} and genome {row.get("genome_name")}.")
                     continue
                 hits = _within_or_border(gff_iso, int(pos))
                 if hits.empty or "feature" not in hits.columns:
+                    if not hits.empty and "feature" not in hits.columns:
+                        print(f"Warning: 'feature' column missing in GFF for junction '{row.get('junction_name')}', isolate '{isolate}'.")
                     results.append(empty_result)
                     continue
                 # for deletions: just count, no coverage thresholds
@@ -1605,51 +1644,37 @@ def annotate_events_with_mges(
 
             hits = _overlapping(gff_iso, ev_start, ev_end)
             if hits.empty or "feature" not in hits.columns:
+                if not hits.empty and "feature" not in hits.columns:
+                    print(f"Warning: 'feature' column missing in GFF for junction '{row.get('junction_name')}', isolate '{isolate}'.")
                 results.append(empty_result)
                 continue
 
+            hits = hits.copy()
+            ann_len = (hits["end"].astype(int) - hits["start"].astype(int)).clip(lower=1).values
+            overlap = (hits["end"].astype(int).clip(upper=ev_end) - hits["start"].astype(int).clip(lower=ev_start)).clip(lower=0).values
+            ann_cov = overlap / ann_len
+            ev_cov  = overlap / ev_length
+            feature = hits["feature"].values
+
+            thr = fill_threshold
             res = empty_result.copy()
-            best_is_overlap  = 0
-            best_is_family   = None
-            assoc_is_families = []
 
-            for _, ann in hits.iterrows():
-                ann_start  = int(ann["start"])
-                ann_end    = int(ann["end"])
-                ann_length = max(ann_end - ann_start, 1)
-                overlap    = min(ev_end, ann_end) - max(ev_start, ann_start)
-                ann_cov    = overlap / ann_length
-                ev_cov     = overlap / ev_length
-                feature    = ann["feature"]
+            ph_mask = (feature == "prophage")
+            res["n_prophage"]            = int(((ann_cov >= thr) & (ev_cov >= thr) & ph_mask).sum())
+            res["n_prophage_associated"] = int(((ann_cov >= thr) & (ev_cov < thr)  & ph_mask).sum())
 
-                if feature == "prophage":
-                    if ann_cov >= fill_threshold and ev_cov >= fill_threshold:
-                        res["n_prophage"] += 1
-                    elif ann_cov >= fill_threshold:
-                        res["n_prophage_associated"] += 1
+            res["n_integron"]            = int(((ann_cov >= thr) & np.isin(feature, ["integron", "CALIN"])).sum())
+            res["n_defense_system"]      = int(((ann_cov >= thr) & (feature == "defense_system")).sum())
 
-                elif feature in ("integron", "CALIN"):
-                    if ann_cov >= fill_threshold:
-                        res["n_integron"] += 1
+            is_mask   = (feature == "IS")
+            is_full   = (ann_cov >= thr) & (ev_cov >= thr) & is_mask
+            is_assoc  = (ann_cov >= thr) & (ev_cov < thr)  & is_mask
+            res["n_is"]           = int(is_full.sum())
+            res["n_is_associated"] = int(is_assoc.sum())
+            if is_full.any():
+                res["is_family"] = hits["is_subtype"].values[is_full][overlap[is_full].argmax()]
+            res["is_families_associated"] = [f for f in hits["is_subtype"].values[is_assoc] if f is not None]
 
-                elif feature == "defense_system":
-                    if ann_cov >= fill_threshold:
-                        res["n_defense_system"] += 1
-
-                elif feature == "IS":
-                    if ann_cov >= fill_threshold and ev_cov >= fill_threshold:
-                        res["n_is"] += 1
-                        if overlap > best_is_overlap:
-                            best_is_overlap = overlap
-                            best_is_family  = ann["is_subtype"]
-                    elif ann_cov >= fill_threshold:
-                        res["n_is_associated"] += 1
-                        fam = ann["is_subtype"]
-                        if fam is not None:
-                            assoc_is_families.append(fam)
-
-            res["is_family"]              = best_is_family
-            res["is_families_associated"] = assoc_is_families
             results.append(res)
 
         df = df.copy()
@@ -1662,9 +1687,9 @@ def annotate_events_with_mges(
                        df["n_defense_system"] + df["n_is"] + df["n_is_associated"] + df["n_prophage_associated"])
 
         def _mge_label(row):
-            if row["n_integron"] > 0:             return "Integron"
             if row["n_prophage"] > 0:             return "Prophage"
             if row["n_is"] > 0:                   return "IS"
+            if row["n_integron"] > 0:             return "Integron"
             if row["n_defense_system"] > 0:       return "Defense system"
             if row["n_prophage_associated"] > 0:  return "Prophage (associated)"
             if row["n_is_associated"] > 0:        return "IS (associated)"
@@ -1673,12 +1698,10 @@ def annotate_events_with_mges(
         df["mge_label"] = df.apply(_mge_label, axis=1)
         return df
 
-    annotated = {}
-    for dtype, df in summaries.items():
-        annotated[dtype] = _annotate_df(df, is_point=(dtype in point_types))
-
-    # collect insertion and translocation intervals per (junction, isolate) for the annotation check
-    event_intervals = {}  # (junction_name, genome_name) -> [(start, end), ...]
+    # build event_intervals upfront so _annotate_df can populate the GFF cache
+    # and we don't need a second pass over summaries afterwards
+    event_intervals = {}  # (junction_name, genome_name) -> np.array of shape (N, 2)
+    _ev_lists = {}
     for dtype in ("insertions", "translocations", "inversions"):
         df = summaries.get(dtype)
         if df is None or df.empty:
@@ -1687,47 +1710,38 @@ def annotate_events_with_mges(
             df = df[df["length"] >= min_length]
         for _, row in df.iterrows():
             key = (row["junction_name"], row["genome_name"])
-            event_intervals.setdefault(key, []).append(
-                (int(row["start_pos"]), int(row["end_pos"]))
-            )
+            _ev_lists.setdefault(key, []).append((int(row["start_pos"]), int(row["end_pos"])))
+    event_intervals = {k: np.array(v) for k, v in _ev_lists.items()} # values are transformed from lists to np.arrays
 
-    # second output: all MGE annotations with a column indicating overlap with insertion/translocation/inversion
-    # overlap is checked per isolate using the same ann_cov >= fill_threshold logic as _annotate_df
-    all_annot_rows = []
+    annotated = {dtype: _annotate_df(df, is_point=(dtype in point_types))
+                 for dtype, df in summaries.items()}
+
+    # build mge_annotations: all GFF rows with overlaps_event flag, vectorized per (junction, isolate)
+    annot_parts = []
     for junction_name, gff in _gff_cache.items():
         if gff.empty or "start" not in gff.columns:
             continue
-        for _, annot_row in gff.iterrows():
-            isolate = annot_row.get("seqid")
-            a_start = annot_row["start"]
-            a_end   = annot_row["end"]
-            ann_length = max(a_end - a_start, 1)
-            feature = annot_row.get("feature", "")
-            intervals = event_intervals.get((junction_name, isolate), [])
-            overlaps_any = False
-            for iv_start, iv_end in intervals:
-                overlap = min(a_end, iv_end) - max(a_start, iv_start)
-                if overlap <= 0:
-                    continue
-                ann_cov = overlap / ann_length
-                ev_length = max(iv_end - iv_start, 1)
-                ev_cov = overlap / ev_length
-                if feature in ("prophage", "IS"):
-                    # full hit: both coverages; associated: ann_cov only
-                    if ann_cov >= fill_threshold:
-                        overlaps_any = True
-                        break
-                else:
-                    # integron, CALIN, defense_system: ann_cov only
-                    if ann_cov >= fill_threshold:
-                        overlaps_any = True
-                        break
-            r = annot_row.to_dict()
-            r["junction_name"] = junction_name
-            r["overlaps_event"] = overlaps_any
-            all_annot_rows.append(r)
+        gff = gff.copy()
+        gff["junction_name"] = junction_name
+        gff["overlaps_event"] = False
 
-    mge_annotations = pd.DataFrame(all_annot_rows)
+        groups = gff.groupby("seqid") if "seqid" in gff.columns else [(None, gff)]
+        for isolate, gff_iso in groups:
+            iv = event_intervals.get((junction_name, isolate))
+            if iv is None or len(iv) == 0:
+                continue
+            a_start  = gff_iso["start"].values[:, None]          # (M, 1)
+            a_end    = gff_iso["end"].values[:, None]             # (M, 1)
+            ann_len  = np.maximum(a_end - a_start, 1)
+            overlap  = np.maximum(np.minimum(a_end, iv[:, 1]) -
+                                  np.maximum(a_start, iv[:, 0]), 0)  # (M, N)
+            ann_cov  = overlap / ann_len                          # (M, N)
+            overlaps = (ann_cov >= fill_threshold).any(axis=1)   # (M,)
+            gff.loc[gff_iso.index, "overlaps_event"] = overlaps
+
+        annot_parts.append(gff)
+
+    mge_annotations = pd.concat(annot_parts, ignore_index=True) if annot_parts else pd.DataFrame()
 
     return annotated, mge_annotations
 
@@ -1742,6 +1756,21 @@ def deduplicate_events(summaries, save_path=None):
       - Drop the isolate column (genome_name) since events are no longer
         tied to a specific isolate after deduplication.
       - Add an 'event_type' column with the event type string.
+
+    Annotation columns (n_prophage, n_integron, n_defense_system, n_is,
+    n_is_associated, is_family, is_families_associated, n_mge, mge_label, etc.)
+    are resolved by majority vote across all isolates sharing the same event.
+    If there is a single mode it is used directly; if multiple modes tie, numeric
+    columns take the rounded mean of the modes, and string columns take the first
+    mode. For list-valued columns (is_families_associated), a family is kept if
+    it appears in more than half of the isolates (NaN/empty-list rows are
+    included in the total count, so they count against the threshold). All other (non-annotation,
+    non-isolate) columns take the value from the first occurrence.
+
+    Origin/hits columns (n_hits_*, n_genomes_*, hits_in_genome,
+    hits_in_plasmid) are summarised as the median across isolates (rounded to
+    int). majority_organism is resolved by majority vote on the first two words
+    of the organism name.
 
     No length filtering is applied here — pass the returned DataFrame to
     ``count_events_per_junction`` with a ``min_length`` argument to filter
@@ -1769,14 +1798,43 @@ def deduplicate_events(summaries, save_path=None):
         "translocations":       "translocation",
         "inversions":           "inversion",
     }
-    parts = []
 
+    # Column sets that require special aggregation
     annotation_cols = {
         "n_prophage", "n_prophage_associated",
         "n_integron", "n_defense_system",
         "n_is", "n_is_associated",
         "is_family", "is_families_associated", "n_mge", "mge_label",
     }
+    origin_median_cols = {"hits_in_genome", "hits_in_plasmid"}  # plus n_hits_* and n_genomes_*
+
+    # Aggregation helpers (defined once, used for every event type)
+    def _majority(series):
+        """Majority vote: single mode, or mean/first of tied modes."""
+        m = series.dropna().mode()
+        if m.empty:
+            return series.iloc[0] if not series.empty else None
+        if len(m) == 1:
+            return m.iloc[0]
+        return int(round(m.mean())) if pd.api.types.is_numeric_dtype(m) else m.iloc[0]
+
+    def _majority_list(series):
+        """Keep families that appear in more than half of all isolates (including NaN rows)."""
+        n = len(series)
+        counts = Counter(fam for lst in series for fam in (lst if isinstance(lst, list) else []))
+        return [fam for fam, cnt in counts.items() if cnt > n / 2]
+
+    def _median_int(series):
+        """Median across isolates, rounded to int; 0 if all NaN."""
+        return int(round(series.median(skipna=True))) if series.notna().any() else 0
+
+    def _majority_organism(series):
+        """Majority vote on the first two words of the organism name."""
+        normalized = series.dropna().map(lambda x: " ".join(x.split()[:2]) if isinstance(x, str) else x)
+        m = normalized.mode()
+        return m.iloc[0] if not m.empty else None
+
+    parts = []
 
     for dtype, etype_label in event_type_map.items():
         df = summaries.get(dtype)
@@ -1790,56 +1848,28 @@ def deduplicate_events(summaries, save_path=None):
             dedup_cols = ["junction_name", "path", "ctx"]
         else:
             dedup_cols = ["junction_name", "path"]
+            print(f"Deduplication is done without using context, only based on path because context column was missing for {dtype}")
 
-        present_ann_cols = [c for c in annotation_cols if c in df.columns]
+        # Columns to skip (used as group keys or dropped)
+        skip_cols = set(dedup_cols) | {"genome_name"}
 
-        if present_ann_cols:
-            # For annotation columns: majority vote across all isolates sharing the same event
-            def _majority(series):
-                m = series.dropna().mode()
-                return m.iloc[0] if not m.empty else (series.iloc[0] if not series.empty else None)
-
-            def _majority_list(series):
-                n = len(series)
-                counts = Counter(fam for lst in series for fam in (lst if isinstance(lst, list) else []))
-                return [fam for fam, cnt in counts.items() if cnt > n / 2]
-
-            non_ann_cols = [c for c in df.columns if c not in annotation_cols and c != "genome_name"]
-            agg_dict = {}
-            for c in present_ann_cols:
-                if c == "is_families_associated":
-                    agg_dict[c] = _majority_list
-                else:
-                    agg_dict[c] = _majority
-
-            # take first value for all non-annotation, non-isolate columns
-            for c in non_ann_cols:
-                if c not in dedup_cols:
-                    agg_dict[c] = "first"
-
-            df = df.groupby(dedup_cols, as_index=False).agg(agg_dict)
-        else:
-            hits_cols = [c for c in df.columns if c.startswith("n_hits_") or c.startswith("n_genomes_")]
-            plasmid_hit_cols = [c for c in df.columns if c in ("hits_in_genome", "hits_in_plasmid")]
-            species_cols = [c for c in df.columns if c.startswith("n_hits_") and c not in
-                            [f"n_hits_{cat}" for cat in ("own_chromosome", "own_plasmid", "other_chromosome", "other_plasmid", "external")]]
-            numeric_cols = hits_cols + plasmid_hit_cols
-            if numeric_cols:
-                non_hits_cols = [c for c in df.columns if c not in numeric_cols and c not in ("genome_name", "isolate_name")]
-                agg_dict = {c: "first" for c in non_hits_cols if c not in dedup_cols}
-                for c in numeric_cols:
-                    agg_dict[c] = lambda s, _c=c: int(round(s.median(skipna=True))) if s.notna().any() else 0
-                if "majority_organism" in df.columns:
-                    def _majority_organism(s):
-                        normalized = s.dropna().map(lambda x: " ".join(x.split()[:2]) if isinstance(x, str) else x)
-                        m = normalized.mode()
-                        return m.iloc[0] if not m.empty else None
-                    agg_dict["majority_organism"] = _majority_organism
-                df = df.groupby(dedup_cols, as_index=False).agg(agg_dict)
+        # Build agg_dict for every column in one pass
+        agg_dict = {}
+        for c in df.columns:
+            if c in skip_cols:
+                continue
+            if c == "is_families_associated":
+                agg_dict[c] = _majority_list
+            elif c in annotation_cols:
+                agg_dict[c] = _majority
+            elif c == "majority_organism":
+                agg_dict[c] = _majority_organism
+            elif c.startswith("n_hits_") or c.startswith("n_genomes_") or c in origin_median_cols:
+                agg_dict[c] = _median_int
             else:
-                df = df.drop_duplicates(subset=dedup_cols)
-                df = df.drop(columns=["genome_name"], errors="ignore")
+                agg_dict[c] = "first"
 
+        df = df.groupby(dedup_cols, as_index=False).agg(agg_dict)
         df = df.reset_index(drop=True)
         df.insert(0, "event_type", etype_label)
         parts.append(df)

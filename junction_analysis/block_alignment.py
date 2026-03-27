@@ -153,6 +153,11 @@ def core_bounds(records):
     return (start, end)
 
 def avg_pairwise_distance(arr):
+    """
+    Compute relative Hamming distances for all pairs of sequences in an alignment.
+    Only ACGT positions are considered; gaps and ambiguous characters are ignored.
+    Returns the mean distance across all pairs and an array of per-pair distances.
+    """
     # ignores gap positions
     # shape: (n, L_core)
     n, L = arr.shape

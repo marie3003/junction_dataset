@@ -2335,6 +2335,9 @@ def plot_events_per_junction(counts_df, figsize=(12, 5), save_path=None):
 
 def plot_event_length_distribution(
     deduped_df,
+    event_types=None,
+    subplot_arrangement=None,
+    color_by=None,
     min_length_threshold=200,
     bins=50,
     log_x=False,
@@ -2342,30 +2345,35 @@ def plot_event_length_distribution(
     y_max=None,
     x_max=None,
     filter_below_threshold=False,
-    color_by_mge=False,
-    insertions_only=False,
-    insertions_by_is_family=False,
-    deletions_only=False,
     ccdf_event=None,
-    color_by_majority_organism=False,
-    color_by_species_counts=False,
     n_species=5,
     legend_title=None,
     figsize=None,
     save_path=None,
 ):
     """
-    Plot the length distribution of each event type as histograms.
-
-    All subplots share the same x- and y-scales. A vertical dashed line
-    is drawn at `min_length_threshold` to mark the filtering cutoff.
+    Plot the length distribution of one or more event types as histograms.
 
     Parameters
     ----------
     deduped_df : pd.DataFrame
         Output of deduplicate_events(). Must have columns 'event_type' and 'length'.
+    event_types : list of str or None
+        Event types to include, e.g. ["insertion"] or ["insertion", "deletion",
+        "translocation", "inversion"]. None defaults to all four standard types.
+        Ambiguous insertions are always excluded.
+    subplot_arrangement : tuple of (int, int) or None
+        Grid shape (rows, cols) when len(event_types) > 1. If None, defaults to
+        (2, 2) for four event types or (1, n) for fewer.
+    color_by : str or None
+        How to color the histogram bars. Options:
+          None              — plain single-color bars per event type
+          "mge"             — stacked by MGE association label (mge_label column)
+          "is_family"       — stacked by IS family (is_family / is_families_associated)
+          "majority_organism" — stacked by majority_organism (first two words)
+          "species_counts"  — proportionally colored by per-bin species hit counts
     min_length_threshold : int or None
-        Position of the cutoff line. Pass None to omit. Default: 200.
+        Position of the vertical cutoff line. Pass None to omit. Default: 200.
     bins : int
         Number of histogram bins. Default: 50.
     log_x : bool
@@ -2378,17 +2386,27 @@ def plot_event_length_distribution(
         If provided, cap the x-axis at this value.
     filter_below_threshold : bool
         If True, exclude events shorter than min_length_threshold.
-    color_by_mge : bool
-        If True, stack bars by MGE association using the same colors as
-        plot_event_mge_stacked_bar. Default: False.
-    insertions_only : bool
-        If True, show only a single panel for insertions. Default: False.
+    ccdf_event : str or None
+        If set to an event type string (e.g. "deletion"), draw a CCDF curve for
+        that event type instead of a histogram. Ignores event_types/color_by.
+    n_species : int
+        Number of top species to show individually in "species_counts" mode. Default: 5.
+    legend_title : str or None
+        Override the default legend title.
     figsize : tuple or None
-        Figure size. Defaults to (6, 4) for insertions_only, (10, 8) otherwise.
+        Figure size. Defaults to (6, 4) for a single panel, (10, 8) for a grid.
     save_path : str or None
         If provided, save the figure; otherwise call plt.show().
     """
-    # MGE colors + alphas matching plot_event_mge_stacked_bar
+    # ── constants ───────────────────────────────────────────────────────────────
+    _EVENT_COLOR = {
+        "insertion":     "#7394c2",
+        "deletion":      "#DD8452",
+        "translocation": "#55A868",
+        "inversion":     "#C44E52",
+    }
+    _ALL_EVENT_TYPES = ["insertion", "deletion", "translocation", "inversion"]
+
     _MGE_STYLE = {
         "Prophage":              ("#a6444f", 1.0),
         "Prophage (associated)": ("#c98087", 1.0),
@@ -2402,102 +2420,87 @@ def plot_event_length_distribution(
         "Defense system": "Defense system (associated)",
         "Integron":       "Integron (associated)",
     }
-    mge_order = ["None", "IS (associated)", "IS",
-                 "Defense system", "Integron",
-                 "Prophage (associated)", "Prophage"]
+    _MGE_ORDER = ["None", "IS (associated)", "IS", "Defense system", "Integron",
+                  "Prophage (associated)", "Prophage"]
 
-    event_cfg = [
-        ("insertion",     "#7394c2"),
-        ("deletion",      "#DD8452"),
-        ("translocation", "#55A868"),
-        ("inversion",     "#C44E52"),
-    ]
+    _SPECIES_PALETTE = [COLORS["light_blue"], COLORS["mid_blue"], COLORS["dark_blue"],
+                        COLORS["purple"], COLORS["rosa"], COLORS["reddish"], COLORS["wine"]]
 
-    plot_df = deduped_df[
-        deduped_df["event_type"] != "ambiguous_insertion"
-    ].copy()
-    if filter_below_threshold and min_length_threshold is not None:
-        plot_df = plot_df[plot_df["length"] >= min_length_threshold]
-
-    # --- single-event CCDF shortcut ---------------------------------------------
-    _ccdf_event = None
-    if deletions_only:
-        _ccdf_event = "deletion"
-    elif ccdf_event is not None:
-        _ccdf_event = ccdf_event
-
-    if _ccdf_event is not None:
-        _etype_label = {
-            "deletion":      "Deletion",
-            "translocation": "Translocation",
-            "inversion":     "Inversion",
-            "insertion":     "Insertion",
-        }.get(_ccdf_event, _ccdf_event.capitalize())
-
-        lengths = plot_df[plot_df["event_type"] == _ccdf_event]["length"].dropna().sort_values().values
-        if len(lengths) == 0:
-            return
-        if figsize is None:
-            figsize = (6, 4)
-        fig, ax = plt.subplots(figsize=figsize)
-        ccdf = 1 - np.arange(0, len(lengths)) / len(lengths)
-        ax.plot(lengths, ccdf, color="#7394c2", linewidth=2.5)
-        ax.fill_between(lengths, ccdf, alpha=0.12, color="#7394c2")
-        if x_max is not None:
-            ax.set_xlim(right=x_max)
-        ax.set_xlim(left=lengths.min())
-        ax.set_ylim(0, 1.02)
+    # ── shared axis styling helper ───────────────────────────────────────────────
+    def _style_ax(ax):
+        if log_y:
+            ax.set_yscale("log")
         if log_x:
             ax.set_xscale("log")
-        ax.set_xlabel(f"{_etype_label} length (bp)", fontsize=15)
-        ax.set_ylabel(f"Fraction of {_etype_label.lower()}s ≥ length", fontsize=15)
-        ax.tick_params(axis="both", labelsize=13, length=4)
-        ax.yaxis.grid(True, linestyle="--", linewidth=0.6, alpha=0.45, zorder=0)
-        ax.xaxis.grid(False)
+        if y_max is not None:
+            ax.set_ylim(top=y_max)
+        if x_max is not None:
+            ax.set_xlim(right=x_max)
+        ax.tick_params(axis="both", labelsize=12, length=3)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
         ax.set_axisbelow(True)
-        for spine in ["top", "right"]:
-            ax.spines[spine].set_visible(False)
-        ax.spines["left"].set_linewidth(0.8)
-        ax.spines["bottom"].set_linewidth(0.8)
-        plt.tight_layout()
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    def _save_or_show(fig):
         if save_path is not None:
             os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
             fig.savefig(save_path, bbox_inches="tight")
             print(f"Saved figure to {save_path}")
         else:
             plt.show()
-        return fig, ax
 
-    # --- insertions by IS family shortcut ---------------------------------------
-    if insertions_by_is_family:
-        sub = plot_df[plot_df["event_type"] == "insertion"].copy()
-        if sub.empty:
-            return
-        if figsize is None:
-            figsize = (6, 4)
+    def _draw_stacked_bars(ax, bin_edges, stacks):
+        """Draw stacked histogram bars and return legend handles.
 
+        stacks : list of (label, heights_array, color [, alpha])
+        Returns list of (patch, label) pairs in draw order.
+        """
+        bottoms = np.zeros(len(bin_edges) - 1)
+        handles = []
+        for entry in stacks:
+            lbl, heights, color = entry[:3]
+            alpha = entry[3] if len(entry) > 3 else 1.0
+            ax.bar(bin_edges[:-1], heights, width=np.diff(bin_edges),
+                   bottom=bottoms, align="edge",
+                   color=color, alpha=alpha, edgecolor="white", linewidth=0.4)
+            handles.append((plt.Rectangle((0, 0), 1, 1, color=color, alpha=alpha, linewidth=0), lbl))
+            bottoms = bottoms + heights
+        return handles
+
+    # ── per-color-mode stack builders ────────────────────────────────────────────
+    def _stacks_plain(sub, bin_edges, color):
+        lengths = sub["length"].dropna().values
+        vals, _ = np.histogram(lengths, bins=bin_edges)
+        return [(None, vals, color)]  # label=None → no legend entry
+
+    def _stacks_mge(sub, bin_edges):
+        stacks = []
+        for lbl in _MGE_ORDER:
+            lengths = sub.loc[sub["mge_label"] == lbl, "length"].dropna().values
+            if len(lengths) == 0:
+                continue
+            vals, _ = np.histogram(lengths, bins=bin_edges)
+            display = _MGE_DISPLAY_NAME.get(lbl, lbl)
+            color, alpha = _MGE_STYLE[lbl]
+            stacks.append((display, vals, color, alpha))
+        return stacks
+
+    def _stacks_is_family(sub, bin_edges):
         IS_BASE = (55, 126, 184)
 
-        # collect IS families from is_family + is_families_associated columns
+        def _hex_from_rgb_str(s):
+            vals = [int(v) for v in s.replace("rgb(", "").replace(")", "").split(",")]
+            return "#{:02x}{:02x}{:02x}".format(*vals)
+
         full_families = sorted(sub["is_family"].dropna().unique()) if "is_family" in sub.columns else []
         assoc_families = sorted({
             f for cell in sub.get("is_families_associated", pd.Series(dtype=object)).dropna()
             for f in (cell if isinstance(cell, list) else [])
         })
         all_families = sorted(set(full_families) | set(assoc_families))
-
-        # lightest shade reserved for "IS (associated)" (no specific family)
-        n_shades = max(len(all_families), 1)
-        shades = _shades_from_base_rgb(IS_BASE, n_shades)
-
-        # family → shade (darkest shades for named families, lightest for associated)
-        def _hex_from_rgb_str(s):
-            vals = [int(v) for v in s.replace("rgb(", "").replace(")", "").split(",")]
-            return "#{:02x}{:02x}{:02x}".format(*vals)
-
+        shades = _shades_from_base_rgb(IS_BASE, max(len(all_families), 1))
         family_color = {fam: _hex_from_rgb_str(shades[i]) for i, fam in enumerate(all_families)}
-        assoc_color  = COLORS["rosa"]   # rosa, clearly distinct from blue IS family shades
-        none_color   = COLORS["gray"]
 
         def _row_label(row):
             if "is_family" in row and pd.notna(row["is_family"]):
@@ -2507,363 +2510,215 @@ def plot_event_length_distribution(
                 return "__associated__"
             return "__none__"
 
+        sub = sub.copy()
         sub["_is_label"] = sub.apply(_row_label, axis=1)
-
-        # stack order: none → associated → named families (darkest on top)
-        stack_order = ["__none__", "__associated__"] + all_families
-        color_map = {"__none__": none_color, "__associated__": assoc_color, **family_color}
+        color_map = {"__none__": COLORS["gray"], "__associated__": COLORS["rosa"], **family_color}
         display_map = {"__none__": "Not associated", "__associated__": "IS (associated)"}
+        stack_order = ["__none__", "__associated__"] + all_families
 
-        all_ins_lengths = sub["length"].dropna().values
-        x_min_i = max(all_ins_lengths.min(), 1) if log_x else all_ins_lengths.min()
-        x_max_i = x_max if x_max is not None else all_ins_lengths.max()
-        if log_x:
-            bin_edges_i = np.logspace(np.log10(x_min_i), np.log10(x_max_i), bins + 1)
-        else:
-            bin_edges_i = np.linspace(x_min_i, x_max_i, bins + 1)
-
-        fig, ax = plt.subplots(figsize=figsize)
-        bottoms = np.zeros(len(bin_edges_i) - 1)
-        handles = []
+        stacks = []
         for lbl in stack_order:
             lengths = sub.loc[sub["_is_label"] == lbl, "length"].dropna().values
             if len(lengths) == 0:
                 continue
-            vals, _ = np.histogram(lengths, bins=bin_edges_i)
-            ax.bar(
-                bin_edges_i[:-1], vals, width=np.diff(bin_edges_i),
-                bottom=bottoms, align="edge",
-                color=color_map[lbl], edgecolor="white", linewidth=0.4,
-            )
-            handles.append((plt.Rectangle((0, 0), 1, 1, color=color_map[lbl], linewidth=0),
-                             display_map.get(lbl, lbl)))
-            bottoms = bottoms + vals
+            vals, _ = np.histogram(lengths, bins=bin_edges)
+            stacks.append((display_map.get(lbl, lbl), vals, color_map[lbl]))
+        return stacks
 
-        if min_length_threshold is not None and not filter_below_threshold:
-            ax.axvline(min_length_threshold, color="#7a7a7a", linestyle="--", linewidth=1.2)
-
-        h, l = zip(*reversed(handles))
-        ax.legend(h, l, frameon=False, fontsize=11,
-                  title=legend_title if legend_title is not None else "IS family", title_fontsize=12,
-                  loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
-
-
-        ax.set_xlabel("Event length (bp)", fontsize=14)
-        ax.set_ylabel("Count", fontsize=14)
-        if log_y:
-            ax.set_yscale("log")
-        if log_x:
-            ax.set_xscale("log")
-        if y_max is not None:
-            ax.set_ylim(top=y_max)
-        if x_max is not None:
-            ax.set_xlim(right=x_max)
-        ax.tick_params(axis="both", labelsize=12, length=3)
-        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
-        ax.set_axisbelow(True)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        fig.tight_layout()
-        fig.subplots_adjust(right=0.72)
-        if save_path is not None:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
-            fig.savefig(save_path, bbox_inches="tight")
-            print(f"Saved figure to {save_path}")
-        else:
-            plt.show()
-        return fig, ax
-
-    # --- shared helper for organism coloring modes ------------------------------
-    def _organism_stacked_bar(sub, bin_edges_s, stack_order, color_map, legend_title_str):
-        fig, ax = plt.subplots(figsize=figsize)
-        bottoms = np.zeros(len(bin_edges_s) - 1)
-        handles = []
-        for lbl in stack_order:
-            lengths = sub.loc[sub["_species_label"] == lbl, "length"].dropna().values
-            if len(lengths) == 0:
-                continue
-            vals, _ = np.histogram(lengths, bins=bin_edges_s)
-            ax.bar(
-                bin_edges_s[:-1], vals, width=np.diff(bin_edges_s),
-                bottom=bottoms, align="edge",
-                color=color_map[lbl], edgecolor="white", linewidth=0.4,
-            )
-            handles.append((plt.Rectangle((0, 0), 1, 1, color=color_map[lbl], linewidth=0), lbl))
-            bottoms = bottoms + vals
-
-        if min_length_threshold is not None and not filter_below_threshold:
-            ax.axvline(min_length_threshold, color="#7a7a7a", linestyle="--", linewidth=1.2)
-
-        h, l = zip(*reversed(handles))
-        ax.legend(h, l, frameon=False, fontsize=11,
-                  title=legend_title_str, title_fontsize=12,
-                  loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
-        ax.set_xlabel("Insertion length (bp)", fontsize=14)
-        ax.set_ylabel("Count", fontsize=14)
-        if log_y:
-            ax.set_yscale("log")
-        if log_x:
-            ax.set_xscale("log")
-        if y_max is not None:
-            ax.set_ylim(top=y_max)
-        if x_max is not None:
-            ax.set_xlim(right=x_max)
-        ax.tick_params(axis="both", labelsize=12, length=3)
-        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
-        ax.set_axisbelow(True)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        fig.tight_layout()
-        fig.subplots_adjust(right=0.72)
-        if save_path is not None:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
-            fig.savefig(save_path, bbox_inches="tight")
-            print(f"Saved figure to {save_path}")
-        else:
-            plt.show()
-        return fig, ax
-
-    _species_palette = [COLORS["light_blue"], COLORS["mid_blue"], COLORS["dark_blue"],
-                        COLORS["purple"], COLORS["rosa"], COLORS["reddish"], COLORS["wine"]]
-
-    # --- mode 1: color each insertion by its majority_organism column -----------
-    if color_by_majority_organism:
-        sub = plot_df[plot_df["event_type"] == "insertion"].copy()
-        if sub.empty:
-            return
-        if figsize is None:
-            figsize = (6, 4)
-
+    def _stacks_majority_organism(sub, bin_edges):
         if "majority_organism" in sub.columns:
+            sub = sub.copy()
             sub["_species"] = sub["majority_organism"].apply(
                 lambda x: " ".join(str(x).split()[:2]) if pd.notna(x) else None
             )
         else:
+            sub = sub.copy()
             sub["_species"] = None
 
-        species_counts = sub["_species"].value_counts()
-        all_species = list(species_counts.index)
-        sub["_species_label"] = sub["_species"].apply(
-            lambda x: x if pd.notna(x) else "unknown"
-        )
-
-        stack_order = all_species + (["unknown"] if sub["_species_label"].eq("unknown").any() else [])
-        color_map = {s: _species_palette[i % len(_species_palette)] for i, s in enumerate(all_species)}
+        all_species = list(sub["_species"].value_counts().index)
+        sub["_label"] = sub["_species"].apply(lambda x: x if pd.notna(x) else "unknown")
+        stack_order = all_species + (["unknown"] if sub["_label"].eq("unknown").any() else [])
+        color_map = {s: _SPECIES_PALETTE[i % len(_SPECIES_PALETTE)] for i, s in enumerate(all_species)}
         color_map["unknown"] = COLORS["gray"]
 
-        all_lengths = sub["length"].dropna().values
-        x_min_s = max(all_lengths.min(), 1) if log_x else all_lengths.min()
-        x_max_s = x_max if x_max is not None else all_lengths.max()
-        bin_edges_s = (
-            np.logspace(np.log10(x_min_s), np.log10(x_max_s), bins + 1)
-            if log_x else np.linspace(x_min_s, x_max_s, bins + 1)
-        )
-        return _organism_stacked_bar(sub, bin_edges_s, stack_order, color_map, "Majority organism")
+        stacks = []
+        for lbl in stack_order:
+            lengths = sub.loc[sub["_label"] == lbl, "length"].dropna().values
+            if len(lengths) == 0:
+                continue
+            vals, _ = np.histogram(lengths, bins=bin_edges)
+            stacks.append((lbl, vals, color_map[lbl]))
+        return stacks
 
-    # --- mode 2: color each bar by relative species hit counts ------------------
-    if color_by_species_counts:
-        sub = plot_df[plot_df["event_type"] == "insertion"].copy()
-        if sub.empty:
-            return
-        if figsize is None:
-            figsize = (6, 4)
-
-        known_cats = {"n_hits_own_chromosome", "n_hits_own_plasmid", "n_hits_other_chromosome",
-                      "n_hits_other_plasmid", "n_hits_external"}
+    def _stacks_species_counts(sub, bin_edges):
+        known_cats = {"n_hits_own_chromosome", "n_hits_own_plasmid",
+                      "n_hits_other_chromosome", "n_hits_other_plasmid", "n_hits_external"}
         _exclude = {"bacterium", "Candidatus bacterium"}
         species_cols = [c for c in sub.columns if c.startswith("n_hits_") and c not in known_cats
                         and c.replace("n_hits_", "").replace("_", " ") not in _exclude]
 
-        species_totals = sub[species_cols].sum().sort_values(ascending=False)
-        top_species_cols = list(species_totals.index[:n_species])
-        other_species_cols = [c for c in species_cols if c not in top_species_cols]
-        top_species_labels = [c.replace("n_hits_", "").replace("_", " ") for c in top_species_cols]
-
-        color_map = {c: _species_palette[i % len(_species_palette)] for i, c in enumerate(top_species_cols)}
+        top_cols = list(sub[species_cols].sum().sort_values(ascending=False).index[:n_species])
+        other_cols = [c for c in species_cols if c not in top_cols]
+        color_map = {c: _SPECIES_PALETTE[i % len(_SPECIES_PALETTE)] for i, c in enumerate(top_cols)}
         color_map["_other"] = COLORS["gray"]
 
         all_lengths = sub["length"].dropna().values
-        x_min_s = max(all_lengths.min(), 1) if log_x else all_lengths.min()
-        x_max_s = x_max if x_max is not None else all_lengths.max()
-        bin_edges_s = (
-            np.logspace(np.log10(x_min_s), np.log10(x_max_s), bins + 1)
-            if log_x else np.linspace(x_min_s, x_max_s, bins + 1)
-        )
-
-        bin_idx = np.digitize(all_lengths, bin_edges_s) - 1
-        bin_idx = np.clip(bin_idx, 0, len(bin_edges_s) - 2)
+        bar_counts, _ = np.histogram(all_lengths, bins=bin_edges)
+        bin_idx = np.clip(np.digitize(all_lengths, bin_edges) - 1, 0, len(bin_edges) - 2)
         sub = sub.loc[sub["length"].dropna().index].copy()
         sub["_bin"] = bin_idx
-
-        bar_counts, _ = np.histogram(all_lengths, bins=bin_edges_s)
         total_per_bin = np.array([sub[sub["_bin"] == b][species_cols].sum(axis=1).sum()
-                                  for b in range(len(bin_edges_s) - 1)])
+                                  for b in range(len(bin_edges) - 1)])
 
-        fig, ax = plt.subplots(figsize=figsize)
-        bottoms = np.zeros(len(bin_edges_s) - 1)
-        handles = []
-
-        for sc in top_species_cols + ["_other"]:
+        stacks = []
+        for sc in top_cols + ["_other"]:
             bin_totals = np.array([
-                sub[sub["_bin"] == b][other_species_cols].sum(axis=1).sum()
-                if sc == "_other"
+                sub[sub["_bin"] == b][other_cols].sum(axis=1).sum() if sc == "_other"
                 else sub[sub["_bin"] == b][sc].sum()
-                for b in range(len(bin_edges_s) - 1)
+                for b in range(len(bin_edges) - 1)
             ])
-            rel = np.where(total_per_bin > 0, bin_totals / total_per_bin, 0)
-            heights = rel * bar_counts
+            heights = np.where(total_per_bin > 0, bin_totals / total_per_bin, 0) * bar_counts
             label = "Other" if sc == "_other" else sc.replace("n_hits_", "").replace("_", " ")
-            ax.bar(bin_edges_s[:-1], heights, width=np.diff(bin_edges_s),
-                   bottom=bottoms, align="edge",
-                   color=color_map[sc], edgecolor="white", linewidth=0.4)
-            handles.append((plt.Rectangle((0, 0), 1, 1, color=color_map[sc], linewidth=0), label))
-            bottoms = bottoms + heights
+            stacks.append((label, heights, color_map[sc]))
+        return stacks
 
-        if min_length_threshold is not None and not filter_below_threshold:
-            ax.axvline(min_length_threshold, color="#7a7a7a", linestyle="--", linewidth=1.2)
+    # ── data prep ────────────────────────────────────────────────────────────────
+    plot_df = deduped_df[deduped_df["event_type"] != "ambiguous_insertion"].copy()
+    if filter_below_threshold and min_length_threshold is not None:
+        plot_df = plot_df[plot_df["length"] >= min_length_threshold]
 
-        h, l = zip(*reversed(handles))
-        ax.legend(h, l, frameon=False, fontsize=11,
-                  title=legend_title if legend_title is not None else "Species (hit counts)",
-                  title_fontsize=12, loc="upper right")
-        ax.set_xlabel("Insertion length (bp)", fontsize=14)
-        ax.set_ylabel("Count", fontsize=14)
-        if log_y:
-            ax.set_yscale("log")
-        if log_x:
-            ax.set_xscale("log")
-        if y_max is not None:
-            ax.set_ylim(top=y_max)
+    # ── CCDF shortcut (separate plot type, ignores event_types/color_by) ─────────
+    if ccdf_event is not None:
+        etype_label = ccdf_event.replace("_", " ").capitalize()
+        lengths = plot_df[plot_df["event_type"] == ccdf_event]["length"].dropna().sort_values().values
+        if len(lengths) == 0:
+            return
+        fig, ax = plt.subplots(figsize=figsize or (6, 4))
+        ccdf = 1 - np.arange(0, len(lengths)) / len(lengths)
+        ax.plot(lengths, ccdf, color="#7394c2", linewidth=2.5)
+        ax.fill_between(lengths, ccdf, alpha=0.12, color="#7394c2")
         if x_max is not None:
             ax.set_xlim(right=x_max)
-        ax.tick_params(axis="both", labelsize=12, length=3)
-        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
+        ax.set_xlim(left=lengths.min())
+        ax.set_ylim(0, 1.02)
+        if log_x:
+            ax.set_xscale("log")
+        ax.set_xlabel(f"{etype_label} length (bp)", fontsize=15)
+        ax.set_ylabel(f"Fraction of {etype_label.lower()}s ≥ length", fontsize=15)
+        ax.tick_params(axis="both", labelsize=13, length=4)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.6, alpha=0.45, zorder=0)
+        ax.xaxis.grid(False)
         ax.set_axisbelow(True)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        fig.tight_layout()
-        if save_path is not None:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
-            fig.savefig(save_path, bbox_inches="tight")
-            print(f"Saved figure to {save_path}")
-        else:
-            plt.show()
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+        ax.spines["left"].set_linewidth(0.8)
+        ax.spines["bottom"].set_linewidth(0.8)
+        plt.tight_layout()
+        _save_or_show(fig)
         return fig, ax
 
-    if insertions_only:
-        active_cfg = [c for c in event_cfg if c[0] == "insertion"]
-    else:
-        active_cfg = event_cfg
+    # ── resolve active event types and figure layout ─────────────────────────────
+    active_etypes = event_types if event_types is not None else _ALL_EVENT_TYPES
 
-    all_lengths = plot_df[
-        plot_df["event_type"].isin([e for e, _ in active_cfg])
-    ]["length"].dropna().values
+    all_lengths = plot_df[plot_df["event_type"].isin(active_etypes)]["length"].dropna().values
     if len(all_lengths) == 0:
         return
 
     x_min = max(all_lengths.min(), 1) if log_x else all_lengths.min()
     x_max_data = x_max if x_max is not None else all_lengths.max()
+    bin_edges = (
+        np.logspace(np.log10(x_min), np.log10(x_max_data), bins + 1)
+        if log_x else np.linspace(x_min, x_max_data, bins + 1)
+    )
 
-    if log_x:
-        bin_edges = np.logspace(np.log10(x_min), np.log10(x_max_data), bins + 1)
-    else:
-        bin_edges = np.linspace(x_min, x_max_data, bins + 1)
-
-    if insertions_only:
-        if figsize is None:
-            figsize = (6, 4)
-        fig, ax_single = plt.subplots(figsize=figsize)
-        axes_list = [ax_single]
+    single_panel = len(active_etypes) == 1
+    if single_panel:
+        fig, ax_single = plt.subplots(figsize=figsize or (6, 4))
+        axes_flat = [ax_single]
         axes_grid = None
     else:
-        if figsize is None:
-            figsize = (10, 8)
-        fig, axes_grid = plt.subplots(2, 2, figsize=figsize, sharex=True, sharey=True)
+        if subplot_arrangement is not None:
+            nrows, ncols = subplot_arrangement
+        elif len(active_etypes) == 4:
+            nrows, ncols = 2, 2
+        else:
+            nrows, ncols = 1, len(active_etypes)
+        fig, axes_grid = plt.subplots(nrows, ncols, figsize=figsize or (10, 8),
+                                      sharex=True, sharey=True)
         fig.subplots_adjust(hspace=0.3, wspace=0.12)
-        axes_list = axes_grid.flatten()
+        axes_flat = np.array(axes_grid).flatten()
 
-    for ax, (etype, color) in zip(axes_list, active_cfg):
+    # ── per-panel drawing ─────────────────────────────────────────────────────────
+    default_legend_titles = {
+        "mge":                "Mobile genetic elements",
+        "is_family":          "IS family",
+        "majority_organism":  "Majority organism",
+        "species_counts":     "Species (hit counts)",
+    }
+
+    for ax, etype in zip(axes_flat, active_etypes):
         sub = plot_df[plot_df["event_type"] == etype]
+        if sub.empty or "length" not in sub.columns:
+            _style_ax(ax)
+            continue
 
-        if not sub.empty and "length" in sub.columns:
-            if color_by_mge:
-                lengths_by_label = {
-                    lbl: sub.loc[sub["mge_label"] == lbl, "length"].dropna().values
-                    for lbl in mge_order
-                }
-                active_labels = [lbl for lbl in mge_order if len(lengths_by_label[lbl]) > 0]
-                colors = [_MGE_STYLE[lbl][0] for lbl in active_labels]
-                alphas = [_MGE_STYLE[lbl][1] for lbl in active_labels]
+        if color_by is None:
+            stacks = _stacks_plain(sub, bin_edges, _EVENT_COLOR.get(etype, "#7394c2"))
+        elif color_by == "mge":
+            stacks = _stacks_mge(sub, bin_edges)
+        elif color_by == "is_family":
+            stacks = _stacks_is_family(sub, bin_edges)
+        elif color_by == "majority_organism":
+            stacks = _stacks_majority_organism(sub, bin_edges)
+        elif color_by == "species_counts":
+            stacks = _stacks_species_counts(sub, bin_edges)
+        else:
+            raise ValueError(f"Unknown color_by={color_by!r}. "
+                             "Choose from: None, 'mge', 'is_family', 'majority_organism', 'species_counts'")
 
-                # matplotlib stacked hist doesn't support per-bar alpha;
-                # draw layers manually from bottom up
-                bottoms = np.zeros(len(bin_edges) - 1)
-                handles = []
-                for lbl, c, a in zip(active_labels, colors, alphas):
-                    vals, _ = np.histogram(lengths_by_label[lbl], bins=bin_edges)
-                    ax.bar(
-                        bin_edges[:-1], vals, width=np.diff(bin_edges),
-                        bottom=bottoms, align="edge",
-                        color=c, alpha=a, edgecolor="white", linewidth=0.4,
-                    )
-                    handles.append(plt.Rectangle((0, 0), 1, 1, color=c, alpha=a, linewidth=0))
-                    bottoms = bottoms + vals
+        handles = _draw_stacked_bars(ax, bin_edges, stacks)
 
-                display_labels = [_MGE_DISPLAY_NAME.get(l, l) for l in active_labels]
-                ax.legend(
-                    handles[::-1], display_labels[::-1],
-                    frameon=False, fontsize=11,
-                    title=legend_title if legend_title is not None else "Mobile genetic elements", title_fontsize=12,
-                )
+        # legend for stacked modes
+        if color_by is not None and handles:
+            titled = legend_title if legend_title is not None else default_legend_titles.get(color_by)
+            h, l = zip(*reversed(handles))
+            # mge and species_counts: legend inside the plot
+            # is_family and majority_organism: legend outside to the right
+            if color_by in ("mge", "species_counts"):
+                ax.legend(h, l, frameon=False, fontsize=11, title=titled,
+                          title_fontsize=12, loc="upper right")
             else:
-                ax.hist(
-                    sub["length"].dropna().values, bins=bin_edges,
-                    color=color, edgecolor="white", linewidth=0.4,
-                )
+                ax.legend(h, l, frameon=False, fontsize=11, title=titled,
+                          title_fontsize=12, loc="upper left",
+                          bbox_to_anchor=(1.01, 1), borderaxespad=0)
+                fig.subplots_adjust(right=0.72)
 
+        # threshold line
         if min_length_threshold is not None and not filter_below_threshold:
-            ax.axvline(
-                min_length_threshold, color="#7a7a7a",
-                linestyle="--", linewidth=1.2,
-                label=f"cutoff = {min_length_threshold} bp",
-            )
-            if not color_by_mge:
+            ax.axvline(min_length_threshold, color="#7a7a7a", linestyle="--", linewidth=1.2,
+                       label=f"cutoff = {min_length_threshold} bp")
+            if color_by is None:
                 ax.legend(frameon=False, fontsize=10)
 
-        if not insertions_only:
+        if not single_panel:
             ax.set_title(etype.capitalize(), fontsize=14, fontweight="normal", pad=6)
-        if log_y:
-            ax.set_yscale("log")
-        if log_x:
-            ax.set_xscale("log")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.tick_params(axis="both", labelsize=12, length=3)
-        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
-        ax.set_axisbelow(True)
 
-    if y_max is not None:
-        axes_list[0].set_ylim(top=y_max)
-    if x_max is not None:
-        axes_list[0].set_xlim(right=x_max)
+        _style_ax(ax)
 
-    if insertions_only:
-        axes_list[0].set_xlabel("Event length (bp)", fontsize=14)
-        axes_list[0].set_ylabel("Count", fontsize=14)
+    # ── axis labels ───────────────────────────────────────────────────────────────
+    if single_panel:
+        axes_flat[0].set_xlabel("Event length (bp)", fontsize=14)
+        axes_flat[0].set_ylabel("Count", fontsize=14)
     else:
-        for ax in axes_grid[1, :]:
+        axes_grid = np.array(axes_grid)
+        for ax in axes_grid.flatten()[-ncols:]:   # bottom row
             ax.set_xlabel("Event length (bp)", fontsize=14)
-        for ax in axes_grid[:, 0]:
+        for ax in axes_grid.flatten()[::ncols]:    # left column
             ax.set_ylabel("Count", fontsize=14)
 
     plt.tight_layout()
-
-    if save_path is not None:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
-        fig.savefig(save_path, bbox_inches="tight")
-        print(f"Saved figure to {save_path}")
-    else:
-        plt.show()
+    _save_or_show(fig)
+    return fig, axes_flat[0] if single_panel else axes_grid
 
 
 def add_annotations_for_dash(
