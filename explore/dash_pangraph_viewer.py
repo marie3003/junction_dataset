@@ -154,10 +154,10 @@ def make_junction_dash_app(
         fig = add_annotations_for_dash(
             fig=fig,
             y_labels=yl,
-            show_mges_annotations=True,
-            show_int_rec_annotations=True,
-            show_trna_annotations=show_trna,
-            show_cds_annotations=True,
+            show_mges_annotations=mges_gff_path is not None,
+            show_int_rec_annotations=annotations_gff_path is not None,
+            show_trna_annotations=show_trna and annotations_gff_path is not None,
+            show_cds_annotations=annotations_gff_path is not None,
             mges_gff_path=mges_gff_path,
             annotations_gff_path=annotations_gff_path,
             annotation_alpha=0.70,
@@ -395,36 +395,83 @@ def make_junction_dash_app(
 
 
 if __name__ == "__main__":
-    
-    #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # consensus definition very conservative here, investigate
-    #junction_name = "ITEMFVYTUE_r__JVDYVQZUBR_r"
-    #junction_name = "MUWGUWCDTU_r__UTYAQKFQDH_r"
-    #junction_name = "PLTCZQCVRD_f__RYYAQMEJGY_f"
-    #junction_name = "NOAJDCSIVA_f__NZXBIFMPMA_r"
-    #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
-    #junction_name = "GPKQYOCEJI_r__NKVSUZGURN_f"
-    #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f" # --> look up again, its the prophage one that would get two clusters
-    #junction_name = "KYQOKYBCOW_r__XXIWNZXZTK_r"
-    junction_name = "VCAVVOUNDI_f__XIWJABIXEM_f"
-    #junction_name = "JVNRLCFAVD_f__PLTCZQCVRD_r" # example for a junction that isn't split enough
-    #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # --> wild junctions with 12 clusters
-    #junction_name = "OBEJYXNUDN_r__ZTHKZYHPIX_r"
-    #junction_name = "AGVTAJTYER_r__OZLYYMOKWU_f" # interesting has one insertion in its own cluster and then the same one again in a different cluster but inverted
-    #junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
-    #junction_name = "ATPWUNKKID_f__KKPYPKGMXA_f"
-    #junction_name = 'KGWWUZQEKD_r__UXLELLOQVR_r'
+    import argparse
+
+    # Detect CLI vs. interactive (VSCode) run
+    _cli = len(sys.argv) > 1
+
+    if _cli:
+        parser = argparse.ArgumentParser(
+            description="Launch the Dash pangraph viewer for a given junction."
+        )
+        parser.add_argument(
+            "junction_name",
+            help="Junction name to visualise, e.g. CIRMBUYJFK_f__CWCCKOQCWZ_r",
+        )
+        parser.add_argument(
+            "--recompute",
+            action="store_true",
+            help="Force recomputation of clustering, consensus paths and indel summaries "
+                 "even if cached results already exist.",
+        )
+        parser.add_argument(
+            "--mges-gff",
+            default=None,
+            metavar="PATH",
+            help="Path to the MGE GFF3 file. If omitted, MGE annotations are not shown.",
+        )
+        parser.add_argument(
+            "--annotations-gff",
+            default=None,
+            metavar="PATH",
+            help="Path to the gene annotations GFF file. "
+                 "If omitted, CDS/integrase/tRNA annotations are not shown.",
+        )
+        parser.add_argument(
+            "--port",
+            type=int,
+            default=8050,
+            help="Port to run the Dash server on (default: 8050).",
+        )
+        args = parser.parse_args()
+        junction_name        = args.junction_name
+        recompute            = args.recompute
+        mges_gff_path        = Path(args.mges_gff) if args.mges_gff else None
+        annotations_gff_path = Path(args.annotations_gff) if args.annotations_gff else None
+        port                 = args.port
+    else:
+        # ── VSCode interactive run ── edit junction_name here ──────────────────
+        #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # consensus definition very conservative here, investigate
+        #junction_name = "ITEMFVYTUE_r__JVDYVQZUBR_r"
+        #junction_name = "MUWGUWCDTU_r__UTYAQKFQDH_r"
+        #junction_name = "PLTCZQCVRD_f__RYYAQMEJGY_f"
+        #junction_name = "NOAJDCSIVA_f__NZXBIFMPMA_r"
+        #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
+        #junction_name = "GPKQYOCEJI_r__NKVSUZGURN_f"
+        #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f" # --> look up again, its the prophage one that would get two clusters
+        #junction_name = "KYQOKYBCOW_r__XXIWNZXZTK_r"
+        #junction_name = "VCAVVOUNDI_f__XIWJABIXEM_f"
+        #junction_name = "JVNRLCFAVD_f__PLTCZQCVRD_r" # example for a junction that isn't split enough
+        #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # --> wild junctions with 12 clusters
+        #junction_name = "OBEJYXNUDN_r__ZTHKZYHPIX_r"
+        #junction_name = "AGVTAJTYER_r__OZLYYMOKWU_f" # interesting has one insertion in its own cluster and then the same one again in a different cluster but inverted
+        junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
+        #junction_name = "ATPWUNKKID_f__KKPYPKGMXA_f"
+        #junction_name = 'KGWWUZQEKD_r__UXLELLOQVR_r'
+        recompute            = False
+        mges_gff_path        = REPO_ROOT / "results" / "junction_mges" / f"{junction_name}.gff3"
+        annotations_gff_path = REPO_ROOT / "results" / "junction_annotations" / f"{junction_name}.gff"
+        port                 = 8050
 
     pangraph_path = REPO_ROOT / "results" / "junction_pangraphs" / f"{junction_name}.json"
     pangraph = pp.Pangraph.from_json(str(pangraph_path))
 
-    mges_gff_path = REPO_ROOT / "results" / "junction_mges" / f"{junction_name}.gff3"
-    annotations_gff_path = REPO_ROOT / "results" / "junction_annotations" / f"{junction_name}.gff"
-    tree_path = REPO_ROOT / "config" / "polished_tree.nwk"
-    in_del_path = REPO_ROOT / "results" / "atb_lookup"
+    tree_path    = REPO_ROOT / "config" / "polished_tree.nwk"
+    in_del_path  = REPO_ROOT / "results" / "atb_lookup"
 
     cache_path = REPO_ROOT / "results" / "consensus_analysis" / junction_name / "dash_cache.json"
     path_dict = None
-    if cache_path.exists():
+    if not recompute and cache_path.exists():
         print(f"Loading consensus cache from {cache_path}")
         cluster_map_core, consensus_paths_plotting, assignment_df_plotting = load_consensus_cache(cache_path)
     else:
@@ -444,10 +491,10 @@ if __name__ == "__main__":
         save_consensus_cache(cache_path, cluster_map_core, consensus_paths_plotting, assignment_df_plotting)
         print(f"Cache saved to {cache_path}")
 
-    # compute indels on the fly only if the consensus1 folder doesn't exist yet
+    # compute indels on the fly only if the consensus1 folder doesn't exist yet (or --recompute)
     _consensus1_dir = in_del_path / "insertions" / junction_name / "consensus1"
     _all_ins_summary = in_del_path / "insertions" / junction_name / "all_insertions_summary.csv"
-    if not _consensus1_dir.exists():
+    if recompute or not _consensus1_dir.exists():
         print("Indel summaries not found, computing on the fly ...")
         if path_dict is None:
             print("path_dict not available from cache — re-running find_consensus_paths_core ...")
@@ -500,15 +547,15 @@ if __name__ == "__main__":
         consensus_paths_plotting=consensus_paths_plotting,
         assignment_df_plotting=assignment_df_plotting,
         cluster_map_core=cluster_map_core,
-        mges_gff_path=str(mges_gff_path),
-        annotations_gff_path=str(annotations_gff_path),
+        mges_gff_path=str(mges_gff_path) if mges_gff_path is not None else None,
+        annotations_gff_path=str(annotations_gff_path) if annotations_gff_path is not None else None,
         order="tree",
         title=f"Junction Block Structure ({junction_name})",
-        initial_selection=("mges", "indels"),  # change to () to start with no annotations
+        initial_selection=(*(["mges"] if mges_gff_path is not None else []), "indels"),
         indels_base_path=str(in_del_path),
         show_indels=True,
         show_trna=True,
         junction_name=junction_name,
     )
 
-    app.run(debug=False)  # CHANGED: turn off debug for normal use
+    app.run(debug=False, port=port)

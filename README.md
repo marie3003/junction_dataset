@@ -51,6 +51,8 @@ You can explore junctions visually with [marimo](https://marimo.io/) by running:
 marimo run explore/view_junctions.py
 ```
 
+---
+
 ## Detailed analysis of accessory genome junctions
 
 All analysis code is located in the `junction_analysis` directory.
@@ -86,5 +88,20 @@ The `explore` folder contains notebooks used throughout the thesis. These notebo
 An interactive dashboard for exploring junctions can be launched with:
 
 ```bash
-python explore/dash_pangraph_viewer.py
+python explore/dash_pangraph_viewer.py CIRMBUYJFK_f__CWCCKOQCWZ_r  \
+--mges-gff results/junction_mges/CIRMBUYJFK_f__CWCCKOQCWZ_r.gff3 \
+--annotations-gff results/junction_annotations/CIRMBUYJFK_f__CWCCKOQCWZ_r.gff \
+--port 8051
+```
+Providing GFF files enables visualization of functional annotations, including:
+- mobile genetic elements (MGEs)
+- integrases, recombinases, and transposases
+- coding sequences (CDS)
+- tRNA and tmRNA genes
+If no GFF paths are specified, these annotations will not be displayed.
+
+You can optionally recompute clustering, consensus paths, and secondary structural events directly within the dashboard:
+```bash
+python explore/dash_pangraph_viewer.py CIRMBUYJFK_f__CWCCKOQCWZ_r --recompute \
+--port 8052
 ```
