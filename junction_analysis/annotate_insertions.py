@@ -3,8 +3,6 @@ from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 
-import pypangraph as pp
-
 import os
 import subprocess
 import re
@@ -16,221 +14,9 @@ from Bio.SeqRecord import SeqRecord
 
 from pathlib import Path
 
-from junction_analysis.consensus import make_deduplicated_paths
 from junction_analysis.helpers import get_isolate_sequence, get_consensus_seq_from_alignment, read_gff3_annotations
 from junction_analysis import pangraph_utils as pu
 from junction_analysis.junction_trees import build_tree_from_block_list
-
-
-def write_block_fasta(example_pangraph, example_junction, isolate_name, block_id, single_sequence = True):
-    if single_sequence:
-        sequence = Seq(example_pangraph.blocks[block_id].to_biopython_records()[0].seq)
-    else:
-        sequence = Seq(example_pangraph.blocks[block_id].consensus())
-    record = SeqRecord(
-        Seq(example_pangraph.blocks[block_id].to_biopython_records()[0].seq),
-        id=f"{isolate_name}|block_{block_id}",
-        description=f"block {block_id} from isolate {isolate_name}"
-    )
-    output_path = f"../results/atb_lookup/{example_junction}/{isolate_name}_block_{block_id}.fasta"
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    SeqIO.write(record, output_path, "fasta")
-
-def get_insertions_deletions(deduplicated_paths, consensus_path):
-    """Identify insertions, deletions, and inversions in each isolate's path compared to the matching consensus path.
-    Arguments:
-        deduplicated_paths: dict of isolate -> Path object (prefiltered to only contain isolates matching the consensus path)
-        consensus_path: Path object representing the consensus path
-    Returns:
-        insertions: dict of isolate -> list of inserted segments (each is a Path object)
-            insertions are defined as blocks that do not exist in the consensus path but in an isolate path dependent on block id and in case of duplicated blocks on context (regardless of strand)
-        deletions: dict of isolate -> list of deleted segments (each is a list of nodes)
-        inversions: dict of isolate -> list of inverted segments (each is a Path object with isolate nodes),
-            inversions are defined as blocks that exist in both consensus and isolate but have different strand,
-            this means that inverted insertions will not be reported as inversions but as insertions, and inverted deletions will not be reported as inversions but as deletions
-        translocations: dict of isolate -> list of pu.Path objects (each Path contains isolate nodes),
-            translocations are blocks present in both consensus and isolate but whose left anchor differs.
-            Anchors are blocks matching by (id, strand, context) in both consensus and isolate.
-            Each block is assigned its rightmost anchor to the left; mismatched anchors indicate translocation.
-    """
-
-    insertions = {}  # isolate -> list of inserted segments (each is a list of nodes)
-    deletions = {}   # isolate -> list of deleted segments (each is a list of nodes)
-    inversions = {}  # isolate -> list of inverted segments (each is a Path of isolate nodes)
-    translocations = {}  # isolate -> list of translocated segments (each is a Path of isolate nodes)
-
-    # Strand-agnostic lookup: (id, context) for consensus membership
-    consensus_id_context = {(n.id, n.context) for n in consensus_path.nodes}
-
-    for isolate, path in deduplicated_paths.items():
-
-        # --- Find insertions (strand-agnostic consensus check) ---
-        current_insertion = []
-        strand = None
-
-        def flush():
-            nonlocal current_insertion
-            if current_insertion:
-                insertions.setdefault(isolate, []).append(pu.Path(current_insertion))
-                current_insertion = []
-
-        for node in path.nodes:
-            if (node.id, node.context) in consensus_id_context:
-                # Block exists in consensus (regardless of strand) — not an insertion
-                flush()
-                strand = None
-                continue
-
-            # Node is part of an insertion region
-            if strand is None:
-                # Start a new insertion block
-                strand = node.strand
-                current_insertion.append(node)
-            elif node.strand == strand:
-                # Keep the same insertion block
-                current_insertion.append(node)
-            else:
-                # Strand changed → split
-                flush()
-                strand = node.strand
-                current_insertion.append(node)
-
-        # Handle trailing insertion
-        flush()
-
-        # --- Find deletions (strand-agnostic isolate check) ---
-        current_deletion = []
-        del_strand = None
-        last_existing_isolate_node = None
-        # Strand-agnostic lookup: (id, context) -> isolate node
-        path_node_lookup = {(n.id, n.context): n for n in path.nodes}
-
-        def flush_del():
-            nonlocal current_deletion, del_strand, last_existing_isolate_node
-            if current_deletion:
-                deletions.setdefault(isolate, []).append({
-                    "path": pu.Path(current_deletion),
-                    "left_nid": last_existing_isolate_node.nid if last_existing_isolate_node else None,})
-                current_deletion = []
-            del_strand = None
-
-        for cnode in consensus_path.nodes:
-            isolate_node = path_node_lookup.get((cnode.id, cnode.context))
-
-            if isolate_node is None:
-                # node is truly absent from isolate — part of a deletion region
-                if del_strand is None:
-                    del_strand = cnode.strand
-                    current_deletion.append(cnode)
-                elif cnode.strand == del_strand:
-                    current_deletion.append(cnode)
-                else:
-                    # strand changed inside the deletion → split
-                    flush_del()
-                    del_strand = cnode.strand
-                    current_deletion.append(cnode)
-            else:
-                flush_del()
-                last_existing_isolate_node = isolate_node # should always be set because paths start with core block
-
-        # trailing deletion even though it should technically not happen
-        flush_del()
-
-        # --- Find inversions ---
-        # Build lookup: (id, context) -> consensus node strand
-        consensus_strand_lookup = {}
-        for cnode in consensus_path.nodes:
-            consensus_strand_lookup[(cnode.id, cnode.context)] = cnode.strand
-
-        current_inversion = []
-
-        def flush_inv():
-            nonlocal current_inversion
-            if current_inversion:
-                inversions.setdefault(isolate, []).append(pu.Path(current_inversion))
-                current_inversion = []
-
-        for node in path.nodes:
-            cons_strand = consensus_strand_lookup.get((node.id, node.context))
-            if cons_strand is None:
-                # Insertion node (not in consensus) — don't interrupt an ongoing inversion
-                continue
-            elif node.strand != cons_strand:
-                # Block exists in both but with different strand — inverted
-                current_inversion.append(node)
-            else:
-                # Block exists with correct strand — end any ongoing inversion
-                flush_inv()
-
-        flush_inv()
-
-        # --- Find translocations ---
-        # Anchors are blocks present in both consensus and isolate with matching
-        # (id, strand, context) — i.e. full node equality. Only anchors can serve
-        # as left context for translocation detection.
-        #
-        # Assign each block a "left anchor" = the rightmost anchor to the left of
-        # the current position. Then for each block present in both consensus and
-        # isolate (by id and context, strand-agnostic), check if left anchors match.
-        # If not, that block is part of a translocation.
-
-        # Anchors: blocks that (1) appear exactly once by id in both consensus and
-        # isolate (strand-agnostic count) AND (2) have an exact (id, strand, context)
-        # match between the two paths. Condition (1) prevents duplicated blocks from
-        # serving as anchors; condition (2) ensures the anchor position is unambiguous.
-        c_id_counts   = Counter(n.id for n in consensus_path.nodes)
-        iso_id_counts = Counter(n.id for n in path.nodes)
-        unique_ids = {bid for bid in c_id_counts
-                      if c_id_counts[bid] == 1 and iso_id_counts.get(bid, 0) == 1}
-        consensus_node_set = set(consensus_path.nodes)  # __hash__ = (id, strand, context)
-        isolate_node_set   = set(path.nodes)
-        exact_match_ids = {n.id for n in consensus_node_set & isolate_node_set}
-        anchor_ids = unique_ids & exact_match_ids
-
-        # Assign left anchor (block id) to each block in consensus (keyed by id, context)
-        consensus_left_anchor = {}
-        current_anchor = None
-        for cnode in consensus_path.nodes:
-            if cnode.id in anchor_ids:
-                current_anchor = cnode.id
-            consensus_left_anchor[(cnode.id, cnode.context)] = current_anchor
-
-        # Assign left anchor (block id) to each block in isolate (keyed by id, context)
-        isolate_left_anchor = {}
-        current_anchor = None
-        for node in path.nodes:
-            if node.id in anchor_ids:
-                current_anchor = node.id
-            isolate_left_anchor[(node.id, node.context)] = current_anchor
-
-        # Walk through isolate left to right, detect translocations among shared blocks
-        current_translocation = []
-
-        def flush_trans():
-            nonlocal current_translocation
-            if current_translocation:
-                translocations.setdefault(isolate, []).append(pu.Path(current_translocation))
-                current_translocation = []
-
-        for node in path.nodes:
-            if (node.id, node.context) not in consensus_id_context:
-                # Insertion — skip, don't interrupt ongoing translocation
-                continue
-
-            iso_anchor = isolate_left_anchor[(node.id, node.context)]
-            cons_anchor = consensus_left_anchor[(node.id, node.context)]
-
-            if iso_anchor != cons_anchor:
-                print(f"Isolate {isolate} block {node} has mismatched anchors: iso {iso_anchor} vs cons {cons_anchor}")
-                # Mismatched left anchor — part of a translocation
-                current_translocation.append(node)
-            else:
-                # Matching left anchor — end any ongoing translocation
-                flush_trans()
-
-        flush_trans()
-
-    return insertions, deletions, inversions, translocations
 
 def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C901
     """Identify insertions, deletions, inversions, and translocations.
@@ -546,15 +332,6 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
     return insertions, ambiguous_insertions, deletions, inversions, translocations, context_stats
 
 
-def get_isolate_sequence_from_fasta(fasta_path, isolate_name):
-    """
-    Reads a FASTA file and returns the sequence for the given isolate name.
-    """
-    for record in SeqIO.parse(fasta_path, "fasta"):
-        if record.id == isolate_name:
-            return str(record.seq)
-    return None
-
 def write_segment_fasta(example_junction, isolate_name, segment_name, consensus, sequence, path, parent_dir):
     record = SeqRecord(
         Seq(sequence),
@@ -710,24 +487,6 @@ def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, dedu
         print_insertions_deletions(insertions, deletions, inversions, translocations)
 
     return insertions, ambiguous_insertions, deletions, inversions, translocations, context_stats_df
-
-def write_sgenome_ids(atb_hits_df, output_file):
-    sgenome_ids = atb_hits_df.sgenome.to_list()
-    with open(output_file, "w") as f:
-        for sid in sgenome_ids:
-            f.write(str(sid) + "\n")
-
-def retrieve_SAMids_txt(parent_dir):
-    parent_dir = Path(parent_dir)
-
-    for file_path in parent_dir.rglob("*.lexicmap.tsv"):
-        hits_df = pd.read_csv(file_path, sep="\t")
-
-        output_path = file_path.with_name(
-            file_path.name.replace(".lexicmap.tsv", ".ids.txt")
-        )
-
-        write_sgenome_ids(hits_df, output_path)
 
 def combine_NCBI_atb_results(parent_dir):
     parent_dir = Path(parent_dir)
@@ -2131,69 +1890,6 @@ def count_events_per_junction(deduped_df, min_length=200, save_path=None):
         print(f"Saved event counts to {save_path}")
 
     return counts_df
-
-
-def collect_hits_info_counts(search_root: str) -> pd.DataFrame:
-    """
-    Iterate over all *.lexicmap.tsv files under `search_root` and collect
-    the number of hits (lines excluding header) and number of genomes per file.
-
-    Parses junction_name, consensus, genome_name, and segment from the path:
-      .../insertions/{junction_name}/{consensus}/{genome_name}_segment_{n}.lexicmap.tsv
-
-    Returns a DataFrame with columns:
-        junction_name, consensus, genome_name, segment, n_hits, n_genomes, file_path
-    """
-    rows = []
-    for p in sorted(Path(search_root).rglob("*.lexicmap.tsv")):
-        # path structure: .../insertions/<junction>/<consensus>/<genome>_segment_<n>.hits_info.tsv
-        parts = p.parts
-        try:
-            ins_idx = [i for i, x in enumerate(parts) if x == "insertions"][-1]
-            junction_name = parts[ins_idx + 1]
-            consensus = parts[ins_idx + 2]
-        except (IndexError, ValueError):
-            junction_name = consensus = None
-
-        stem = p.name.replace(".lexicmap.tsv", "")   # e.g. NZ_AP022044.1_segment_1
-        seg_match = re.search(r"_segment_(\d+)$", stem)
-        if seg_match:
-            segment = f"segment_{seg_match.group(1)}"
-            genome_name = stem[: seg_match.start()]
-        else:
-            segment = None
-            genome_name = stem
-
-        n_hits = 0
-        n_genomes = None
-        with open(p) as f:
-            header = f.readline()
-            if header:
-                try:
-                    hits_col = header.strip().split("\t").index("hits")
-                except ValueError:
-                    hits_col = None
-                for line in f:
-                    n_hits += 1
-                    if n_genomes is None and hits_col is not None:
-                        fields = line.strip().split("\t")
-                        if len(fields) > hits_col:
-                            try:
-                                n_genomes = int(fields[hits_col])
-                            except ValueError:
-                                pass
-
-        rows.append(dict(
-            junction_name=junction_name,
-            consensus=consensus,
-            genome_name=genome_name,
-            segment=segment,
-            n_hits=n_hits,
-            n_genomes=n_genomes,
-            file_path=str(p),
-        ))
-
-    return pd.DataFrame(rows)
 
 
 def collect_hits_info_counts_with_self(

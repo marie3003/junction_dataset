@@ -7,7 +7,7 @@ import numpy as np
 
 from Bio import AlignIO
 from Bio.Phylo.TreeConstruction import DistanceCalculator
-from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
 import pypangraph as pp
@@ -389,31 +389,6 @@ def summarize_block_msas(junction_name, cl=None, save_df=True, return_pairwise_d
         return df, pairwise_dict
 
     return df
-
-
-def cluster_alignment(alignment_path):
-    # gap positions are ignored in identity calculation (that's why one doesn't have to worry about missing parts on the ends)
-    aln = AlignIO.read(alignment_path, "fasta")
-    calc = DistanceCalculator('identity') # counts non identical positions, ignoring gaps
-    dm = calc.get_distance(aln)
-
-    distance_df = pd.DataFrame(dm.matrix, index=dm.names, columns=dm.names)
-    distance_matrix = distance_df.to_numpy()
-    distance_matrix = np.nan_to_num(distance_matrix, nan = 0.0)
-    distance_matrix = distance_matrix + distance_matrix.T
-
-    # --- hierarchical clustering (UPGMA/average by default) ---
-    Z = linkage(squareform(distance_matrix), method="average")  # use 'single'/'complete' if preferred
-
-    return distance_matrix, Z, dm.names
-
-def retrieve_cluster_assignments(Z, names, n_clusters):
-    labels_k = fcluster(Z, t=n_clusters, criterion="maxclust")
-
-    # Create dictionary mapping isolate name -> cluster number
-    cluster_assignments = {name.split("__", 1)[0]: int(label) for name, label in zip(names, labels_k)}
-
-    return cluster_assignments
 
 def build_block_trees(
     junction_name,

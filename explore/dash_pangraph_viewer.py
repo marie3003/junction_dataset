@@ -1,7 +1,4 @@
-import copy
-import random
-
-from dash import Dash, dcc, html, Input, Output, Patch, State, ctx
+from dash import Dash, dcc, html, Input, Output, Patch, State
 
 from pathlib import Path
 import sys
