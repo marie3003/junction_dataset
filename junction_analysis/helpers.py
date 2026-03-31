@@ -1217,24 +1217,45 @@ def add_singleton_has_own_cluster(jdf_all, cluster_df):
 
 def add_binary_event_info(jdf_all, cluster_df, pangraph_dir="../results/junction_pangraphs"):
     """
-    For binary junctions (n_categories == 2), add:
-      - binary_gain_isolates
-      - binary_loss_isolates
-      - binary_gain_frequency
-      - binary_loss_frequency
-      - binary_event_type
-      - binary_gain_has_own_cluster
-      - binary_loss_has_own_cluster
-      - binary_gain_in_multiple_clusters
-      - binary_loss_in_multiple_clusters
-      - binary_event_in_multiple_clusters
+    For binary junctions (n_categories == 2, n_iso > 2), load the pangraph and
+    infer gain/loss events from the accessory block composition. Adds the
+    following columns to jdf_all (all others are left as NA):
 
-    Event logic per non-core block:
-      - subtract the minimum count across isolates
-      - count how many isolates have adjusted count > 0
-      - if this frequency is < n_iso/2: gain in those isolates
-      - if this frequency is > n_iso/2: loss in the complementary isolates
-      - if this frequency is == n_iso/2: ambiguous
+    Columns added
+    -------------
+    binary_gain_isolates : str
+        Comma-separated isolate names that carry the gained block(s).
+    binary_loss_isolates : str
+        Comma-separated isolate names that are missing the lost block(s).
+    binary_gain_frequency : Int64
+        Number of isolates with the gain.
+    binary_loss_frequency : Int64
+        Number of isolates with the loss (= isolates missing the block).
+    binary_event_type : str
+        "gain", "loss", or "gain_and_loss".
+    binary_gain_has_own_cluster : boolean
+        True if the gain isolates form exactly one cluster and that cluster
+        contains only those isolates.
+    binary_loss_has_own_cluster : boolean
+        True if the loss isolates form exactly one cluster and that cluster
+        contains only those isolates.
+    binary_gain_in_multiple_clusters : boolean
+        True if the gain isolates are spread across more than one cluster.
+    binary_loss_in_multiple_clusters : boolean
+        True if the loss isolates are spread across more than one cluster.
+    binary_event_in_multiple_clusters : boolean
+        True if either gain or loss isolates span multiple clusters.
+
+    Event inference per accessory block
+    ------------------------------------
+    For each non-core block the raw counts are min-subtracted across isolates,
+    and the number of isolates with adjusted count > 0 is taken as freq.
+      - freq < n_iso / 2  → gain event in those freq isolates
+      - freq > n_iso / 2  → loss event in the n_iso - freq complementary isolates
+      - freq == n_iso / 2 → ambiguous; the junction is skipped entirely
+    If gain or loss frequencies are inconsistent across blocks the junction is
+    also skipped and a warning is issued.
+    Junctions with n_iso == 2 are skipped (too few isolates to determine direction).
     """
     jdf_all = jdf_all.copy()
 

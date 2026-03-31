@@ -770,11 +770,47 @@ def combine_NCBI_atb_results_centralized(parent_dir):
             open(output_path, "w").close()
 
 
-def find_insertion_hits_own_genome(genome_root, insertions_seq_dir):
+def find_insertion_hits_own_genome(genome_root, insertions_seq_dir, rerun_minimap=True):
     """
-    Look up insertion sequences in an isolates own genome.
-    @param genome_root: directory of genome files
-    @param insertion_seq_dir: directory with subfolder structure junction_name/consensus_n/insertion_file.fasta
+    Look up insertion sequences in the isolate's own chromosome using minimap2 (asm5 preset).
+
+    For each .fasta file under insertions_seq_dir, the isolate name is extracted from the
+    FASTA header and the insertion is mapped to the corresponding genome FASTA in genome_root.
+
+    Hit counting
+    ------------
+    A hit is counted if the query is sufficiently covered by low-divergence alignments
+    (dv < 1%). Sufficiency is defined as: uncovered query bases <= max(50, 10% of query
+    length). This relaxed threshold handles short insertions (200-250 bp) where block
+    boundary artefacts prevent perfect end-to-end alignment.
+
+    Insertions spanning the linearisation point of a circular chromosome map as two
+    complementary alignments. These are detected and counted as a single hit when:
+      - Both alignments have dv < 1%
+      - Their target intervals are ≤50 bp apart on the circular genome
+      - Their combined query coverage is ≤100% (no spurious overlap)
+      - The combined query coverage meets the sufficiency threshold above
+      - The larger of the two individual coverages is ≥50%
+    Full single-hit alignments are matched first; only the remaining partial alignments
+    enter the pairing step. Pairs are selected greedily in order of combined coverage
+    closest to 100%.
+
+    Parameters
+    ----------
+    genome_root : str
+        Directory containing one FASTA per isolate, named {isolate_name}.fasta.
+    insertions_seq_dir : str
+        Directory with insertion FASTA files, structured as
+        {junction_name}/consensus{n}/{isolate_name}_segment_{k}.fasta.
+    rerun_minimap : bool
+        If True (default), always run minimap2. If False, skip minimap2 when the
+        output PAF file already exists.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per insertion segment with columns: junction_name, consensus,
+        genome_name, insertion_path, insertion_length, segment, hits_in_genome.
     """
     results = []
 
@@ -814,32 +850,84 @@ def find_insertion_hits_own_genome(genome_root, insertions_seq_dir):
             paf_path = insertion_seq_path.replace(".fasta", ".paf")
 
             # Run minimap2: consensus (query) vs genome (target)
-            subprocess.run(
-                [
-                    "minimap2", "-x", "asm5", "-N", "50", "-p", "0.9", "-k", "19", "--eqx",
-                    genome_fasta,         # target / reference
-                    insertion_seq_path    # query
-                ],
-                stdout=open(paf_path, "w")
-            )
+            if rerun_minimap or not os.path.exists(paf_path):
+                subprocess.run(
+                    [
+                        "minimap2", "-x", "asm5", "-N", "50", "-p", "0.9", "-k", "19", "--eqx",
+                        genome_fasta,         # target / reference
+                        insertion_seq_path    # query
+                    ],
+                    stdout=open(paf_path, "w")
+                )
 
-            # Count hits with <1% divergence and >= 90% coverage
-            count = 0
+            # Count hits with <1% divergence and >= 90% query coverage.
+            # An insertion spanning the linearisation point of a circular chromosome
+            # produces two complementary alignments. We pair such alignments when:
+            #   - both have dv < 1%
+            #   - their target intervals are ≤50 bp apart on the circular genome
+            #   - their combined query coverage is in [90%, 100%]
+            #   - the larger of the two individual coverages is ≥50%
+            # Pairs are selected greedily in order of combined coverage closest to
+            # 100%. Remaining unmatched alignments are counted if single coverage ≥90%.
+
+            _target_alns = defaultdict(list)
             with open(paf_path) as paf_file:
                 for line in paf_file:
                     if "\tdv:f:" not in line:
                         continue
-
                     fields = line.split("\t")
-                    # Query length, start and end
-                    query_len = int(fields[1])
-                    query_start = int(fields[2])
-                    query_end = int(fields[3])
-
                     dv = float(line.split("dv:f:")[1].split("\t")[0])
-                    coverage = (query_end - query_start) / query_len if query_len > 0 else 0
+                    if dv >= 0.01:
+                        continue
+                    qlen  = int(fields[1])
+                    qs, qe = int(fields[2]), int(fields[3])
+                    tname = fields[5]
+                    tlen  = int(fields[6])
+                    ts, te = int(fields[7]), int(fields[8])
+                    _target_alns[tname].append({"qs": qs, "qe": qe, "qlen": qlen,
+                                                "ts": ts, "te": te, "tlen": tlen})
 
-                    if dv < 0.01 and coverage >= 0.9:
+            count = 0
+            for tname, alns in _target_alns.items():
+                qlen   = alns[0]["qlen"]
+                tlen   = alns[0]["tlen"]
+                for a in alns:
+                    a["cov"] = (a["qe"] - a["qs"]) / qlen
+
+                # A hit is sufficient if uncovered bases <= max(50, 10% of query length)
+                max_uncovered = max(50, 0.1 * qlen)
+
+                # Mark full single hits immediately; only partial hits need pairing
+                matched = [(qlen - (a["qe"] - a["qs"])) <= max_uncovered for a in alns]
+                count += sum(matched)
+
+                # Find candidate pairs among the remaining partial hits
+                partial = [i for i, m in enumerate(matched) if not m]
+                pairs = []
+                for ii in range(len(partial)):
+                    for jj in range(ii + 1, len(partial)):
+                        i, j = partial[ii], partial[jj]
+                        a, b = alns[i], alns[j]
+                        # Circular gap between the two target intervals
+                        target_gap = min((b["ts"] - a["te"]) % tlen,
+                                         (a["ts"] - b["te"]) % tlen)
+                        if target_gap > 50:
+                            continue
+                        # Combined query coverage (subtract any overlap)
+                        overlap = max(0, min(a["qe"], b["qe"]) - max(a["qs"], b["qs"]))
+                        combined_bases = a["qe"] - a["qs"] + b["qe"] - b["qs"] - overlap
+                        combined_cov = combined_bases / qlen
+                        if combined_cov > 1.0 or (qlen - combined_bases) > max_uncovered:
+                            continue
+                        if max(a["cov"], b["cov"]) < 0.5:
+                            continue
+                        pairs.append((abs(combined_cov - 1.0), i, j))
+
+                # Greedy assignment: best pairs (closest to 100%) first
+                pairs.sort(key=lambda x: x[0])
+                for _, i, j in pairs:
+                    if not matched[i] and not matched[j]:
+                        matched[i] = matched[j] = True
                         count += 1
 
             results.append(
@@ -859,20 +947,45 @@ def find_insertion_hits_own_genome(genome_root, insertions_seq_dir):
     return insertions_df
 
 
-def find_insertion_hits_in_plasmids(plasmid_fasta_root, insertions_seq_dir):
+def find_insertion_hits_in_plasmids(plasmid_fasta_root, insertions_seq_dir, rerun_minimap=True):
     """
-    Looks up insertion sequences in all plasmid sequences that match the isolate of the insertion.
-    For each insertion and each corresponding plasmid, it runs minimap2 and saves the output
-    to a PAF file named after the insertion and plasmid.
+    Look up insertion sequences in all plasmids belonging to the same isolate using
+    minimap2 (asm5 preset). A separate PAF file is written per insertion-plasmid pair.
 
-    Args:
-        plasmid_fasta_root (str): Directory of plasmid FASTA files.
-                                  Expected structure is .../{isolate_name}/{plasmid}.fasta
-        insertions_seq_dir (str): Directory with insertion sequences.
-                                  Expected structure is .../{junction}/{consensus}/{isolate_name}_segment_*.fasta
-    Returns:
-        pandas.DataFrame: A DataFrame with the results, where each row corresponds to an
-                          insertion-plasmid pair and includes the count of significant hits.
+    Hit counting
+    ------------
+    Identical logic to find_insertion_hits_own_genome: a hit is counted when the query
+    is sufficiently covered by low-divergence alignments (dv < 1%), where sufficiency
+    means uncovered query bases <= max(50, 10% of query length).
+
+    Plasmids are circular, so insertions spanning the linearisation point map as two
+    complementary alignments. These are detected and counted as a single hit when:
+      - Both alignments have dv < 1%
+      - Their target intervals are ≤50 bp apart on the circular plasmid
+      - Their combined query coverage is ≤100% (no spurious overlap)
+      - The combined query coverage meets the sufficiency threshold above
+      - The larger of the two individual coverages is ≥50%
+    Full single-hit alignments are matched first; only the remaining partial alignments
+    enter the pairing step. Pairs are selected greedily in order of combined coverage
+    closest to 100%.
+
+    Parameters
+    ----------
+    plasmid_fasta_root : str
+        Directory of plasmid FASTA files, structured as {isolate_name}/{plasmid}.fasta.
+    insertions_seq_dir : str
+        Directory with insertion FASTA files, structured as
+        {junction_name}/consensus{n}/{isolate_name}_segment_{k}.fasta.
+    rerun_minimap : bool
+        If True (default), always run minimap2. If False, skip minimap2 when the
+        output PAF file already exists.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per insertion-plasmid pair with columns: junction_name, consensus,
+        isolate_name, plasmid_name, insertion_path, insertion_length, segment,
+        hits_in_plasmid.
     """
     results = []
 
@@ -916,30 +1029,77 @@ def find_insertion_hits_in_plasmids(plasmid_fasta_root, insertions_seq_dir):
                 paf_path = insertion_seq_path.replace(".fasta", f"_{plasmid_name}.paf")
 
                 # Run minimap2 for each plasmid separately
-                subprocess.run(
-                    [
-                        "minimap2", "-x", "asm5", "-N", "50", "-p", "0.9", "-k", "19", "--eqx",
-                        plasmid_file,
-                        insertion_seq_path
-                    ],
-                    stdout=open(paf_path, "w")
-                )
+                if rerun_minimap or not os.path.exists(paf_path):
+                    subprocess.run(
+                        [
+                            "minimap2", "-x", "asm5", "-N", "50", "-p", "0.9", "-k", "19", "--eqx",
+                            plasmid_file,
+                            insertion_seq_path
+                        ],
+                        stdout=open(paf_path, "w")
+                    )
 
-                # Process PAF output to count significant hits
-                count = 0
+                # Count hits with <1% divergence and >= 90% query coverage.
+                # Plasmids are circular, so an insertion spanning the linearisation
+                # point produces two complementary alignments — handled identically
+                # to the chromosome case: full single hits are counted first, then
+                # partial hits are paired if their target gap is ≤50 bp on the
+                # circular plasmid and their combined query coverage is in [90%, 100%].
+                _target_alns = defaultdict(list)
                 with open(paf_path) as paf_file:
                     for line in paf_file:
                         if not line or "\tdv:f:" not in line:
                             continue
                         fields = line.split("\t")
-                        query_len = int(fields[1])
-                        query_start = int(fields[2])
-                        query_end = int(fields[3])
-
                         dv = float(line.split("dv:f:")[1].split("\t")[0])
-                        coverage = (query_end - query_start) / query_len if query_len > 0 else 0
+                        if dv >= 0.01:
+                            continue
+                        qlen = int(fields[1])
+                        qs, qe = int(fields[2]), int(fields[3])
+                        tname = fields[5]
+                        tlen  = int(fields[6])
+                        ts, te = int(fields[7]), int(fields[8])
+                        _target_alns[tname].append({"qs": qs, "qe": qe, "qlen": qlen,
+                                                    "ts": ts, "te": te, "tlen": tlen})
 
-                        if dv < 0.01 and coverage >= 0.9:
+                count = 0
+                for tname, alns in _target_alns.items():
+                    qlen = alns[0]["qlen"]
+                    tlen = alns[0]["tlen"]
+                    for a in alns:
+                        a["cov"] = (a["qe"] - a["qs"]) / qlen
+
+                    # A hit is sufficient if uncovered bases <= max(50, 10% of query length)
+                    max_uncovered = max(50, 0.1 * qlen)
+
+                    # Mark full single hits immediately; only partial hits need pairing
+                    matched = [(qlen - (a["qe"] - a["qs"])) <= max_uncovered for a in alns]
+                    count += sum(matched)
+
+                    # Find candidate pairs among the remaining partial hits
+                    partial = [i for i, m in enumerate(matched) if not m]
+                    pairs = []
+                    for ii in range(len(partial)):
+                        for jj in range(ii + 1, len(partial)):
+                            i, j = partial[ii], partial[jj]
+                            a, b = alns[i], alns[j]
+                            target_gap = min((b["ts"] - a["te"]) % tlen,
+                                             (a["ts"] - b["te"]) % tlen)
+                            if target_gap > 50:
+                                continue
+                            overlap = max(0, min(a["qe"], b["qe"]) - max(a["qs"], b["qs"]))
+                            combined_bases = a["qe"] - a["qs"] + b["qe"] - b["qs"] - overlap
+                            combined_cov = combined_bases / qlen
+                            if combined_cov > 1.0 or (qlen - combined_bases) > max_uncovered:
+                                continue
+                            if max(a["cov"], b["cov"]) < 0.5:
+                                continue
+                            pairs.append((abs(combined_cov - 1.0), i, j))
+
+                    pairs.sort(key=lambda x: x[0])
+                    for _, i, j in pairs:
+                        if not matched[i] and not matched[j]:
+                            matched[i] = matched[j] = True
                             count += 1
                 results.append({
                     "junction_name": os.path.basename(os.path.dirname(dirpath)),
@@ -2042,178 +2202,156 @@ def collect_hits_info_counts_with_self(
     min_pident: float = 100.0,
 ) -> pd.DataFrame:
     """
-    Like collect_hits_info_counts, but uses `sam_df` (columns: isolate_id,
-    accession, type, biosample) to separate hits into self vs. external and
-    exclude all hits whose sgenome is any biosample in our own dataset from
-    the external counts.
+    Walk search_root for *.lexicmap.tsv files and count hits per insertion segment,
+    bucketed by the relationship of each hit's source genome (sgenome biosample) to
+    the query isolate.
 
-    For each query file the genome_name is matched against sam_df.accession to
-    find the owning isolate_id and its biosample(s).  Hits are then bucketed:
+    Input files
+    -----------
+    *.lexicmap.tsv : tab-separated, one hit per row. Required columns: sgenome, pident,
+        qcovGnm.
+    *.hits_info.tsv : optional companion file (same stem). Required columns: organism,
+        pident, qcovGnm, sgenome, strain. Used to derive majority_organism, per-species
+        hit counts, and n_hits_st131. Self-hits (own chromosome / plasmid) are excluded
+        from all three.
 
-      - own_chromosome  : sgenome == biosample of the query isolate's chromosome row(s)
-      - own_plasmid     : sgenome == biosample of the query isolate's plasmid row(s)
-      - other_chromosome: sgenome == biosample of another isolate in the dataset (chromosome)
-      - other_plasmid   : sgenome == biosample of another isolate in the dataset (plasmid)
-      - external        : sgenome not in sam_df at all
+    Hit bucketing (via sgenome biosample)
+    --------------------------------------
+    own_chromosome   : sgenome is a biosample of the query isolate's chromosome
+    own_plasmid      : sgenome is a biosample of the query isolate's plasmid(s)
+    other_chromosome : sgenome belongs to another isolate in sam_df (chromosome)
+    other_plasmid    : sgenome belongs to another isolate in sam_df (plasmid)
+    external         : sgenome is not own chromosome or own plasmid (i.e. other_chromosome
+                       + other_plasmid + hits not present in sam_df at all)
+
+    The query isolate is identified by matching genome_name (from the filename) against
+    sam_df.accession. Only hits with pident >= min_pident and qcovGnm >= 90% are counted.
+
+    Majority organism
+    -----------------
+    Derived from the companion .hits_info.tsv (if present). Organism names are
+    normalised to the first two words (genus + species) before the majority vote.
+    Self-hits are excluded. Per-species counts are added as n_hits_{Genus_species} columns.
 
     Parameters
     ----------
     search_root : str
-        Root directory to search for *.lexicmap.tsv files.
+        Root directory to search recursively for *.lexicmap.tsv files. The path
+        structure is expected to contain .../insertions/{junction_name}/{consensus}/...
     sam_df : pd.DataFrame
-        Columns: isolate_id, accession, type, biosample.
+        Columns: isolate_id, accession, type ("chromosome"/"plasmid"), biosample.
     min_pident : float
         Minimum percent identity (inclusive) to count a hit. Default 100.0.
-        Also filters hits used for majority organism annotation.
 
-    Returns a DataFrame with columns:
-        junction_name, consensus, genome_name, segment,
-        n_hits, n_genomes,                          # total hits / total genomes from lexicmap header
-        n_hits_own_chromosome, n_genomes_own_chromosome,
-        n_hits_own_plasmid,    n_genomes_own_plasmid,
-        n_hits_other_chromosome, n_genomes_other_chromosome,
-        n_hits_other_plasmid,    n_genomes_other_plasmid,
-        n_hits_external,         n_genomes_external,
-        majority_organism,                          # only if *.hits_info.tsv exists alongside
-        file_path
+    Returns
+    -------
+    pd.DataFrame
+        One row per *.lexicmap.tsv file with columns:
+            junction_name, consensus, genome_name, segment,
+            n_hits, n_genomes,
+            n_hits_{cat}, n_genomes_{cat}  for each of the five categories above,
+            majority_organism,
+            n_hits_st131,                           # hits whose strain column contains "ST131"
+            n_hits_{Genus_species}  per species found in hits_info (NaN filled to 0),
+            file_path
     """
-    # Build fast lookup structures from sam_df
-    acc_to_isolate: dict = dict(zip(sam_df["accession"], sam_df["isolate_id"]))
-    iso_chr_bs: dict = (
-        sam_df[sam_df["type"] == "chromosome"]
-        .groupby("isolate_id")["biosample"]
-        .apply(set)
-        .to_dict()
-    )
-    iso_pla_bs: dict = (
-        sam_df[sam_df["type"] == "plasmid"]
-        .groupby("isolate_id")["biosample"]
-        .apply(set)
-        .to_dict()
-    )
-    all_own_biosamples: set = set(sam_df["biosample"])
-    bs_to_type: dict = dict(zip(sam_df["biosample"], sam_df["type"]))
+    # Build lookup structures from sam_df
+    acc_to_isolate  = dict(zip(sam_df["accession"], sam_df["isolate_id"]))
+    iso_chr_bs      = sam_df[sam_df["type"] == "chromosome"].groupby("isolate_id")["biosample"].apply(set).to_dict()
+    iso_pla_bs      = sam_df[sam_df["type"] == "plasmid"].groupby("isolate_id")["biosample"].apply(set).to_dict()
+    all_own_bs      = set(sam_df["biosample"])
+    bs_to_type      = dict(zip(sam_df["biosample"], sam_df["type"]))
 
     cats = ("own_chromosome", "own_plasmid", "other_chromosome", "other_plasmid", "external")
     rows = []
-    for p in sorted(Path(search_root).rglob("*.lexicmap.tsv")):
-        parts = p.parts
-        try:
-            ins_idx = [i for i, x in enumerate(parts) if x == "insertions"][-1]
-            junction_name = parts[ins_idx + 1]
-            consensus = parts[ins_idx + 2]
-        except (IndexError, ValueError):
-            junction_name = consensus = None
 
-        stem = p.name.replace(".lexicmap.tsv", "")
+    for p in sorted(Path(search_root).rglob("*.lexicmap.tsv")):
+        # Extract junction_name and consensus from path
+        parts = p.parts
+        ins_idx = [i for i, x in enumerate(parts) if x == "insertions"][-1]
+        junction_name = parts[ins_idx + 1]
+        consensus     = parts[ins_idx + 2]
+
+        # Extract genome_name and segment from filename
+        stem      = p.name.replace(".lexicmap.tsv", "")
         seg_match = re.search(r"_segment_(\d+)$", stem)
         if seg_match:
-            segment = f"segment_{seg_match.group(1)}"
+            segment    = f"segment_{seg_match.group(1)}"
             genome_name = stem[: seg_match.start()]
         else:
-            segment = None
+            segment    = None
             genome_name = stem
 
-        isolate_id = acc_to_isolate.get(genome_name)
-        own_chr_bs: set = iso_chr_bs.get(isolate_id, set()) if isolate_id else set()
-        own_pla_bs: set = iso_pla_bs.get(isolate_id, set()) if isolate_id else set()
+        # Own-isolate biosample sets for bucketing
+        isolate_id  = acc_to_isolate.get(genome_name)
+        own_chr_bs  = iso_chr_bs.get(isolate_id, set())
+        own_pla_bs  = iso_pla_bs.get(isolate_id, set())
 
-        hit_counts: dict = {c: 0 for c in cats}
-        genome_sets: dict = {c: set() for c in cats}
-        n_hits = 0
+        # Parse lexicmap hits
+        hit_counts  = {c: 0 for c in cats}
+        genome_sets = {c: set() for c in cats}
+        n_hits      = 0
 
         with open(p) as f:
-            header = f.readline()
-            if not header:
-                continue
-            col_names = header.strip().split("\t")
-            try:
-                sgenome_col = col_names.index("sgenome")
-            except ValueError:
-                sgenome_col = None
-            try:
-                hits_col = col_names.index("hits")  # noqa: F841 (unused after refactor)
-            except ValueError:
-                hits_col = None
-            try:
-                pident_col = col_names.index("pident")
-            except ValueError:
-                pident_col = None
+            cols = {name: idx for idx, name in enumerate(f.readline().strip().split("\t"))}
+            sg_col      = cols["sgenome"]
+            pident_col  = cols["pident"]
+            qcovgnm_col = cols["qcovGnm"]
 
             for line in f:
                 fields = line.strip().split("\t")
-
-                # pident filter
-                if pident_col is not None and len(fields) > pident_col:
-                    try:
-                        if float(fields[pident_col]) < min_pident:
-                            continue
-                    except ValueError:
-                        pass
-
-                n_hits += 1
-                sg = fields[sgenome_col] if sgenome_col is not None and len(fields) > sgenome_col else None
-
-                if sg is None:
+                if float(fields[pident_col]) < min_pident or float(fields[qcovgnm_col]) < 90.0:
                     continue
+                n_hits += 1
+                sg = fields[sg_col]
                 if sg in own_chr_bs:
                     cat = "own_chromosome"
                 elif sg in own_pla_bs:
                     cat = "own_plasmid"
-                elif sg in all_own_biosamples:
-                    t = bs_to_type.get(sg, "chromosome")
-                    cat = "other_chromosome" if t == "chromosome" else "other_plasmid"
+                elif sg in all_own_bs:
+                    cat = "other_chromosome" if bs_to_type[sg] == "chromosome" else "other_plasmid"
+                    hit_counts[cat] += 1
+                    genome_sets[cat].add(sg)
+                    hit_counts["external"] += 1
+                    genome_sets["external"].add(sg)
+                    continue
                 else:
                     cat = "external"
-
                 hit_counts[cat] += 1
                 genome_sets[cat].add(sg)
 
-        # Majority organism + per-species counts from companion hits_info.tsv if present
+        # Majority organism + per-species counts from companion hits_info.tsv
         majority_organism = None
         normalized_counts: dict = {}
+        n_hits_st131 = 0
         info_path = Path(str(p).replace(".lexicmap.tsv", ".hits_info.tsv"))
         if info_path.exists():
-            try:
-                with open(info_path) as f:
-                    info_header = f.readline()
-                    if info_header:
-                        info_cols = info_header.strip().split("\t")
-                        try:
-                            org_col = info_cols.index("organism")
-                            info_pident_col = info_cols.index("pident") if "pident" in info_cols else None
-                            info_sgenome_col = info_cols.index("sgenome") if "sgenome" in info_cols else None
-                        except ValueError:
-                            org_col = None
-                            info_pident_col = None
-                            info_sgenome_col = None
-                        if org_col is not None:
-                            organism_counts: dict = {}
-                            for line in f:
-                                ifields = line.strip().split("\t")
-                                if info_pident_col is not None and len(ifields) > info_pident_col:
-                                    try:
-                                        if float(ifields[info_pident_col]) < min_pident:
-                                            continue
-                                    except ValueError:
-                                        pass
-                                # exclude own chromosome and plasmid hits
-                                if info_sgenome_col is not None and len(ifields) > info_sgenome_col:
-                                    sg = ifields[info_sgenome_col]
-                                    if sg in own_chr_bs or sg in own_pla_bs:
-                                        continue
-                                if len(ifields) > org_col:
-                                    org = ifields[org_col].strip()
-                                    if org:
-                                        organism_counts[org] = organism_counts.get(org, 0) + 1
-                            if organism_counts:
-                                # normalize to species (first two words) before majority vote
-                                for org, cnt in organism_counts.items():
-                                    species = " ".join(org.split()[:2])
-                                    normalized_counts[species] = normalized_counts.get(species, 0) + cnt
-                                majority_organism = max(normalized_counts, key=normalized_counts.get)
-            except Exception:
-                pass
+            with open(info_path) as f:
+                info_cols      = {name: idx for idx, name in enumerate(f.readline().strip().split("\t"))}
+                org_col        = info_cols["organism"]
+                ipident_col    = info_cols["pident"]
+                iqcovgnm_col   = info_cols["qcovGnm"]
+                isg_col        = info_cols["sgenome"]
+                strain_col     = info_cols["strain"]
+                organism_counts: dict = {}
+                for line in f:
+                    ifields = line.strip().split("\t")
+                    if float(ifields[ipident_col]) < min_pident or float(ifields[iqcovgnm_col]) < 90.0:
+                        continue
+                    if ifields[isg_col] in own_chr_bs or ifields[isg_col] in own_pla_bs:
+                        continue
+                    if len(ifields) <= org_col:
+                        continue
+                    if strain_col < len(ifields) and "ST131" in ifields[strain_col]:
+                        n_hits_st131 += 1
+                    org = ifields[org_col].strip()
+                    if org:
+                        organism_counts[org] = organism_counts.get(org, 0) + 1
+            if organism_counts:
+                for org, cnt in organism_counts.items():
+                    species = " ".join(org.split()[:2])
+                    normalized_counts[species] = normalized_counts.get(species, 0) + cnt
+                majority_organism = max(normalized_counts, key=normalized_counts.get)
 
         row = dict(
             junction_name=junction_name,
@@ -2223,20 +2361,19 @@ def collect_hits_info_counts_with_self(
             n_hits=n_hits,
             n_genomes=len(set.union(*genome_sets.values()) if any(genome_sets.values()) else set()),
             majority_organism=majority_organism,
+            n_hits_st131=n_hits_st131,
             file_path=str(p),
         )
         for cat in cats:
-            row[f"n_hits_{cat}"] = hit_counts[cat]
+            row[f"n_hits_{cat}"]    = hit_counts[cat]
             row[f"n_genomes_{cat}"] = len(genome_sets[cat])
-
         for species, cnt in normalized_counts.items():
-            col_name = "_".join(species.split())
-            row[f"n_hits_{col_name}"] = cnt
+            row[f"n_hits_{'_'.join(species.split())}"] = cnt
 
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    species_cols = [c for c in df.columns if c.startswith("n_hits_") and c not in
-                    {f"n_hits_{cat}" for cat in ("own_chromosome", "own_plasmid", "other_chromosome", "other_plasmid", "external")}]
+    known_hit_cols = {f"n_hits_{cat}" for cat in cats} | {"n_hits"}
+    species_cols = [c for c in df.columns if c.startswith("n_hits_") and c not in known_hit_cols]
     df[species_cols] = df[species_cols].fillna(0)
     return df

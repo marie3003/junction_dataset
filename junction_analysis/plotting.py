@@ -2552,7 +2552,8 @@ def plot_event_length_distribution(
 
     def _stacks_species_counts(sub, bin_edges):
         known_cats = {"n_hits_own_chromosome", "n_hits_own_plasmid",
-                      "n_hits_other_chromosome", "n_hits_other_plasmid", "n_hits_external"}
+                      "n_hits_other_chromosome", "n_hits_other_plasmid", "n_hits_external",
+                      "n_hits_st131"}
         _exclude = {"bacterium", "Candidatus bacterium"}
         species_cols = [c for c in sub.columns if c.startswith("n_hits_") and c not in known_cats
                         and c.replace("n_hits_", "").replace("_", " ") not in _exclude]
@@ -5020,7 +5021,7 @@ def plot_hits_distribution(
         col = columns[0]
         # identify species columns (n_hits_<Genus>_<species>)
         known_cats = {"n_hits_own_chromosome", "n_hits_own_plasmid", "n_hits_other_chromosome",
-                      "n_hits_other_plasmid", "n_hits_external"}
+                      "n_hits_other_plasmid", "n_hits_external", "n_hits_st131"}
         species_cols = [c for c in df.columns if c.startswith("n_hits_") and c not in known_cats
                         and not c.startswith("n_hits_n_")]
 

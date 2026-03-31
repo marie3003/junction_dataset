@@ -449,13 +449,12 @@ if __name__ == "__main__":
         #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
         #junction_name = "GPKQYOCEJI_r__NKVSUZGURN_f"
         #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f" # --> look up again, its the prophage one that would get two clusters
-        #junction_name = "KYQOKYBCOW_r__XXIWNZXZTK_r"
-        #junction_name = "VCAVVOUNDI_f__XIWJABIXEM_f"
+        junction_name = "AWYUJYFNGP_f__GCNKXNFARN_r"
         #junction_name = "JVNRLCFAVD_f__PLTCZQCVRD_r" # example for a junction that isn't split enough
         #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # --> wild junctions with 12 clusters
         #junction_name = "OBEJYXNUDN_r__ZTHKZYHPIX_r"
         #junction_name = "AGVTAJTYER_r__OZLYYMOKWU_f" # interesting has one insertion in its own cluster and then the same one again in a different cluster but inverted
-        junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
+        #junction_name = "CIRMBUYJFK_f__CWCCKOQCWZ_r"
         #junction_name = "ATPWUNKKID_f__KKPYPKGMXA_f"
         #junction_name = 'KGWWUZQEKD_r__UXLELLOQVR_r'
         recompute            = False

@@ -56,6 +56,26 @@ marimo run explore/view_junctions.py
 ## Detailed analysis of accessory genome junctions
 
 All analysis code is located in the `junction_analysis` directory.
+Generated outputs are stored in the `results` directory, organized as follows:
+
+- `results/junction_pangraphs`: pangraphs for all junctions  
+- `results/junction_sequences`: sequences of all junctions  
+- `results/junction_annotations`: gene annotations for each junction  
+- `results/junction_mges`: mobile genetic element (MGE) annotations per junction  
+
+- `results/consensus_analysis`: clustering results and consensus path definitions  
+
+- `results/block_fastas`: FASTA files for each block  
+- `results/block_alignments`: alignments for each block, including summary statistics  
+- `results/block_alignments_cluster`: alignments of all block variants within each cluster  
+
+- `results/atb_lookup`: results related to detected secondary events  
+
+- `results/genome_fastas`: genome FASTA files used for insertion sequence origin lookup  
+- `results/plasmid_fastas`: plasmid FASTA files used for insertion sequence origin lookup  
+
+- `results/junction_summary_df.csv`: summary dataframe containing results for each junction
+
 
 The `explore` folder contains notebooks used throughout the thesis. These notebooks document the full workflow, validation steps, and downstream analyses.
 
@@ -80,6 +100,9 @@ The `explore` folder contains notebooks used throughout the thesis. These notebo
 
 - `explore/analyze_homologous_recombinations.ipynb`  
   Analysis of homologous recombination across the core (and potentially accessory) genome  
+
+- `explore/relate_n_events_clusters.ipynb`
+  Analysis how junctions with many clusters relate to junctions with many secondary structural events
 
 ---
 
