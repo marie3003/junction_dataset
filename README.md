@@ -104,6 +104,12 @@ The `explore` folder contains notebooks used throughout the thesis. These notebo
 - `explore/relate_n_events_clusters.ipynb`
   Analysis how junctions with many clusters relate to junctions with many secondary structural events
 
+- `explore/block_diversity.ipynb`
+  General analysis of sequence diversity within blocks
+
+- `explore/analyze_junction_block_trees.ipynb`
+  Analysis whether clustering based on accessory blocks is consistent with core block clustering
+
 ---
 
 ## Interactive visualization

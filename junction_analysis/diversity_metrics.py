@@ -46,7 +46,7 @@ def calculate_dedup_block_ji_matrix(pangraph):
     -------
     pd.DataFrame of shape (n_isolates, n_isolates) with JI values.
     """
-    dedup_paths, _ = make_deduplicated_paths(pangraph)
+    dedup_paths, _, _ = make_deduplicated_paths(pangraph)
     isolates = sorted(dedup_paths.keys())
     node_sets = {iso: _path_to_node_set(dedup_paths[iso]) for iso in isolates}
 
@@ -73,7 +73,7 @@ def calculate_dedup_edge_ji_matrix(pangraph):
     pd.DataFrame of shape (n_isolates, n_isolates) with JI values,
     or NaN-filled DataFrame if no edges exist in any path.
     """
-    dedup_paths, _ = make_deduplicated_paths(pangraph)
+    dedup_paths, _, _  = make_deduplicated_paths(pangraph)
     isolates = sorted(dedup_paths.keys())
 
     edge_sets = {iso: _path_to_edge_set(dedup_paths[iso]) for iso in isolates}
@@ -512,42 +512,19 @@ def compute_dedup_ji_all_junctions(pangraph_dir, junction_names=None, save_path=
             continue
         try:
             pan = pp.Pangraph.from_json(str(fpath))
-        except Exception as e:
-            print(f"Error loading {jname}: {e}")
-            continue
-
-        try:
-            dedup_paths, _ = make_deduplicated_paths(pan)
-        except Exception as e:
-            print(f"  {jname} [make_deduplicated_paths]: {e}")
-            continue
-
-        isolates = sorted(dedup_paths.keys())
-
-        # block JI
-        try:
             block_df = calculate_dedup_block_ji_matrix(pan)
-        except Exception as e:
-            print(f"  {jname} [dedup_block_ji]: {e}")
-            block_df = None
-
-        # edge JI
-        try:
             edge_df = calculate_dedup_edge_ji_matrix(pan)
         except Exception as e:
-            print(f"  {jname} [dedup_edge_ji]: {e}")
-            edge_df = None
+            print(f"  {jname}: {e}")
+            continue
 
-        for i, j in combinations(range(len(isolates)), 2):
-            iso_a, iso_b = isolates[i], isolates[j]
-            block_val = block_df.loc[iso_a, iso_b] if block_df is not None else np.nan
-            edge_val = edge_df.loc[iso_a, iso_b] if edge_df is not None else np.nan
+        for iso_a, iso_b in combinations(sorted(block_df.index), 2):
             rows.append({
                 "junction_name": jname,
                 "isolate_1": iso_a,
                 "isolate_2": iso_b,
-                "block_ji_dist": block_val,
-                "edge_ji_dist": edge_val,
+                "block_ji_dist": block_df.loc[iso_a, iso_b],
+                "edge_ji_dist": edge_df.loc[iso_a, iso_b],
             })
 
     df = pd.DataFrame(rows, columns=["junction_name", "isolate_1", "isolate_2", "block_ji_dist", "edge_ji_dist"])

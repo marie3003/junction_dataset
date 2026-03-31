@@ -470,7 +470,7 @@ def find_consensus_paths(pangraph, rare_block_threshold = 10, rare_edge_threshol
     @return path_dict: original paths written as Path and Node objects
     """
     # deduplicate
-    deduplicated_paths, deduplicated_blog_freq = make_deduplicated_paths(pangraph)
+    deduplicated_paths, deduplicated_blog_freq, _ = make_deduplicated_paths(pangraph)
 
     # refilter, after deduplication some blocks might now have a frequency below the threshold (now consider duplication and inversion)
     rare_deduplicated_blocks = {dnode for dnode, cnt in deduplicated_blog_freq.items() if cnt < rare_block_threshold}
