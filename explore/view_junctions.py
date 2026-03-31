@@ -28,7 +28,7 @@ def _():
 
 @app.cell
 def _(pd):
-    _fname = f"config/junction_stats.csv"
+    _fname = f"results/junction_stats.csv"
     jdf = pd.read_csv(_fname)
     jdf
     return (jdf,)

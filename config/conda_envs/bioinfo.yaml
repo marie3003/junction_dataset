@@ -148,6 +148,12 @@ dependencies:
   - xorg-libxtst=1.2.5
   - xorg-libxxf86vm=1.1.6
   - zstd=1.5.7
-prefix: /home/marco/miniconda3/envs/junctions
-
-# This environment yaml file only works on linux
+  - pip:
+      - attrs==25.4.0
+      - jsonschema==4.25.1
+      - jsonschema-specifications==2025.9.1
+      - pypangraph==1.0.1
+      - referencing==0.37.0
+      - rpds-py==0.30.0
+prefix: 
+  /home/marco/Documents/code/2510_junctions/.snakemake/conda/bb1ad4f9c6a43d71cb34cb95d075ac45_

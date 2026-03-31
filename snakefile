@@ -21,6 +21,12 @@ with open(config["plasmids_file"]) as f:
     plasmids = json.load(f)
 
 
+wildcard_constraints:
+    acc="[^/]+",
+    junc="[^/]+",
+    acc_iso="[^/]+",
+
+
 rule download_gbk:
     output:
         "data/gbk/{acc}.gbk",
@@ -29,6 +35,19 @@ rule download_gbk:
     shell:
         """
         efetch -db nucleotide -id {wildcards.acc} -format gbwithparts > {output}
+        """
+
+
+rule gbk_to_fa:
+    input:
+        gbk="data/gbk/{acc}.gbk",
+    output:
+        fa="data/fasta/{acc}.fa",
+    conda:
+        "config/conda_envs/bioinfo.yaml"
+    shell:
+        """
+        python3 scripts/gbk_to_fa.py --gbk {input.gbk} --fa {output.fa}
         """
 
 
@@ -68,6 +87,21 @@ rule build_junction_pangraph:
         """
 
 
+rule junction_stats:
+    input:
+        pangraph=expand(rules.build_junction_pangraph.output, junc=junc_ids),
+    output:
+        "results/junction_stats.csv",
+    conda:
+        "config/conda_envs/bioinfo.yaml"
+    shell:
+        """
+        python scripts/junction_stats.py \
+            --junct_pangraphs {input.pangraph} \
+            --df_csv {output}
+        """
+
+
 rule genome_lengths:
     input:
         expand(rules.download_gbk.output, acc=acc_nums),
@@ -101,13 +135,19 @@ def all_plasmid_outputs(wildcards):
     return outs
 
 
+include: "rules/mges.smk"
+
+
 rule all:
     input:
         expand(rules.build_junction_pangraph.output, junc=junc_ids),
         rules.genome_lengths.output,
         all_plasmid_outputs,
+        rules.junction_stats.output,
 
 
 localrules:
     download_gbk,
     plasmids,
+    genomad_download_db,
+    defensefinder_models_download,

@@ -8,3 +8,7 @@ default-resources:
   mem_mb: 16000
   slurm_extra: "'--qos=30min'"
   runtime: 29m
+set-resources:
+  genomad_run:
+    mem_mb: 60000
+    cpus_per_task: 4
