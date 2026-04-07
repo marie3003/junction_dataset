@@ -47,7 +47,7 @@ def _trace_groups_from_fig(fig):
       - insertions: bar traces named 'Insertion'
       - deletions: scatter traces named 'Deletion'
     """
-    groups = {"blocks": [], "mges": [], "intrec": [], "cds": [], "trna": [], "insertions": [], "deletions": [], "inversions": [], "translocations": []}
+    groups = {"blocks": [], "mges": [], "intrec": [], "cds": [], "trna": [], "insertions": [], "deletions": [], "inversions": [], "translocations": [], "clustering": []}
 
     for i, tr in enumerate(fig.data):
         ttype = getattr(tr, "type", None)
@@ -80,6 +80,8 @@ def _trace_groups_from_fig(fig):
             groups["inversions"].append(i)
         elif name == "Translocation":
             groups["translocations"].append(i)
+        elif ttype == "scatter" and (name.startswith("Cluster ") or (not name and getattr(tr, "hoverinfo", None) == "skip" and getattr(tr, "showlegend", True) is False)):
+            groups["clustering"].append(i)
 
     return groups
 
@@ -180,6 +182,12 @@ def make_junction_dash_app(
     base_fig_tree = _build_fig(show_consensus=False)
     base_fig = base_fig_consensus  # default
 
+    # Initialise translocation arrow visibility to match initial_selection
+    _indels_initially_on = "indels" in initial_selection
+    for _fig in (base_fig_consensus, base_fig_tree):
+        for _ann in (_fig.layout.annotations or []):
+            _ann.visible = _indels_initially_on
+
     def _precompute(fig):
         grps, colored, grey = _compute_block_colors_for_figure(fig, pan)
         orig_hover = [fig.data[tidx].hovertemplate for tidx in grps["blocks"]]
@@ -200,6 +208,11 @@ def make_junction_dash_app(
 
     precomputed_consensus = _precompute(base_fig_consensus)
     precomputed_tree = _precompute(base_fig_tree)
+
+    # Clustering traces start visible (toggle is on by default)
+    for _grps, _fig in ((precomputed_consensus[0], base_fig_consensus), (precomputed_tree[0], base_fig_tree)):
+        for _tidx in _grps["clustering"]:
+            _fig.data[_tidx].visible = True
 
     # unpack defaults (consensus view)
     groups, block_colors_colored, block_colors_grey, original_hovertemplates, \
@@ -236,8 +249,9 @@ def make_junction_dash_app(
                             {"label": "Disable annotation hover", "value": "disable_anno_hover"},
                             {"label": "Disable indel hover", "value": "disable_indel_hover"},
                             {"label": "Show consensus", "value": "show_consensus"},
+                            {"label": "Show clustering", "value": "show_clustering"},
                         ],
-                        value=["show_consensus"],
+                        value=["show_consensus", "show_clustering"],
                         inline=True,
                         persistence=True,
                         persistence_type="memory",
@@ -308,6 +322,10 @@ def make_junction_dash_app(
             for tidx in groups["trna"]: active_fig.data[tidx].visible = "trna" in selected_annos
             for tidx in groups["insertions"] + groups["deletions"] + groups["inversions"] + groups["translocations"]:
                 active_fig.data[tidx].visible = "indels" in selected_annos
+            for ann in (active_fig.layout.annotations or []):
+                ann.visible = "indels" in selected_annos
+            for tidx in groups["clustering"]:
+                active_fig.data[tidx].visible = "show_clustering" in selected_options
             active_fig.layout.barmode = "overlay" if any_on else "stack"
             search_msg = f"{len(highlighted_traces)} traces matched" if search_query else ""
             return active_fig, search_msg, use_consensus
@@ -327,10 +345,11 @@ def make_junction_dash_app(
         _set_visible(groups["deletions"], "indels" in selected_annos)
         _set_visible(groups["inversions"], "indels" in selected_annos)
         _set_visible(groups["translocations"], "indels" in selected_annos)
+        _set_visible(groups["clustering"], "show_clustering" in selected_options)
 
         # Toggle translocation arrow annotations
-        n_annotations = len(base_fig.layout.annotations or [])
-        for ai in range(n_annotations):
+        active_fig_ref = base_fig_consensus if use_consensus else base_fig_tree
+        for ai in range(len(active_fig_ref.layout.annotations or [])):
             patch["layout"]["annotations"][ai]["visible"] = ("indels" in selected_annos)
 
         # 2) Enforce block colors (grey only if non-indel annotations are on)
@@ -444,9 +463,9 @@ if __name__ == "__main__":
         #junction_name = "PLTCZQCVRD_f__RYYAQMEJGY_f"
         #junction_name = "NOAJDCSIVA_f__NZXBIFMPMA_r"
         #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
-        #junction_name = "GPKQYOCEJI_r__NKVSUZGURN_f"
+        junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
         #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f" # --> look up again, its the prophage one that would get two clusters
-        junction_name = "AWYUJYFNGP_f__GCNKXNFARN_r"
+        #junction_name = "AWYUJYFNGP_f__GCNKXNFARN_r"
         #junction_name = "JVNRLCFAVD_f__PLTCZQCVRD_r" # example for a junction that isn't split enough
         #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # --> wild junctions with 12 clusters
         #junction_name = "OBEJYXNUDN_r__ZTHKZYHPIX_r"
