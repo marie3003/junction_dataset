@@ -2020,6 +2020,7 @@ def plot_event_length_distribution(
     ccdf_event=None,
     n_species=5,
     legend_title=None,
+    legend_loc=None,
     figsize=None,
     save_path=None,
 ):
@@ -2359,12 +2360,17 @@ def plot_event_length_distribution(
             # is_family and majority_organism: legend outside to the right
             if color_by in ("mge", "species_counts"):
                 ax.legend(h, l, frameon=False, fontsize=11, title=titled,
-                          title_fontsize=12, loc="upper right")
+                          title_fontsize=12, loc=legend_loc or "upper right")
             else:
-                ax.legend(h, l, frameon=False, fontsize=11, title=titled,
-                          title_fontsize=12, loc="upper left",
-                          bbox_to_anchor=(1.01, 1), borderaxespad=0)
-                fig.subplots_adjust(right=0.72)
+                _loc = legend_loc or "upper left"
+                if legend_loc is None:
+                    ax.legend(h, l, frameon=False, fontsize=11, title=titled,
+                              title_fontsize=12, loc=_loc,
+                              bbox_to_anchor=(1.01, 1), borderaxespad=0)
+                    fig.subplots_adjust(right=0.72)
+                else:
+                    ax.legend(h, l, frameon=False, fontsize=11, title=titled,
+                              title_fontsize=12, loc=_loc)
 
         # threshold line
         if min_length_threshold is not None and not filter_below_threshold:
@@ -4415,14 +4421,26 @@ def plot_event_mge_stacked_bar(
     event_order = ["insertion", "deletion", "translocation", "inversion"]
     event_order = [e for e in event_order if e in df["event_type"].unique()]
 
-    # build counts dataframe
+    # build counts dataframe — each event is assigned to exactly one MGE category
+    # priority (highest first): Prophage > Prophage (associated) > Integron >
+    #   Defense system > IS > IS (associated) > None
+    _PRIORITY = [
+        "Prophage", "IS", "Integron", "Defense system",
+        "Prophage (associated)", "IS (associated)",
+    ]
+
     rows = {}
     for etype in event_order:
         sub = df[df["event_type"] == etype]
-        row = {}
-        for label, col in mge_cols.items():
-            row[label] = int((sub[col] > 0).sum()) if col in sub.columns else 0
-        row["None"] = int((sub["n_mge"] == 0).sum()) if "n_mge" in sub.columns else len(sub)
+        row = {cat: 0 for cat in _STACK_ORDER}
+        for _, event in sub.iterrows():
+            assigned = "None"
+            for cat in _PRIORITY:
+                col = mge_cols.get(cat)
+                if col and col in sub.columns and event[col] > 0:
+                    assigned = cat
+                    break
+            row[assigned] += 1
         rows[etype] = row
 
     counts = pd.DataFrame(rows, index=_STACK_ORDER).T  # shape: event_order x categories
@@ -4439,7 +4457,7 @@ def plot_event_mge_stacked_bar(
         bars = ax.bar(
             x, vals, bottom=bottoms,
             color=color, alpha=alpha,
-            width=0.6, edgecolor="white", linewidth=0.5,
+            width=0.75, edgecolor="white", linewidth=0.5,
         )
         # legend handle with correct visual appearance
         display = _DISPLAY_NAME.get(cat, cat)
@@ -4449,10 +4467,10 @@ def plot_event_mge_stacked_bar(
         bottoms += vals
 
     ax.set_xticks(x)
-    ax.set_xticklabels([e.capitalize() for e in event_order], fontsize=13)
-    ax.set_ylabel("n. events", fontsize=14)
-    ax.set_xlabel("Event type", fontsize=14)
-    ax.tick_params(axis="both", labelsize=12, length=0)
+    ax.set_xticklabels([e.capitalize() for e in event_order], fontsize=16)
+    ax.set_ylabel("n. events", fontsize=17)
+    ax.set_xlabel("Event type", fontsize=17)
+    ax.tick_params(axis="both", labelsize=15, length=0)
     ax.yaxis.grid(True, linestyle="--", linewidth=0.6, alpha=0.5, zorder=0)
     ax.set_axisbelow(True)
 
@@ -4460,9 +4478,9 @@ def plot_event_mge_stacked_bar(
         ax.spines[spine].set_visible(False)
 
     handles, labels = zip(*reversed(bar_handles))
-    ax.legend(handles, labels, fontsize=11, frameon=False,
+    ax.legend(handles, labels, fontsize=13, frameon=False,
               loc="upper right", title="MGE category",
-              title_fontsize=12)
+              title_fontsize=14)
 
     plt.tight_layout()
 
@@ -4561,7 +4579,8 @@ def plot_hits_distribution(
             if log_x:
                 vals = vals[vals > 0]
             counts, _ = np.histogram(vals, bins=shared_bins)
-            label = "unknown" if cat is None else cat
+            cat_count = mask.sum()
+            label = f"unknown ({cat_count:,})" if cat is None else f"{cat} ({cat_count:,})"
             ax.bar(
                 shared_bins[:-1], counts, width=np.diff(shared_bins),
                 bottom=bottoms, align="edge",
@@ -4705,4 +4724,111 @@ def plot_hits_distribution(
     else:
         plt.show()
 
+    return fig, ax
+
+
+def plot_species_hits_bar(
+    df,
+    cutoff=10000,
+    stacked=False,
+    n_st131=None,
+    title=None,
+    figsize=(7, 5),
+    save_path=None,
+):
+    """Horizontal bar chart of species hits. Accepts either:
+    - a DataFrame with n_hits_<species> columns (sums across rows), or
+    - a Series with species names as index and counts as values (e.g. value_counts()).
+    Species with total hits >= cutoff are shown individually; the rest are grouped
+    as 'Other species'.
+    stacked=True draws a single bar split by species instead of one bar per species."""
+    if isinstance(df, pd.Series):
+        totals = df.sort_values(ascending=False)
+    else:
+        _known = {"n_hits_own_chromosome", "n_hits_own_plasmid", "n_hits_other_chromosome",
+                   "n_hits_other_plasmid", "n_hits_external", "n_hits_st131"}
+        species_cols = [c for c in df.columns if c.startswith("n_hits_") and c not in _known]
+        totals = df[species_cols].sum()
+        totals.index = totals.index.str.replace("n_hits_", "").str.replace("_", " ")
+    totals = totals.sort_values(ascending=False)
+
+    above = totals[totals >= cutoff]
+    below_sum = totals[totals < cutoff].sum()
+
+    labels = list(above.index)
+    values = list(above.values)
+    if below_sum > 0:
+        labels.append("Other species")
+        values.append(below_sum)
+
+    _palette = [
+        COLORS["light_blue"], COLORS["mid_blue"], COLORS["dark_blue"],
+        COLORS["purple"], COLORS["rosa"], COLORS["reddish"],
+        COLORS["teal"], COLORS["wine"], COLORS["pink"],
+    ]
+    colors = [_palette[i % len(_palette)] for i in range(len(labels))]
+    if "Other species" in labels:
+        colors[labels.index("Other species")] = COLORS["gray"]
+
+    total = sum(values)
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if stacked:
+        left = 0
+        ecoli_left = None
+        ecoli_val = None
+        for label, val, color in zip(labels, values, colors):
+            legend_label = f"{label} ({val / total:.1%})"
+            ax.barh(0, val, left=left, color=color, edgecolor="white",
+                    linewidth=0.8, height=0.5, label=legend_label)
+            if label == "Escherichia coli":
+                ecoli_left = left
+                ecoli_val = val
+            left += val
+
+        # overlay ST131 stripes on E. coli segment
+        if n_st131 is not None and ecoli_left is not None:
+            st131_pct = n_st131 / total
+            ax.barh(0, n_st131, left=ecoli_left, color="none", edgecolor="white",
+                    linewidth=0.8, height=0.5, hatch="////", zorder=3)
+            # custom legend handle with grey hatch + grey border
+            import matplotlib.patches as mpatches
+            st131_handle = mpatches.Patch(
+                facecolor="none", edgecolor=COLORS["gray"], hatch="////",
+                linewidth=0.8, label=f"ST131 ({st131_pct:.1%})"
+            )
+        ax.set_yticks([])
+        ax.set_xlabel("Total hits", fontsize=12)
+        handles, leg_labels = ax.get_legend_handles_labels()
+        if n_st131 is not None and ecoli_left is not None:
+            handles.append(st131_handle)
+            leg_labels.append(st131_handle.get_label())
+        ax.legend(handles, leg_labels, fontsize=10, frameon=False, bbox_to_anchor=(0, 1),
+                  loc="lower left", ncol=2, borderpad=0, labelspacing=0.3)
+        for spine in ["top", "right", "left"]:
+            ax.spines[spine].set_visible(False)
+        fig.subplots_adjust(top=0.6)
+    else:
+        # reverse so largest is on top
+        labels, values, colors = labels[::-1], values[::-1], colors[::-1]
+        bars = ax.barh(labels, values, color=colors, edgecolor="white", linewidth=0.5)
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_width() + total * 0.005, bar.get_y() + bar.get_height() / 2,
+                    f"{val / total:.1%}", va="center", fontsize=10)
+        ax.set_xlabel("Total hits", fontsize=12)
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+        ax.xaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, zorder=0)
+        ax.set_axisbelow(True)
+
+    ax.tick_params(axis="both", labelsize=11)
+    ax.set_title(title or "Species hit distribution", fontsize=13)
+
+    plt.tight_layout()
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        fig.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
     return fig, ax

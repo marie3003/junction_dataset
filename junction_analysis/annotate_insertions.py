@@ -1917,8 +1917,7 @@ def collect_hits_info_counts_with_self(
     own_plasmid      : sgenome is a biosample of the query isolate's plasmid(s)
     other_chromosome : sgenome belongs to another isolate in sam_df (chromosome)
     other_plasmid    : sgenome belongs to another isolate in sam_df (plasmid)
-    external         : sgenome is not own chromosome or own plasmid (i.e. other_chromosome
-                       + other_plasmid + hits not present in sam_df at all)
+    external         : sgenome is not present in sam_df at all (truly external to the study)
 
     The query isolate is identified by matching genome_name (from the filename) against
     sam_df.accession. Only hits with pident >= min_pident and qcovGnm >= 90% are counted.
@@ -2006,11 +2005,6 @@ def collect_hits_info_counts_with_self(
                     cat = "own_plasmid"
                 elif sg in all_own_bs:
                     cat = "other_chromosome" if bs_to_type[sg] == "chromosome" else "other_plasmid"
-                    hit_counts[cat] += 1
-                    genome_sets[cat].add(sg)
-                    hit_counts["external"] += 1
-                    genome_sets["external"].add(sg)
-                    continue
                 else:
                     cat = "external"
                 hit_counts[cat] += 1
@@ -2034,7 +2028,7 @@ def collect_hits_info_counts_with_self(
                     ifields = line.strip().split("\t")
                     if float(ifields[ipident_col]) < min_pident or float(ifields[iqcovgnm_col]) < 90.0:
                         continue
-                    if ifields[isg_col] in own_chr_bs or ifields[isg_col] in own_pla_bs:
+                    if ifields[isg_col] in all_own_bs:
                         continue
                     if len(ifields) <= org_col:
                         continue
