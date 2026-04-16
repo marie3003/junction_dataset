@@ -781,9 +781,24 @@ if __name__ == "__main__":
         args = parser.parse_args()
         junction_name        = args.junction_name
         recompute            = args.recompute
-        mges_gff_path        = Path(args.mges_gff) if args.mges_gff else None
-        annotations_gff_path = Path(args.annotations_gff) if args.annotations_gff else None
         port                 = args.port
+
+        _default_mges = REPO_ROOT / "results" / "junction_mges" / f"{junction_name}.gff3"
+        _default_ann  = REPO_ROOT / "results" / "junction_annotations" / f"{junction_name}.gff"
+
+        if args.mges_gff:
+            mges_gff_path = Path(args.mges_gff)
+        elif _default_mges.exists():
+            mges_gff_path = _default_mges
+        else:
+            mges_gff_path = None
+
+        if args.annotations_gff:
+            annotations_gff_path = Path(args.annotations_gff)
+        elif _default_ann.exists():
+            annotations_gff_path = _default_ann
+        else:
+            annotations_gff_path = None
     else:
         # ── VSCode interactive run ── edit junction_name here ──────────────────
         #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # consensus definition very conservative here, investigate

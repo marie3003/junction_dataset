@@ -55,6 +55,8 @@ marimo run explore/view_junctions.py
 
 ## Detailed analysis of accessory genome junctions
 
+Information about the used environment are saved in `config/conda_envs/junction_env.yaml`.
+
 All analysis code is located in the `junction_analysis` directory.
 Generated outputs are stored in the `results` directory, organized as follows:
 
@@ -115,6 +117,12 @@ The `explore` folder contains notebooks used throughout the thesis. These notebo
 ## Interactive visualization
 
 An interactive dashboard for exploring junctions can be launched with:
+
+```
+python explore/dash_pangraph_viewer.py CIRMBUYJFK_f__CWCCKOQCWZ_r
+```
+
+or more explicitly with specified annotation files and output port:
 
 ```bash
 python explore/dash_pangraph_viewer.py CIRMBUYJFK_f__CWCCKOQCWZ_r  \
