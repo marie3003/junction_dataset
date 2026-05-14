@@ -182,7 +182,8 @@ def strip_newick_suffixes(input_path, output_path):
         f.write(cleaned)
 
 def get_isolate_sequence(pangraph, block_id, node_id):
-    sequence = pangraph.blocks[block_id].alignment.generate_alignment()[str(node_id)]
+    base_id = int(re.sub(r"_\d+$", "", str(block_id)))
+    sequence = pangraph.blocks[base_id].alignment.generate_alignment()[str(node_id)]
     return sequence.replace("-", "")
 
 def write_shared_nodes_fasta(pangraph, path_dict, shared_nodes, shared_node_isolates, output_path):

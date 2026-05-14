@@ -148,19 +148,25 @@ class Path:
 class Edge:
     """Oriented link between two nodes/paths"""
 
-    def __init__(self, left, right) -> None:
+    def __init__(self, left, right, n_occurrence=None) -> None:
         self.left = left
         self.right = right
+        self.n_occurrence = n_occurrence
 
     def invert(self) -> "Edge":
-        return Edge(self.right.invert(), self.left.invert())
+        return Edge(self.right.invert(), self.left.invert(), self.n_occurrence)
 
     def __side_eq__(self, o: object) -> bool:
         # comparison of edges doesn't depend on context
         return self.left.id == o.left.id and self.left.strand == o.left.strand and self.right.id == o.right.id and self.right.strand == o.right.strand
 
     def __eq__(self, o: object) -> bool:
-        return self.__side_eq__(o) or self.__side_eq__(o.invert())
+        sides_eq = self.__side_eq__(o) or self.__side_eq__(o.invert())
+        if not sides_eq:
+            return False
+        if self.n_occurrence is None or o.n_occurrence is None:
+            return True
+        return self.n_occurrence == o.n_occurrence
 
     def __side_hash__(self) -> int:
         return hash((self.left.id, self.left.strand, self.right.id, self.right.strand))
@@ -169,7 +175,8 @@ class Edge:
         return self.__side_hash__() ^ self.invert().__side_hash__()
 
     def __repr__(self) -> str:
-        return f"{self.left} <--> {self.right}"
+        base = f"{self.left} <--> {self.right}"
+        return f"{base} (#{self.n_occurrence})" if self.n_occurrence is not None else base
 
     def __to_str_id(self) -> str:
         return "__".join([self.left.to_str_id(), self.right.to_str_id()])
@@ -186,6 +193,44 @@ class Edge:
             return Edge(DeduplicatedNode.from_str_id(left), DeduplicatedNode.from_str_id(right))
         else:
             return Edge(Node.from_str_id(left), Node.from_str_id(right))
+
+
+class EdgePath:
+    """A path represented as an ordered sequence of edges."""
+
+    def __init__(self, edges=None) -> None:
+        self.edges = tuple(edges) if edges is not None else ()
+
+    def __iter__(self):
+        return iter(self.edges)
+
+    def __len__(self) -> int:
+        return len(self.edges)
+
+    def invert(self) -> "EdgePath":
+        return EdgePath(e.invert() for e in reversed(self.edges))
+
+    def __eq__(self, o: object) -> bool:
+        if not isinstance(o, EdgePath):
+            return NotImplemented
+        return self.edges == o.edges
+
+    def __hash__(self) -> int:
+        return hash(self.edges)
+
+    @staticmethod
+    def from_path(path: "Path") -> "EdgePath":
+        nodes = path.nodes
+        occurrence_counts = Counter()
+        edges = []
+        for u, v in zip(nodes, nodes[1:]):
+            e = Edge(u, v)
+            occurrence_counts[e] += 1
+            edges.append(Edge(u, v, n_occurrence=occurrence_counts[e]))
+        return EdgePath(edges)
+
+    def __repr__(self) -> str:
+        return " -> ".join(str(e) for e in self.edges)
 
 
 class Junction:

@@ -2,6 +2,8 @@ import numpy as np
 import math
 import random
 import os
+import re
+import itertools
 from pathlib import Path
 
 import plotly.graph_objects as go
@@ -118,17 +120,18 @@ def plot_junction_pangraph_interactive(
 
     n_core = int(bdf["core"].sum())
     n_acc = int(len(bdf) - n_core)
-    cgen_acc = iter(sns.color_palette("rainbow", n_acc))
-    cgen_core = iter(sns.color_palette("pastel", n_core))
+    cgen_acc = itertools.cycle(sns.color_palette("rainbow", max(n_acc, 1)))
+    cgen_core = itertools.cycle(sns.color_palette("pastel", max(n_core, 1)))
     block_colors: dict = {}
 
     def get_block_color(block_id):
+        base_id = int(re.sub(r"_\d+$", "", str(block_id)))
         # Only turn blocks grey for annotation overlays (not for indels alone)
         if show_mges_annotations or show_cds_annotations or show_int_rec_annotations:
-            return GREY_CORE if bool(bdf.loc[block_id, "core"]) else GREY_ACC
+            return GREY_CORE if bool(bdf.loc[base_id, "core"]) else GREY_ACC
 
         if block_id not in block_colors:
-            color = next(cgen_core) if bool(bdf.loc[block_id, "core"]) else next(cgen_acc)
+            color = next(cgen_core) if bool(bdf.loc[base_id, "core"]) else next(cgen_acc)
             if isinstance(color, tuple) and len(color) == 3:
                 color = f"rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})"
             block_colors[block_id] = color
@@ -191,7 +194,8 @@ def plot_junction_pangraph_interactive(
         for block_idx, node in enumerate(cons_path):
             bid = node.id
             strand = node.strand
-            block_len = int(bdf.loc[bid, "len"])
+            base_bid = int(re.sub(r"_\d+$", "", str(bid)))
+            block_len = int(bdf.loc[base_bid, "len"])
             _add_bar(
                 label=label,
                 left=int(x_left),
@@ -802,14 +806,15 @@ def plot_junction_pangraph_combined(
     n_acc = int(len(bdf) - n_core)
 
     # distinct color generators for core / accessory
-    cgen_acc = iter(sns.color_palette("rainbow", n_acc))
-    cgen_core = iter(sns.color_palette("pastel", n_core))
+    cgen_acc = itertools.cycle(sns.color_palette("rainbow", max(n_acc, 1)))
+    cgen_core = itertools.cycle(sns.color_palette("pastel", max(n_core, 1)))
     block_colors: dict = {}
 
     def get_block_color(block_id):
         """Return (and cache) a consistent color per block id."""
+        base_id = int(re.sub(r"_\d+$", "", str(block_id)))
         if block_id not in block_colors:
-            color = next(cgen_core) if bool(bdf.loc[block_id, "core"]) else next(cgen_acc)
+            color = next(cgen_core) if bool(bdf.loc[base_id, "core"]) else next(cgen_acc)
             block_colors[block_id] = color
         return block_colors[block_id]
 
@@ -846,7 +851,8 @@ def plot_junction_pangraph_combined(
         for node in cons_path:
             bid = node.id
             strand = node.strand
-            block_len = int(bdf.loc[bid, "len"])
+            base_bid = int(re.sub(r"_\d+$", "", str(bid)))
+            block_len = int(bdf.loc[base_bid, "len"])
             ax.barh(
                 y_val,
                 width=block_len,
@@ -1140,16 +1146,17 @@ def plot_pangraph_base_for_dash(
 
     n_core = int(bdf["core"].sum())
     n_acc = int(len(bdf) - n_core)
-    cgen_acc = iter(sns.color_palette("rainbow", n_acc))
-    cgen_core = iter(sns.color_palette("pastel", n_core))
+    cgen_acc = itertools.cycle(sns.color_palette("rainbow", max(n_acc, 1)))
+    cgen_core = itertools.cycle(sns.color_palette("pastel", max(n_core, 1)))
     block_colors: dict = {}
 
     def get_block_color(block_id):
+        base_id = int(re.sub(r"_\d+$", "", str(block_id)))
         if grey_mode:
-            return GREY_CORE if bool(bdf.loc[block_id, "core"]) else GREY_ACC
+            return GREY_CORE if bool(bdf.loc[base_id, "core"]) else GREY_ACC
 
         if block_id not in block_colors:
-            color = next(cgen_core) if bool(bdf.loc[block_id, "core"]) else next(cgen_acc)
+            color = next(cgen_core) if bool(bdf.loc[base_id, "core"]) else next(cgen_acc)
             if isinstance(color, tuple) and len(color) == 3:
                 color = f"rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)})"
             block_colors[block_id] = color
@@ -1212,7 +1219,8 @@ def plot_pangraph_base_for_dash(
         for block_idx, node in enumerate(cons_path):
             bid = node.id
             strand = node.strand
-            block_len = int(bdf.loc[bid, "len"])
+            base_bid = int(re.sub(r"_\d+$", "", str(bid)))
+            block_len = int(bdf.loc[base_bid, "len"])
             _add_bar(
                 label=label,
                 left=int(x_left),
@@ -4823,6 +4831,81 @@ def plot_species_hits_bar(
 
     ax.tick_params(axis="both", labelsize=11)
     ax.set_title(title or "Species hit distribution", fontsize=13)
+
+    plt.tight_layout()
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        fig.savefig(save_path, bbox_inches="tight")
+        print(f"Saved figure to {save_path}")
+    else:
+        plt.show()
+    return fig, ax
+
+
+def plot_density_scatter(
+    df,
+    x_col="n_clusters",
+    y_col="n_recombinations",
+    figsize=(6, 4),
+    title=None,
+    xlabel=None,
+    ylabel=None,
+    log_color=False,
+    diagonal=True,
+    save_path=None,
+):
+    """
+    Scatter plot where each point represents a unique (x_col, y_col) combination,
+    sized and colored by the number of observations at that position.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    x_col, y_col : str
+        Columns to plot on x and y axes.
+    figsize : tuple
+    title, xlabel, ylabel : str or None
+    log_color : bool
+        If True, use log scale for the colorbar.
+    diagonal : bool
+        If True, draw a dashed diagonal reference line through the origin.
+    save_path : str or None
+    """
+    _cmap_colors = ["#b5d2f2", "#7394c2", "#397398", "#80557e", "#d991b4", "#a6444f"]
+    cmap = LinearSegmentedColormap.from_list("event_cmap", _cmap_colors)
+
+    density_df = (
+        df.groupby([x_col, y_col])
+        .size()
+        .reset_index(name="n")
+    )
+
+    norm = LogNorm(vmin=1, vmax=density_df["n"].max()) if log_color else Normalize(vmin=1, vmax=density_df["n"].max())
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sc = ax.scatter(
+        density_df[x_col],
+        density_df[y_col],
+        c=density_df["n"],
+        s=30 + density_df["n"] * 8,
+        alpha=0.8,
+        cmap=cmap,
+        norm=norm,
+        linewidths=0,
+    )
+
+    if diagonal:
+        max_val = max(density_df[x_col].max(), density_df[y_col].max())
+        ax.plot([0, max_val], [0, max_val], linestyle="--", linewidth=1, color=COLORS["gray"])
+
+    ax.set_xlabel(xlabel or x_col)
+    ax.set_ylabel(ylabel or y_col)
+    ax.set_title(title or f"{x_col} vs {y_col}")
+    ax.grid(True, alpha=0.15)
+
+    cb = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax)
+    cb.set_label("number of junctions at position")
 
     plt.tight_layout()
     if save_path is not None:

@@ -87,7 +87,9 @@ def create_block_msas_for_cluster(example_junction, isolate_list, cl, ambiguous_
     out_aln_dir.mkdir(parents=True, exist_ok=True)
 
     for block in ambiguous_blocks:
-        fasta_file = Path(in_fasta_dir) / f"block_{block.id}_sequences.fa"
+        # strip seq-dedup cluster suffix (e.g. "BLOCKID_0" → "BLOCKID") for fasta file lookup
+        base_id = re.sub(r"_\d+$", "", str(block.id))
+        fasta_file = Path(in_fasta_dir) / f"block_{base_id}_sequences.fa"
         ctx_tag = _context_to_filename(block.context)
 
         out_aln = out_aln_dir / f"block_{block.id}_ctx_{ctx_tag}_sequences_cluster_aln.fa"

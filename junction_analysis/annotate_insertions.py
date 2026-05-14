@@ -177,6 +177,8 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         current_translocation = []
         current_translocation_first_ctx = None
         current_trans_has_ambiguous = False
+        insertion_or_translocation_id_ctxs = set()
+
         n_insertions_isolate = 0
         n_ambiguous_ins_isolate = 0
         n_trans_isolate = 0
@@ -185,18 +187,21 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         def flush_ins():
             nonlocal current_insertion, current_insertion_first_ctx
             nonlocal n_insertions_isolate, n_ambiguous_ins_isolate, current_ins_has_dup_ambiguous
+
             if current_insertion:
                 insertions.setdefault(isolate, []).append({
                     "path": pu.Path(list(current_insertion)),
                     "ctx": current_insertion_first_ctx,
                 })
                 n_insertions_isolate += 1
+
                 if current_ins_has_dup_ambiguous:
                     n_ambiguous_ins_isolate += 1
                     ambiguous_insertions.setdefault(isolate, []).append({
                         "path": pu.Path(list(current_insertion)),
                         "ctx": current_insertion_first_ctx,
                     })
+
                 current_insertion = []
                 current_insertion_first_ctx = None
                 current_ins_has_dup_ambiguous = False
@@ -204,14 +209,17 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         def flush_trans():
             nonlocal current_translocation, current_translocation_first_ctx
             nonlocal n_trans_isolate, n_ambiguous_trans_isolate, current_trans_has_ambiguous
+
             if current_translocation:
                 translocations.setdefault(isolate, []).append({
                     "path": pu.Path(list(current_translocation)),
                     "ctx": current_translocation_first_ctx,
                 })
                 n_trans_isolate += 1
+
                 if current_trans_has_ambiguous:
                     n_ambiguous_trans_isolate += 1
+
                 current_translocation = []
                 current_translocation_first_ctx = None
                 current_trans_has_ambiguous = False
@@ -223,24 +231,36 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 continue
 
             avail = c_ctx_by_id.get(n.id, [])
+
             if avail:
                 if len(avail) > 1:
                     current_trans_has_ambiguous = True
+
                 c_ctx = avail.pop(0)
                 matched.add((n.id, c_ctx))
                 matched.add((n.id, ctx))
+
                 flush_ins()
+
                 if not current_translocation:
                     current_translocation_first_ctx = ctx
+
                 current_translocation.append(n)
+                insertion_or_translocation_id_ctxs.add((n.id, ctx))
+
             else:
                 matched.add((n.id, ctx))
+
                 flush_trans()
+
                 if not current_insertion:
                     current_insertion_first_ctx = ctx
+
                 if _base_ctx(ctx) in c_id_to_base_ctxs.get(n.id, set()):
                     current_ins_has_dup_ambiguous = True
+
                 current_insertion.append(n)
+                insertion_or_translocation_id_ctxs.add((n.id, ctx))
 
         flush_ins()
         flush_trans()
@@ -265,6 +285,7 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
 
         def flush_del():
             nonlocal current_deletion, last_iso_node, current_deletion_first_ctx
+
             if current_deletion:
                 deletions.setdefault(isolate, []).append({
                     "path": pu.Path(list(current_deletion)),
@@ -277,13 +298,16 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         for n, ctx in zip(c_nodes, c_ctxs):
             if (n.id, ctx) in matched:
                 iso_n = iso_id_ctx_to_node.get((n.id, ctx))
+
                 if iso_n is not None:
                     flush_del()
                     last_iso_node = iso_n
+
                 continue
 
             if not current_deletion:
                 current_deletion_first_ctx = ctx
+
             current_deletion.append(n)
 
         flush_del()
@@ -297,6 +321,7 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
 
         def flush_inv():
             nonlocal current_inversion, current_inversion_first_ctx
+
             if current_inversion:
                 inversions.setdefault(isolate, []).append({
                     "path": pu.Path(list(current_inversion)),
@@ -305,24 +330,18 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 current_inversion = []
                 current_inversion_first_ctx = None
 
-        insertion_id_ctxs = {
-            (n.id, n.context)
-            for ins_entry in insertions.get(isolate, [])
-            for n in ins_entry["path"].nodes
-        } | {
-            (n.id, n.context)
-            for te in translocations.get(isolate, [])
-            for n in te["path"].nodes
-        }
-
         for n, ctx in zip(iso_nodes, iso_ctxs):
-            if (n.id, n.context) in insertion_id_ctxs:
-                # Part of an insertion or translocation— skip without flushing the inversion to not interrupt it
+            if (n.id, ctx) in insertion_or_translocation_id_ctxs:
+                # Part of an insertion or translocation — skip without flushing
+                # so it does not interrupt a surrounding inversion.
                 continue
+
             c_strand = c_id_ctx_strand.get((n.id, ctx))
+
             if c_strand is not None and n.strand != c_strand:
                 if not current_inversion:
                     current_inversion_first_ctx = ctx
+
                 current_inversion.append(n)
             else:
                 flush_inv()
