@@ -33,17 +33,32 @@ class Node:
         return Node(bid, strand)
     
 class DeduplicatedNode:
-    """Combination of block id, strandedness and context in path (closest, non-duplicated block to the left), node id can be added optionally but equality doesn't depend on it."""
+    """Combination of block id, strandedness and context in path (closest, non-duplicated block to the left), node id can be added optionally but equality doesn't depend on it.
 
-    def __init__(self, bid: str, strand: bool, context: str, nid: Optional[str] = None,) -> None:
+    Optional attributes:
+        type           : one of "matched", "insertion", "inversion", "deletion", or None
+        parent_clade_id: name of the internal tree node where this event was acquired, or None
+    """
+
+    def __init__(
+        self,
+        bid: str,
+        strand: bool,
+        context: str,
+        nid: Optional[str] = None,
+        type: Optional[str] = None,
+        parent_clade_id: Optional[str] = None,
+    ) -> None:
         self.id = bid
         self.strand = strand
         self.context = context
         self.nid = nid
+        self.type = type
+        self.parent_clade_id = parent_clade_id
 
     # for now context is always block that is never inverted, that's why we can just keep the context in the case of an inversion
     def invert(self) -> "DeduplicatedNode":
-        return DeduplicatedNode(self.id, not self.strand, self.context, self.nid)
+        return DeduplicatedNode(self.id, not self.strand, self.context, self.nid, self.type, self.parent_clade_id)
 
     def __eq__(self, other: object) -> bool:
         return self.id == other.id and self.strand == other.strand and self.context == other.context

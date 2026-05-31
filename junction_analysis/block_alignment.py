@@ -93,8 +93,8 @@ def create_block_msas_for_cluster(example_junction, isolate_list, cl, ambiguous_
         ctx_tag = _context_to_filename(block.context)
 
         out_aln = out_aln_dir / f"block_{block.id}_ctx_{ctx_tag}_sequences_cluster_aln.fa"
-        if out_aln.exists():
-            continue
+        #if out_aln.exists():
+        #    continue
 
         # Build the set of nids that correspond to this (block_id, context) copy
         if path_dict_cluster_dedup is not None:
@@ -293,7 +293,14 @@ def analyze_alignment(path, return_pairwise_dists=False):
     # filename: block_{block_id}_ctx_{context}_sequences_cluster_aln.fa
     # or legacy: block_{block_id}_sequences_cluster_aln.fa
     fname = path.name
-    block_id = int(fname.split("_", 2)[1])
+    block_id_str = fname.split("_ctx_")[0].removeprefix("block_")
+    # seq-dedup renamed blocks have a "_N" suffix (e.g. "3226134370544314880_0")
+    # Python int() accepts underscores as numeric separators (PEP 515), so we must
+    # check for the suffix pattern BEFORE attempting int() conversion
+    if re.search(r"_\d+$", block_id_str):
+        block_id = block_id_str  # seq-dedup renamed: keep as string
+    else:
+        block_id = int(block_id_str)
     ctx_match = re.search(r"_ctx_(.+?)_sequences", fname)
     context = ctx_match.group(1) if ctx_match else ""
     if context == "nocontext":
@@ -378,7 +385,7 @@ def summarize_block_msas(junction_name, cl=None, save_df=True, return_pairwise_d
         else:
             return df
 
-    df = df.sort_values("block_id")
+    df = df.sort_values("block_id", key=lambda col: col.astype(str))
 
     pangraph = pp.Pangraph.from_json(str(repo_root() / "results" / "junction_pangraphs" / f"{junction_name}.json"))
     blockstats_df = pangraph.to_blockstats_df().reset_index()

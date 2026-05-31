@@ -508,6 +508,7 @@ def plot_junction_pangraph_interactive(
                     # Extract segment numbers from insertion names (e.g., "segment_0" -> "0")
                     segment_nums = [s.split("_")[-1] if "_" in s else s.replace("segment", "") for s in sub_ins["insertion"].tolist()]
                     block_counts = [str(p).count("[") for p in sub_ins["path"].tolist()]
+                    clade_ids = sub_ins["parent_clade_id"].fillna("").tolist() if "parent_clade_id" in sub_ins.columns else [""] * len(sub_ins)
 
                     fig.add_trace(go.Bar(
                         x=(sub_ins["end_pos"] - sub_ins["start_pos"]).tolist(),
@@ -532,6 +533,7 @@ def plot_junction_pangraph_interactive(
                             segment_nums,
                             sub_ins["strand"].tolist(),
                             block_counts,
+                            clade_ids,
                         )),
                         hovertemplate=(
                             "<b>Insertion (#%{customdata[2]})</b>"
@@ -540,6 +542,7 @@ def plot_junction_pangraph_interactive(
                             "<br>Length = %{customdata[1]:d}"
                             "<br>Strand = %{customdata[3]}"
                             "<br>Blocks = %{customdata[4]}"
+                            "<br>Clade = %{customdata[5]}"
                             "<extra></extra>"
                         ),
                     ))
@@ -608,6 +611,7 @@ def plot_junction_pangraph_interactive(
 
                 inv_nums = [str(name).replace("inversion", "") for name in sub_inv["inversion"].tolist()]
                 block_counts = [str(p).count("[") for p in sub_inv["path"].tolist()]
+                clade_ids = sub_inv["parent_clade_id"].fillna("").tolist() if "parent_clade_id" in sub_inv.columns else [""] * len(sub_inv)
 
                 fig.add_trace(go.Bar(
                     x=(sub_inv["end_pos"] - sub_inv["start_pos"]).tolist(),
@@ -632,6 +636,7 @@ def plot_junction_pangraph_interactive(
                         inv_nums,
                         sub_inv["strand"].tolist(),
                         block_counts,
+                        clade_ids,
                     )),
                     hovertemplate=(
                         "<b>Inversion (#%{customdata[2]})</b>"
@@ -640,6 +645,7 @@ def plot_junction_pangraph_interactive(
                         "<br>Length = %{customdata[1]:d}"
                         "<br>Strand = %{customdata[3]}"
                         "<br>Blocks = %{customdata[4]}"
+                        "<br>Clade = %{customdata[5]}"
                         "<extra></extra>"
                     ),
                 ))
@@ -1134,6 +1140,7 @@ def plot_pangraph_base_for_dash(
     add_cluster_annotation: bool = True,
     title: str = "",
     grey_mode: bool = False,
+    nid_to_block_id: dict = None,
 ):
     """
     Plots the base block structure of a junction pangraph using Plotly, without annotations.
@@ -1201,13 +1208,14 @@ def plot_pangraph_base_for_dash(
         p = pan.paths[isolate_name]
         for block_idx, node_id in enumerate(p.nodes):
             block, strand, start, end = pan.nodes[node_id][["block_id", "strand", "start", "end"]]
+            display_block_id = nid_to_block_id.get(str(node_id), block) if nid_to_block_id else block
             _add_bar(
                 label=isolate_name,
                 left=int(start),
                 width=int(end - start),
-                color=get_block_color(block),
+                color=get_block_color(display_block_id),
                 strand=bool(strand),
-                block_id=block,
+                block_id=display_block_id,
                 block_pos=block_idx,
             )
         if isolate_name not in y_seen:
@@ -2661,6 +2669,7 @@ def add_annotations_for_dash(
                     # Extract segment numbers from insertion names (e.g., "segment_0" -> "0")
                     segment_nums = [s.split("_")[-1] if "_" in s else s.replace("segment", "") for s in sub_ins["insertion"].tolist()]
                     block_counts = [str(p).count("[") for p in sub_ins["path"].tolist()]
+                    clade_ids = sub_ins["parent_clade_id"].fillna("").tolist() if "parent_clade_id" in sub_ins.columns else [""] * len(sub_ins)
 
                     fig.add_trace(go.Bar(
                         x=(sub_ins["end_pos"] - sub_ins["start_pos"]).tolist(),
@@ -2685,6 +2694,7 @@ def add_annotations_for_dash(
                             segment_nums,
                             sub_ins["strand"].tolist(),
                             block_counts,
+                            clade_ids,
                         )),
                         hovertemplate=(
                             "<b>Insertion (#%{customdata[2]})</b>"
@@ -2693,6 +2703,7 @@ def add_annotations_for_dash(
                             "<br>Length = %{customdata[1]:d}"
                             "<br>Strand = %{customdata[3]}"
                             "<br>Blocks = %{customdata[4]}"
+                            "<br>Clade = %{customdata[5]}"
                             "<extra></extra>"
                         ),
                     ))
@@ -2714,7 +2725,7 @@ def add_annotations_for_dash(
                     n_blocks = str(row.get("path", "")).count("[")
                     del_xs.append(row["position"])
                     del_ys.append(label)
-                    del_customdata.append([del_num, row["length"], row.get("strand", ""), n_blocks])
+                    del_customdata.append([del_num, row["length"], row.get("strand", ""), n_blocks, row.get("parent_clade_id", "")])
 
             if del_xs:
                 fig.add_trace(go.Scatter(
@@ -2736,6 +2747,7 @@ def add_annotations_for_dash(
                         "<br>Length = %{customdata[1]:d}"
                         "<br>Strand = %{customdata[2]}"
                         "<br>Blocks = %{customdata[3]}"
+                        "<br>Clade = %{customdata[4]}"
                         "<extra></extra>"
                     ),
                 ))
@@ -2761,6 +2773,7 @@ def add_annotations_for_dash(
 
                 inv_nums = [str(name).replace("inversion", "") for name in sub_inv["inversion"].tolist()]
                 block_counts = [str(p).count("[") for p in sub_inv["path"].tolist()]
+                clade_ids = sub_inv["parent_clade_id"].fillna("").tolist() if "parent_clade_id" in sub_inv.columns else [""] * len(sub_inv)
 
                 fig.add_trace(go.Bar(
                     x=(sub_inv["end_pos"] - sub_inv["start_pos"]).tolist(),
@@ -2785,6 +2798,7 @@ def add_annotations_for_dash(
                         inv_nums,
                         sub_inv["strand"].tolist(),
                         block_counts,
+                        clade_ids,
                     )),
                     hovertemplate=(
                         "<b>Inversion (#%{customdata[2]})</b>"
@@ -2793,6 +2807,7 @@ def add_annotations_for_dash(
                         "<br>Length = %{customdata[1]:d}"
                         "<br>Strand = %{customdata[3]}"
                         "<br>Blocks = %{customdata[4]}"
+                        "<br>Clade = %{customdata[5]}"
                         "<extra></extra>"
                     ),
                 ))
@@ -4115,6 +4130,198 @@ def plot_clustering_threshold_sweep(df, figsize=(7,4), save_path=None, normalize
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"Saved figure to {save_path}")
     else:
+        plt.show()
+
+
+def plot_event_tree(events_df, isolate_list, block_id, event_type, context,
+                    clade_df=None,
+                    tree_path="../config/polished_tree.nwk",
+                    title=None, ax=None, save_path=None):
+    """
+    Plot the subtree of isolate_list with tips colored by presence/absence
+    of a specific (event_type, block_id, context) combination.
+
+    If clade_df (output of group_events_by_clade) is provided, the parent
+    node of each gain clade is marked with a dot and labelled with its
+    parent_clade_id integer.
+
+    Parameters
+    ----------
+    events_df : pd.DataFrame
+        Output of detect_event_blocks().
+    isolate_list : list[str]
+        All isolates in the cluster (used to build the subtree).
+    block_id : str or int
+        Block ID to highlight.
+    event_type : str
+        One of "insertion", "deletion", "inversion".
+    context : str
+        Context string (consensus position UID).
+    clade_df : pd.DataFrame or None
+        Output of group_events_by_clade(). If provided, parent clade nodes
+        are annotated on the tree.
+    tree_path : str
+        Path to the full Newick phylogeny.
+    title : str or None
+        Plot title. Defaults to "{event_type} | {block_id} | {context}".
+    ax : matplotlib Axes or None
+    save_path : str or None
+    """
+    from junction_analysis.helpers import build_subtree
+    from Bio import Phylo
+
+    tree = Phylo.read(tree_path, "newick")
+    subtree = build_subtree(tree, isolate_list)
+
+    mask = (
+        (events_df["event_type"] == event_type) &
+        (events_df["block_id"]   == block_id)   &
+        (events_df["context"]    == context)
+    )
+    event_isolates = set(events_df.loc[mask, "isolate"])
+
+    # for each gain clade in clade_df, resolve parent_clade_id (frozenset of
+    # tip names) back to a subtree node via common_ancestor
+    gain_clade_nodes = []
+    if clade_df is not None:
+        cmask = (
+            (clade_df["event_type"] == event_type) &
+            (clade_df["block_id"]   == block_id)   &
+            (clade_df["context"]    == context)
+        )
+        for _, row in clade_df.loc[cmask].iterrows():
+            pid = row.get("parent_clade_id")
+            if pid is None:
+                continue
+            # pid is now an internal node name string; find it in the subtree
+            nodes = list(subtree.find_clades({"name": pid}))
+            if not nodes:
+                continue
+            node = nodes[0]
+            gain_clade_nodes.append((node, pid))
+
+    n_tips = len(isolate_list)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, max(3, n_tips * 0.18)))
+        created_fig = True
+    else:
+        fig = ax.figure
+        created_fig = False
+
+    present_color = COLORS["reddish"]
+    absent_color  = COLORS["gray"]
+
+    # --- parent map ---
+    parent_map = {}
+    for clade in subtree.find_clades(order="preorder"):
+        for child in clade.clades:
+            parent_map[child] = clade
+
+    # --- tip y positions (pre-order) ---
+    tips_in_order = [c for c in subtree.find_clades(order="preorder") if c.is_terminal()]
+    tip_y  = {tip: i for i, tip in enumerate(tips_in_order)}
+
+    # --- x positions (cumulative branch length) ---
+    node_x = {subtree.root: 0.0}
+    for clade in subtree.find_clades(order="preorder"):
+        for child in clade.clades:
+            bl = child.branch_length if child.branch_length is not None else 0.0
+            node_x[child] = node_x[clade] + bl
+
+    # --- y positions for internal nodes (midpoint of children) ---
+    node_y = {}
+    for clade in subtree.find_clades(order="postorder"):
+        if clade.is_terminal():
+            node_y[clade] = tip_y[clade]
+        else:
+            child_ys = [node_y[c] for c in clade.clades]
+            node_y[clade] = (min(child_ys) + max(child_ys)) / 2.0
+
+    def _tip_fraction(clade):
+        """Fraction of tips below clade that carry the event."""
+        tips = clade.get_terminals()
+        if not tips:
+            return 0.0
+        return sum(1 for t in tips if t.name in event_isolates) / len(tips)
+
+    def _branch_color(clade):
+        frac = _tip_fraction(clade)
+        if frac == 1.0:
+            return present_color
+        elif frac == 0.0:
+            return absent_color
+        else:
+            return COLORS["mid_blue"]  # mixed
+
+    # --- draw branches ---
+    lw = 1.8
+    for clade in subtree.find_clades(order="preorder"):
+        if not clade.is_terminal():
+            children_sorted = sorted(clade.clades, key=lambda c: node_y[c])
+            for i in range(len(children_sorted) - 1):
+                lower = children_sorted[i]
+                upper = children_sorted[i + 1]
+                y_lo, y_hi = node_y[lower], node_y[upper]
+                y_mid = (y_lo + y_hi) / 2.0
+                ax.plot([node_x[clade], node_x[clade]], [y_lo, y_mid],
+                        color=_branch_color(lower), linewidth=lw, solid_capstyle="butt")
+                ax.plot([node_x[clade], node_x[clade]], [y_mid, y_hi],
+                        color=_branch_color(upper), linewidth=lw, solid_capstyle="butt")
+
+        if clade is subtree.root:
+            continue
+        ax.plot(
+            [node_x[parent_map[clade]], node_x[clade]],
+            [node_y[clade], node_y[clade]],
+            color=_branch_color(clade), linewidth=lw, solid_capstyle="butt",
+        )
+
+    max_x = max(node_x.values())
+
+    # --- gain clade markers ---
+    for clade, pid in gain_clade_nodes:
+        if clade not in node_x:
+            continue
+        marker_color = _branch_color(clade)
+        ax.plot(node_x[clade], node_y[clade], "o",
+                color=marker_color, markersize=7, zorder=5)
+        if pid is not None:
+            ax.text(node_x[clade], node_y[clade] + 0.35, str(pid),
+                    ha="center", va="bottom", fontsize=7,
+                    color=marker_color, fontweight="bold")
+
+    # --- tip labels ---
+    for tip in tips_in_order:
+        color = present_color if tip.name in event_isolates else absent_color
+        ax.text(max_x * 1.01, node_y[tip], tip.name,
+                va="center", ha="left", fontsize=7, color=color)
+
+    # --- legend ---
+    import matplotlib.patches as mpatches
+    handles = [
+        mpatches.Patch(color=present_color, label="present"),
+        mpatches.Patch(color=absent_color,  label="absent"),
+        mpatches.Patch(color=COLORS["mid_blue"], label="mixed"),
+    ]
+    ax.legend(handles=handles, fontsize=11, frameon=False,
+              loc="upper left", bbox_to_anchor=(0, 1))
+
+    ax.set_title(title or f"{event_type} | {block_id} | {context}", fontsize=11, pad=4)
+    ax.set_xlabel("branch length", fontsize=12)
+    ax.tick_params(axis="x", labelsize=11)
+    ax.set_yticks([])
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.set_xlim(left=0, right=max_x * 1.35)
+    plt.tight_layout()
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        if created_fig:
+            plt.close(fig)
+    elif created_fig:
         plt.show()
 
 

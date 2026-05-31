@@ -17,17 +17,18 @@ sys.path.insert(0, str(REPO_ROOT))
 from junction_analysis.plotting import plot_pangraph_base_for_dash, add_annotations_for_dash, _rgb_str, _shades_from_base_rgb, _rgba
 from junction_analysis.consensus import find_consensus_paths_core, find_consensus_paths_edge, find_consensus_paths_refined, save_consensus_cache, load_consensus_cache
 from junction_analysis.annotate_insertions import (
-    get_insertions_deletions_from_consensus,
+    # get_insertions_deletions_from_consensus,  # replaced by new pipeline
+    detect_event_blocks,
+    group_events_by_clade,
+    find_combined_events,
     write_insertions_fasta,
-    summarize_ambiguous_insertions,
+    # summarize_ambiguous_insertions,  # no longer used
     summarize_deletions_consensus,
     summarize_inversions_consensus,
-    summarize_translocations_consensus,
     load_all_insertions_summaries,
-    load_all_ambiguous_insertions_summaries,
+    # load_all_ambiguous_insertions_summaries,  # no longer used
     load_all_deletions_summaries,
     load_all_inversions_summaries,
-    load_all_translocations_summaries,
 )
 
 import pandas as pd
@@ -272,10 +273,19 @@ def make_junction_dash_app(
     show_trna: bool = False,
     indels_base_path: str = None,
     junction_name: str = None,
+    path_dict: dict = None,
 ):
     """
     Creates a Dash app showing the pangraph with annotation toggles.
     """
+    # build nid -> suffixed block id lookup from path_dict if provided
+    nid_to_block_id = {}
+    if path_dict is not None:
+        for iso, path in path_dict.items():
+            for node in path.nodes:
+                if node.nid is not None:
+                    nid_to_block_id[str(node.nid)] = node.id
+
     def _build_fig(show_consensus):
         fig, yl, mx, inv_rects = plot_pangraph_base_for_dash(
             pan=pan,
@@ -287,6 +297,7 @@ def make_junction_dash_app(
             add_cluster_annotation=True,
             title=title,
             grey_mode=False,
+            nid_to_block_id=nid_to_block_id if nid_to_block_id else None,
         )
         fig = add_annotations_for_dash(
             fig=fig,
@@ -807,10 +818,10 @@ if __name__ == "__main__":
         #junction_name = "PLTCZQCVRD_f__RYYAQMEJGY_f"
         #junction_name = "NOAJDCSIVA_f__NZXBIFMPMA_r"
         #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
-        junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
+        #junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
         #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f" # --> look up again, its the prophage one that would get two clusters
         #junction_name = "AWYUJYFNGP_f__GCNKXNFARN_r"
-        #junction_name = "JVNRLCFAVD_f__PLTCZQCVRD_r" # example for a junction that isn't split enough
+        junction_name = "JVNRLCFAVD_f__PLTCZQCVRD_r" # example for a junction that isn't split enough
         #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # --> wild junctions with 12 clusters
         #junction_name = "OBEJYXNUDN_r__ZTHKZYHPIX_r"
         #junction_name = "AGVTAJTYER_r__OZLYYMOKWU_f" # interesting has one insertion in its own cluster and then the same one again in a different cluster but inverted
@@ -826,7 +837,7 @@ if __name__ == "__main__":
     pangraph = pp.Pangraph.from_json(str(pangraph_path))
 
     tree_path    = REPO_ROOT / "config" / "polished_tree.nwk"
-    in_del_path  = REPO_ROOT / "results" / "atb_lookup"
+    in_del_path  = REPO_ROOT / "results" / "atb_lookup_new"
 
     cache_path = REPO_ROOT / "results" / "consensus_analysis" / junction_name / "dash_cache.json"
     path_dict = None
@@ -839,7 +850,7 @@ if __name__ == "__main__":
             junction_name,
             clustering_bl_thresh=0.001,
             tree_path=str(tree_path),
-            rare_context_thresh=0.2, z_score_threshold=3.5, seq_dedup_length_threshold=0.002
+            rare_context_thresh=0.2, z_score_threshold=3.5, seq_dedup_length_threshold=0.05
         )
         # cluster_map_core, consensus_paths_core, path_dict, consensus_paths_plotting, assignment_df_plotting, *_ = find_consensus_paths_core(
         #     junction_name,
@@ -872,7 +883,7 @@ if __name__ == "__main__":
                 junction_name,
                 clustering_bl_thresh=0.001,
                 tree_path=str(tree_path),
-                rare_context_thresh=0.2, z_score_threshold=3.5, seq_dedup_length_threshold=0.002,
+                rare_context_thresh=0.2, z_score_threshold=3.5, seq_dedup_length_threshold=0.05,
             )
             # _, _, path_dict, *_ = find_consensus_paths_core(
             #     junction_name,
@@ -891,29 +902,35 @@ if __name__ == "__main__":
             #     tree_path=str(tree_path),
             # )
         for i in range(1, len(consensus_paths_plotting) + 1):
-            insertions, ambiguous_insertions, deletions, inversions, translocations, _ = \
-                get_insertions_deletions_from_consensus(
-                    assignment_df_plotting, consensus_paths_plotting, path_dict,
-                    consensus=i, junction_name=junction_name,
-                )
+            isolates_i = assignment_df_plotting[
+                assignment_df_plotting["best_consensus"] == f"consensus_{i}"
+            ].index.tolist()
+            deduplicated_paths_i = {iso: path_dict[iso] for iso in isolates_i if iso in path_dict}
+
+            df, path_dict_annotated, consensus_annotated = detect_event_blocks(
+                deduplicated_paths_i, consensus_paths_plotting[i - 1]
+            )
+            _, path_dict_annotated = group_events_by_clade(
+                df, path_dict_annotated, isolates_i,
+                tree_path=str(tree_path), method="fitch"
+            )
+            insertions, deletions, inversions = find_combined_events(
+                path_dict_annotated, consensus_annotated,
+                tree_path=str(tree_path), isolate_list=isolates_i
+            )
+
             write_insertions_fasta(junction_name, pangraph, insertions, consensus=i,
                                    save_df=True, parent_dir=str(in_del_path / "insertions"))
-            summarize_ambiguous_insertions(junction_name, pangraph, ambiguous_insertions,
-                                           consensus=i, parent_dir=str(in_del_path / "insertions"), save_df=True)
-            summarize_deletions_consensus(deletions, junction_name, pangraph, path_dict,
+            summarize_inversions_consensus(inversions, junction_name, pangraph, consensus_id=i,
+                                           parent_dir=str(in_del_path / "inversions"), save_df=True)
+            summarize_deletions_consensus(deletions, junction_name, pangraph, path_dict_annotated,
                                           assignment_df_plotting, consensus_id=i,
                                           parent_dir=str(in_del_path / "deletions"),
                                           rerun_alignment=False, save_df=True)
-            summarize_inversions_consensus(inversions, junction_name, pangraph, consensus_id=i,
-                                           parent_dir=str(in_del_path / "inversions"), save_df=True)
-            summarize_translocations_consensus(translocations, junction_name, pangraph, consensus_id=i,
-                                               parent_dir=str(in_del_path / "translocations"), save_df=True)
 
         load_all_insertions_summaries(str(in_del_path / "insertions"), junction_name, save_df=True)
-        load_all_ambiguous_insertions_summaries(str(in_del_path / "insertions"), junction_name, save_df=True)
         load_all_deletions_summaries(str(in_del_path / "deletions"), junction_name, save_df=True)
         load_all_inversions_summaries(str(in_del_path / "inversions"), junction_name, save_df=True)
-        load_all_translocations_summaries(str(in_del_path / "translocations"), junction_name, save_df=True)
         print("Indel summaries computed and saved.")
     elif not _all_ins_summary.exists():
         print(
@@ -935,6 +952,7 @@ if __name__ == "__main__":
         initial_selection=(*(["mges"] if mges_gff_path is not None else []), "indels"),
         indels_base_path=str(in_del_path),
         show_indels=True,
+        path_dict=path_dict,
         show_trna=True,
         junction_name=junction_name,
     )

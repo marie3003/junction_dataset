@@ -2,6 +2,7 @@ from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
+from Bio import Phylo
 
 import os
 import subprocess
@@ -15,22 +16,673 @@ from Bio.SeqRecord import SeqRecord
 from pathlib import Path
 
 from junction_analysis.helpers import get_isolate_sequence, get_consensus_seq_from_alignment, read_gff3_annotations
+from junction_analysis.consensus import build_subtree
 from junction_analysis import pangraph_utils as pu
 from junction_analysis.junction_trees import build_tree_from_block_list
 
+def detect_event_blocks(deduplicated_paths, consensus_path):  # noqa: C901
+    """
+    Detect insertions, deletions, and inversions block by block for each
+    isolate vs. the consensus path.
+
+    Uses the same anchor/context matching as get_insertions_deletions_v2 to
+    identify which (block_id, context) pairs correspond across paths.
+
+    Each consensus block at position i gets a position-unique ID
+    ``"{block.id}_{i}"`` used as context anchor.
+
+    Context assignment per event type
+    ----------------------------------
+    deletions / inversions
+        Context = uid of the consensus block immediately to the left.
+    insertions
+        Context is derived from the nearest non-inserted block to the left
+        in the isolate path:
+          - Left block is *matched*: use its consensus position, then walk
+            right over any contiguous deleted blocks; use the furthest
+            deleted block's uid (or the matched block's uid if none).
+          - Left block is *inverted*, right neighbour also inverted
+            (within the inversion): use the right inverted block's
+            consensus position (inversion flips ordering) and apply the
+            same rightward deletion scan.
+          - Left block is *inverted*, right neighbour matched or absent
+            (at the end of the inversion): walk further left through the
+            inversion run to find its first block, then apply the
+            rightward deletion scan.
+
+    Annotated path outputs
+    ----------------------
+    Every node in both the isolate and consensus paths is represented as a
+    ``DeduplicatedNode(id, strand, context, nid)`` and collected into
+    ``Path`` objects.  For isolate nodes, the context encodes position
+    relative to the consensus (matched blocks get the uid of the consensus
+    block to their left; event blocks get the context computed above).
+    These annotated paths are the primary input to ``merge_event_blocks``.
+
+    Parameters
+    ----------
+    deduplicated_paths : dict[str, pu.Path]
+    consensus_path     : pu.Path
+
+    Returns
+    -------
+    events_df : pd.DataFrame
+        Columns: event_type, isolate, block_id, context, nid.
+        One row per event block per isolate.
+    iso_annotated_paths : dict[str, pu.Path]
+        Per-isolate ``Path`` of ``DeduplicatedNode`` covering every block
+        in the isolate path (matched, inverted, and inserted).
+    consensus_annotated : pu.Path
+        ``Path`` of ``DeduplicatedNode`` for the consensus, with each
+        node's context set to the uid of its left neighbour.
+    """
+    c_nodes = list(consensus_path.nodes)
+    # unique position IDs for every consensus slot
+    c_uid = [f"{n.id}_{i}" for i, n in enumerate(c_nodes)]
+
+    # annotated consensus path — each block as DeduplicatedNode with left-neighbour as context
+    consensus_annotated = pu.Path([
+        pu.DeduplicatedNode(n.id, n.strand, c_uid[j - 1] if j > 0 else "", n.nid)
+        for j, n in enumerate(c_nodes)
+    ])
+
+    rows = []
+    iso_annotated_paths = {}   # isolate -> Path of DeduplicatedNode
+
+    for isolate, path in deduplicated_paths.items():
+        iso_nodes = list(path.nodes)
+
+        # ------------------------------------------------------------------ #
+        # Anchor / context assignment (identical to get_insertions_deletions_v2)
+        # ------------------------------------------------------------------ #
+        c_id_counts   = Counter(n.id for n in c_nodes)
+        iso_id_counts = Counter(n.id for n in iso_nodes)
+        c_id_to_strand   = {n.id: n.strand for n in c_nodes   if c_id_counts[n.id]   == 1}
+        iso_id_to_strand = {n.id: n.strand for n in iso_nodes if iso_id_counts[n.id] == 1}
+
+        def _candidate_anchor_ids(excluded=frozenset()):
+            return {
+                bid for bid in c_id_counts
+                if c_id_counts[bid] == 1
+                and iso_id_counts.get(bid, 0) == 1
+                and c_id_to_strand.get(bid) == iso_id_to_strand.get(bid)
+                and bid not in excluded
+            }
+
+        def _assign_ctx(nodes, anchor_ids):
+            cur = None
+            ctxs = []
+            region_counts = Counter()
+            for i, n in enumerate(nodes):
+                base_ctx = "" if (i == 0 or cur is None) else str(cur)
+                region_counts[n.id] += 1
+                count = region_counts[n.id]
+                ctx = base_ctx if count == 1 else f"{base_ctx}_{count}"
+                ctxs.append(ctx)
+                if n.id in anchor_ids:
+                    if cur != n.id:
+                        region_counts = Counter()
+                    cur = n.id
+            return ctxs
+
+        def _detect_translocations_iterative(initial_anchor_ids):
+            translocated_ids = set()
+            excluded = set()
+            while True:
+                anchor_ids = initial_anchor_ids - excluded
+                c_ctxs_tmp   = _assign_ctx(c_nodes,   anchor_ids)
+                iso_ctxs_tmp = _assign_ctx(iso_nodes, anchor_ids)
+                c_ic   = {(n.id, ctx): n.strand for n, ctx in zip(c_nodes,   c_ctxs_tmp)}
+                iso_ic = {(n.id, ctx): n.strand for n, ctx in zip(iso_nodes, iso_ctxs_tmp)}
+                matched_tmp = {k for k in c_ic if k in iso_ic}
+                c_ctx_by_id = defaultdict(list)
+                for n, ctx in zip(c_nodes, c_ctxs_tmp):
+                    if (n.id, ctx) not in matched_tmp:
+                        c_ctx_by_id[n.id].append(ctx)
+                new_id = None
+                for n, ctx in zip(iso_nodes, iso_ctxs_tmp):
+                    if (n.id, ctx) in matched_tmp:
+                        continue
+                    if c_ctx_by_id.get(n.id) and n.id not in translocated_ids:
+                        c_ctx_by_id[n.id].pop(0)
+                        new_id = n.id
+                        break
+                if new_id is None:
+                    break
+                translocated_ids.add(new_id)
+                excluded.add(new_id)
+            return translocated_ids
+
+        preliminary_trans_ids = _detect_translocations_iterative(_candidate_anchor_ids())
+        anchor_ids = _candidate_anchor_ids(excluded=preliminary_trans_ids)
+        c_ctxs   = _assign_ctx(c_nodes,   anchor_ids)
+        iso_ctxs = _assign_ctx(iso_nodes, anchor_ids)
+
+        c_key_to_strand   = {(n.id, ctx): n.strand for n, ctx in zip(c_nodes,   c_ctxs)}
+        iso_key_to_strand = {(n.id, ctx): n.strand for n, ctx in zip(iso_nodes, iso_ctxs)}
+        iso_key_to_nid    = {(n.id, ctx): n.nid    for n, ctx in zip(iso_nodes, iso_ctxs)}
+        c_key_to_pos      = {(n.id, ctx): j        for j, (n, ctx) in enumerate(zip(c_nodes, c_ctxs))}
+
+        # ------------------------------------------------------------------ #
+        # Pass 1: walk consensus → deletions and inversions
+        # ------------------------------------------------------------------ #
+        inverted_keys         = set()   # (id, ctx) keys that are inverted in isolate
+        deleted_c_positions   = set()   # consensus positions that are deleted in isolate
+        inv_key_to_ctx        = {}      # (id, ctx) -> left_ctx for inverted keys
+        predecessor_of_deleted = defaultdict(list)  # predecessor_key -> [c_pos j, ...]
+        leading_deleted        = []     # deleted positions with no non-deleted predecessor
+        last_non_del_key       = None   # most recent matched or inverted key
+
+        for j, (n, ctx) in enumerate(zip(c_nodes, c_ctxs)):
+            key       = (n.id, ctx)
+            left_ctx  = c_uid[j - 1] if j > 0 else ""
+            iso_strand = iso_key_to_strand.get(key)
+
+            # doesn't exist in isolate path means lookup gives None
+            if iso_strand is None:
+                deleted_c_positions.add(j)
+                rows.append({"event_type": "deletion",  "isolate": isolate, "block_id": n.id, "strand": n.strand, "context": left_ctx, "nid": pd.NA})
+                if last_non_del_key is not None:
+                    predecessor_of_deleted[last_non_del_key].append(j)
+                else:
+                    leading_deleted.append(j)
+            elif iso_strand != n.strand:
+                inverted_keys.add(key)
+                inv_key_to_ctx[key] = left_ctx
+                rows.append({"event_type": "inversion", "isolate": isolate, "block_id": n.id, "strand": n.strand, "context": left_ctx, "nid": iso_key_to_nid.get(key)})
+                last_non_del_key = key
+            else:
+                last_non_del_key = key
+
+        # ------------------------------------------------------------------ #
+        # Pass 2: walk isolate → build DeduplicatedNode path + insertions   #
+        # Classify each node as matched / inverted / inserted, compute its  #
+        # context, and emit insertion rows on the fly.                       #
+        # ------------------------------------------------------------------ #
+        def _ctx_from_c_pos(c_pos):
+            """Consensus uid at c_pos, walking right over contiguous deletions."""
+            furthest = None
+            for p in range(c_pos + 1, len(c_nodes)):
+                if p in deleted_c_positions:
+                    furthest = p
+                else:
+                    break
+            return c_uid[furthest] if furthest is not None else c_uid[c_pos]
+
+        # first pass: classify every node so left/right neighbour lookups work
+        iso_status = []
+        for n, ctx in zip(iso_nodes, iso_ctxs):
+            key = (n.id, ctx)
+            if key in inverted_keys:
+                iso_status.append("inversion")
+            elif key in c_key_to_strand and c_key_to_strand[key] == n.strand:
+                iso_status.append("matched")
+            else:
+                iso_status.append("insertion")
+
+        def _del_node(j):
+            """Build a deleted DeduplicatedNode from consensus position j."""
+            cn = c_nodes[j]
+            left_ctx = c_uid[j - 1] if j > 0 else ""
+            return pu.DeduplicatedNode(cn.id, cn.strand, left_ctx, cn.nid, type="deletion")
+
+        # prepend any deleted blocks that have no non-deleted predecessor
+        dedup_nodes = [_del_node(j) for j in leading_deleted]
+
+        for i, (n, ctx) in enumerate(zip(iso_nodes, iso_ctxs)):
+            key       = (n.id, ctx)
+            node_type = iso_status[i]
+
+            if node_type == "inversion":
+                node_ctx = inv_key_to_ctx[key]
+                # deleted blocks whose predecessor is this inverted block go BEFORE it
+                pre_deleted = [_del_node(j) for j in predecessor_of_deleted.get(key, [])]
+                dedup_nodes.extend(pre_deleted)
+                dedup_nodes.append(pu.DeduplicatedNode(n.id, n.strand, node_ctx, n.nid, type=node_type))
+
+            elif node_type == "insertion":
+                left_idx  = next((k for k in range(i - 1, -1,            -1) if iso_status[k] != "insertion"), None)
+                right_idx = next((k for k in range(i + 1, len(iso_nodes))    if iso_status[k] != "insertion"), None)
+
+                if left_idx is None:
+                    node_ctx = ""
+                elif iso_status[left_idx] == "matched":
+                    c_pos_   = c_key_to_pos.get((iso_nodes[left_idx].id, iso_ctxs[left_idx]))
+                    node_ctx = _ctx_from_c_pos(c_pos_) if c_pos_ is not None else ""
+                else:
+                    # left is inverted
+                    if right_idx is not None and iso_status[right_idx] == "inversion":
+                        c_pos_   = c_key_to_pos.get((iso_nodes[right_idx].id, iso_ctxs[right_idx]))
+                        node_ctx = _ctx_from_c_pos(c_pos_) if c_pos_ is not None else ""
+                    else:
+                        first_inv = left_idx
+                        for k in range(left_idx - 1, -1, -1):
+                            if iso_status[k] == "inversion":
+                                first_inv = k
+                            elif iso_status[k] == "matched":
+                                break
+                        c_pos_   = c_key_to_pos.get((iso_nodes[first_inv].id, iso_ctxs[first_inv]))
+                        node_ctx = _ctx_from_c_pos(c_pos_) if c_pos_ is not None else ""
+
+                rows.append({"event_type": "insertion", "isolate": isolate, "block_id": n.id, "strand": n.strand, "context": node_ctx, "nid": n.nid})
+                dedup_nodes.append(pu.DeduplicatedNode(n.id, n.strand, node_ctx, n.nid, type=node_type))
+
+            else:  # matched
+                c_pos_   = c_key_to_pos.get(key)
+                node_ctx = c_uid[c_pos_ - 1] if (c_pos_ is not None and c_pos_ > 0) else ""
+                dedup_nodes.append(pu.DeduplicatedNode(n.id, n.strand, node_ctx, n.nid, type=node_type))
+                # deleted blocks whose predecessor is this matched block go AFTER it
+                post_deleted = [_del_node(j) for j in predecessor_of_deleted.get(key, [])]
+                dedup_nodes.extend(post_deleted)
+
+        iso_annotated_paths[isolate] = pu.Path(dedup_nodes)
+
+    cols = ["event_type", "isolate", "block_id", "strand", "context", "nid"]
+    df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    return df, iso_annotated_paths, consensus_annotated
+
+
+def group_events_by_clade(events_df, iso_annotated_paths, isolate_list,
+                          tree_path="../config/polished_tree.nwk",
+                          method="fitch"):
+    """
+    Group detected events into clades according to the phylogeny, and annotate
+    the isolate paths with the resolved ``parent_clade_id`` for every
+    non-matched node.
+
+    For each unique (event_type, block_id, context) combination, the isolates
+    carrying the event are mapped onto the subtree and clades are identified
+    using one of two methods:
+
+    method="maximal_clades"
+        Strict: finds maximally connected subtrees where ALL tips carry the
+        event. Any absent tip breaks the clade into smaller pieces. Can
+        over-split when losses occur within an otherwise positive clade.
+
+    method="fitch" (default)
+        Runs binary Fitch parsimony (0=absent, 1=present) with a bottom-up
+        pass to assign state sets and a top-down pass to resolve ambiguous
+        nodes. Each 0→1 gain edge defines one independent event acquisition;
+        the clade below that edge (restricted to tips that actually carry the
+        event) is returned as one row. Allows losses within a gain clade, so
+        it merges clades that would be split by the maximal_clades approach.
+
+    Parameters
+    ----------
+    events_df : pd.DataFrame
+        Output of detect_event_blocks().
+    iso_annotated_paths : dict[str, pu.Path]
+        Output of detect_event_blocks(). Nodes will be updated in-place with
+        their resolved ``parent_clade_id``.
+    isolate_list : list[str]
+        All isolates in the cluster (used to build the subtree).
+    tree_path : str
+        Path to the full Newick phylogeny.
+    method : {"fitch", "maximal_clades"}
+
+    Returns
+    -------
+    clade_df : pd.DataFrame
+        Columns: event_type, block_id, strand, context, clade_isolates,
+        clade_branch_length, parent_clade_id.
+        One row per independent clade/gain per event.
+    iso_annotated_paths : dict[str, pu.Path]
+        Same dict as the input, with ``parent_clade_id`` set on every
+        inserted, deleted, and inverted node.
+    """
+    tree = Phylo.read(tree_path, "newick")
+    subtree = build_subtree(tree, isolate_list)
+
+    def _total_branch_length(clade):
+        return sum(
+            c.branch_length for c in clade.find_clades()
+            if c.branch_length is not None
+        )
+
+    # assign a unique integer index to every internal node (preorder)
+    node_index = {}
+    idx = 0
+    for clade in subtree.find_clades(order="preorder"):
+        if not clade.is_terminal():
+            node_index[clade] = idx
+            idx += 1
+
+    # build parent map once, shared by both methods
+    parent_map = {}
+    for clade in subtree.find_clades(order="preorder"):
+        for child in clade.clades:
+            parent_map[child] = clade
+
+    def _maximal_clades(event_isolates):
+        event_set = set(event_isolates)
+        result = []
+
+        def _walk(clade):
+            if all(tip.name in event_set for tip in clade.get_terminals()):
+                tips = [tip.name for tip in clade.get_terminals()]
+                result.append((
+                    tips,
+                    _total_branch_length(clade),
+                    clade.name,
+                ))
+            else:
+                for child in clade.clades:
+                    _walk(child)
+
+        _walk(subtree.root)
+        return result
+
+    def _fitch_clades(event_isolates):
+        event_set = set(event_isolates)
+
+        # bottom-up: assign Fitch state sets
+        state = {}
+        for clade in subtree.find_clades(order="postorder"):
+            if clade.is_terminal():
+                state[clade] = {1} if clade.name in event_set else {0}
+            else:
+                child_sets = [state[c] for c in clade.clades]
+                inter = set.intersection(*child_sets)
+                state[clade] = inter if inter else set.union(*child_sets)
+
+        # precompute fraction of event-carrying tips below each node
+        tip_fraction = {}
+        for clade in subtree.find_clades(order="postorder"):
+            tips = clade.get_terminals()
+            tip_fraction[clade] = sum(1 for t in tips if t.name in event_set) / len(tips)
+
+        # top-down: resolve ambiguous nodes
+        # unambiguous nodes take their Fitch state; ambiguous nodes resolve
+        # towards 1 (present) if the majority of tips below carry the event,
+        # otherwise follow the parent state.
+
+        resolved = {subtree.root: 0 if 0 in state[subtree.root] else 1}
+        for clade in subtree.find_clades(order="preorder"):
+            if clade is subtree.root:
+                continue
+            if len(state[clade]) == 1:
+                resolved[clade] = next(iter(state[clade]))  # unambiguous
+            else:
+                # ambiguous: majority vote on tips below
+                resolved[clade] = 1 if tip_fraction[clade] > 0.5 else resolved[parent_map[clade]]
+
+        # collect all gain edges (parent=0 → child=1)
+        gain_clades = [
+            clade for clade in subtree.find_clades(order="preorder")
+            if clade is not subtree.root
+            and resolved[parent_map[clade]] == 0
+            and resolved[clade] == 1
+        ]
+        gain_clade_set = {id(c) for c in gain_clades}
+
+        def _exclusive_tips(clade, top=True):
+            """Tips under clade that are not under any nested gain clade."""
+            if not top and id(clade) in gain_clade_set:
+                return []
+            if clade.is_terminal():
+                return [clade.name] if clade.name in event_set else []
+            tips = []
+            for child in clade.clades:
+                tips.extend(_exclusive_tips(child, top=False))
+            return tips
+
+        result = []
+        for clade in gain_clades:
+            tips = _exclusive_tips(clade)
+            if tips:
+                mrca = subtree.common_ancestor(tips)
+                result.append((tips, _total_branch_length(clade), mrca.name))
+
+        return result
+
+    _group_fn = _fitch_clades if method == "fitch" else _maximal_clades
+
+    rows = []
+    # (event_type, block_id, strand, context, isolate) -> parent_clade_id
+    evt_to_clade = {}
+
+    for (event_type, block_id, strand, context), group in events_df.groupby(
+        ["event_type", "block_id", "strand", "context"]
+    ):
+        event_isolates = group["isolate"].tolist()
+        for clade_isolates, clade_bl, parent_id in _group_fn(event_isolates):
+            rows.append({
+                "event_type":          event_type,
+                "block_id":            block_id,
+                "strand":              strand,
+                "context":             context,
+                "clade_isolates":      clade_isolates,
+                "clade_branch_length": clade_bl,
+                "parent_clade_id":     parent_id,
+            })
+            for iso in clade_isolates:
+                evt_to_clade[(event_type, block_id, strand, context, iso)] = parent_id
+
+    clade_df = pd.DataFrame(rows, columns=["event_type", "block_id", "strand", "context", "clade_isolates", "clade_branch_length", "parent_clade_id"])
+
+    # annotate iso_annotated_paths in-place
+    for isolate, path in iso_annotated_paths.items():
+        for dn in path.nodes:
+            if dn.type in ("insertion", "deletion", "inversion"):
+                dn.parent_clade_id = evt_to_clade.get((dn.type, dn.id, dn.strand, dn.context, isolate))
+
+    return clade_df, iso_annotated_paths
+
+
+def find_combined_events(  # noqa: C901
+    iso_annotated_paths,
+    consensus_annotated,
+    tree_path,
+    isolate_list,
+):
+    """
+    Walk each annotated isolate path and combine adjacent per-block events of
+    the same type and ``parent_clade_id`` into longer events.
+
+    Requires that ``group_events_by_clade`` has already been called so that
+    every non-matched node in ``iso_annotated_paths`` carries a
+    ``parent_clade_id``.
+
+    The tree is read to resolve ancestor/descendant relationships between
+    ``parent_clade_id`` values, which governs which nodes may be skipped over
+    without interrupting a running event group.
+
+    Combination rules
+    -----------------
+    deletions  (walk isolate path left-to-right; deleted nodes are consecutive
+                in the consensus because ``detect_event_blocks`` places them
+                after/before their predecessor)
+        Continue : same ``parent_clade_id`` and type "deletion".
+        Jump     : a deleted node whose ``parent_clade_id`` is an *ancestor* of
+                   the current group's clade (higher in the tree, i.e. the
+                   current deletion is a refinement of a broader deletion).
+        Interrupt: any matched, inverted, or inserted node.
+
+    inversions  (walk isolate path left-to-right)
+        Continue : same ``parent_clade_id`` and type "inversion".
+        Jump     : deleted or inserted nodes (regardless of clade).
+        Interrupt: any matched node.
+
+    insertions  (walk isolate path left-to-right)
+        Continue : same ``parent_clade_id`` and type "insertion".
+        Jump     : inserted nodes whose ``parent_clade_id`` is a *descendant*
+                   of the current group's clade (closer to the tips).
+        Interrupt: matched or inverted nodes, or an inserted node whose
+                   ``parent_clade_id`` is an ancestor of the current group's
+                   clade.
+
+    Parameters
+    ----------
+    iso_annotated_paths : dict[str, pu.Path]
+        Output of ``group_events_by_clade`` — every node carries ``.type``
+        and, for event nodes, ``.parent_clade_id``.
+    consensus_annotated : pu.Path
+        Output of ``detect_event_blocks`` (used only to look up consensus
+        positions for deletion ordering).
+    tree_path : str
+        Path to the full Newick phylogeny.
+    isolate_list : list[str]
+        All isolates in the cluster (used to build the subtree).
+
+    Returns
+    -------
+    insertions : dict[str, list[pu.Path]]
+    deletions  : dict[str, list[pu.Path]]
+    inversions : dict[str, list[pu.Path]]
+    """
+    # ---------------------------------------------------------------------- #
+    # Build ancestor / descendant helpers from the subtree                   #
+    # ---------------------------------------------------------------------- #
+    tree = Phylo.read(tree_path, "newick")
+    subtree = build_subtree(tree, isolate_list)
+
+    parent_name = {
+        child.name: clade.name
+        for clade in subtree.find_clades(order="preorder")
+        for child in clade.clades
+        if child.name
+    }
+    ancestor_map = {}   # node_name -> frozenset of all ancestor names (inclusive)
+    for clade in subtree.find_clades():
+        if not clade.name:
+            continue
+        ancs, cur = set(), clade.name
+        while cur:
+            ancs.add(cur)
+            cur = parent_name.get(cur)
+        ancestor_map[clade.name] = frozenset(ancs)
+
+    def is_ancestor(a, b):
+        """True if a is an ancestor of (or equal to) b."""
+        return bool(a and b and a in ancestor_map.get(b, frozenset()))
+
+    def is_descendant(a, b):
+        """True if a is a descendant of (or equal to) b."""
+        return bool(a and b and b in ancestor_map.get(a, frozenset()))
+
+    # ---------------------------------------------------------------------- #
+    # Walk each isolate path                                                  #
+    # ---------------------------------------------------------------------- #
+    insertions: dict = {}
+    deletions:  dict = {}
+    inversions: dict = {}
+
+    for isolate, iso_path in iso_annotated_paths.items():
+        nodes = iso_path.nodes
+
+        def _flush(open_groups, result):
+            """Emit all open groups into result and clear them."""
+            for cl, grp in open_groups.items():
+                if grp:
+                    result.setdefault(isolate, []).append(pu.Path(grp))
+            open_groups.clear()
+
+        # ---- deletions --------------------------------------------------- #
+        # open_del: clade_id -> list[dn]  (one open group per active clade)
+        # A node with an ancestor clade is a "jump" for the current group but
+        # continues its own open group — so we keep multiple groups alive.
+        # Any matched/inverted/inserted node interrupts ALL open groups.
+        open_del: dict = {}
+        for dn in nodes:
+            t = dn.type or "matched"
+            if t == "deletion":
+                cl = dn.parent_clade_id
+                # close any open group whose clade is a descendant of cl
+                # (a broader deletion arrived — the narrower one is done)
+                to_close = [c for c in open_del if is_descendant(c, cl) and c != cl]
+                for c in to_close:
+                    deletions.setdefault(isolate, []).append(pu.Path(open_del.pop(c)))
+                open_del.setdefault(cl, []).append(dn)
+            else:
+                # matched / inverted / inserted — interrupt all
+                _flush(open_del, deletions)
+        _flush(open_del, deletions)
+
+        # ---- inversions -------------------------------------------------- #
+        # deleted and inserted nodes are jumped: they don't belong to the
+        # inversion group but don't break it either.  They are handled by
+        # their own deletion/insertion passes above/below.
+        # Multiple simultaneous inversion groups at different clades are
+        # kept alive in open_inv.
+        open_inv: dict = {}
+        for dn in nodes:
+            t = dn.type or "matched"
+            if t == "inversion":
+                cl = dn.parent_clade_id
+                open_inv.setdefault(cl, []).append(dn)
+            elif t in ("deletion", "insertion"):
+                pass  # jump — each is handled by its own pass
+            else:
+                # matched — interrupt all open inversion groups
+                _flush(open_inv, inversions)
+        _flush(open_inv, inversions)
+
+        # ---- insertions -------------------------------------------------- #
+        # A descendant-clade insertion is a "jump" for the current group but
+        # continues its own open group.  An ancestor-clade insertion closes
+        # descendant groups and continues/starts the ancestor group.
+        # matched / inverted interrupts all.
+        #
+        # Nested-context rule: when a new lower-level (descendant-clade) group
+        # starts, scan back through the current contiguous insertion-only
+        # streak (any matched/deleted/inverted node resets the streak).  If a
+        # higher-level (ancestor-clade) insertion is found within that streak,
+        # every node in the new lower-level group gets its context set to that
+        # node's block id — placing the nested insertion relative to its
+        # surrounding insertion rather than the original consensus position.
+        open_ins: dict = {}
+        nested_ctx: dict = {}   # cl -> context string to apply to all nodes in group
+        ins_streak: list = []   # insertion nodes seen since last non-insertion node
+        for dn in nodes:
+            t = dn.type or "matched"
+            if t == "insertion":
+                cl = dn.parent_clade_id
+                # close any open group whose clade is a descendant of cl
+                to_close = [c for c in open_ins if is_descendant(c, cl) and c != cl]
+                for c in to_close:
+                    insertions.setdefault(isolate, []).append(pu.Path(open_ins.pop(c)))
+                    nested_ctx.pop(c, None)
+                # when a new group starts, look back through the unbroken
+                # insertion streak for the last ancestor-clade node
+                if cl not in open_ins:
+                    last_higher = next(
+                        (prev for prev in reversed(ins_streak)
+                         if prev.parent_clade_id and prev.parent_clade_id != cl
+                         and is_ancestor(prev.parent_clade_id, cl)),
+                        None,
+                    )
+                    if last_higher is not None:
+                        nested_ctx[cl] = last_higher.id
+                # apply nested context to every node in a nested group
+                if cl in nested_ctx:
+                    dn.context = nested_ctx[cl]
+                open_ins.setdefault(cl, []).append(dn)
+                ins_streak.append(dn)
+            elif t == "deletion":
+                ins_streak = []  # deletion breaks the contiguous insertion streak
+            else:
+                # matched / inverted — interrupt all
+                _flush(open_ins, insertions)
+                nested_ctx.clear()
+                ins_streak = []
+        _flush(open_ins, insertions)
+
+    return insertions, deletions, inversions
+
+
 def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C901
-    """Identify insertions, deletions, inversions, and translocations.
+    """Identify insertions, deletions, and inversions.
 
     For each (consensus, isolate) pair, context is recomputed locally:
     each block gets the id of the nearest anchor block to its left as context.
     Anchors are block ids that appear exactly once in both paths with the same
-    strand. If an anchor id equals the block id being assigned context, "_1" is
-    appended to keep (block_id, context) unique. The first block always gets
-    empty context.
+    strand. Translocated block ids are excluded from anchors so their context
+    differs, causing them to be detected as insertions (isolate side) and
+    deletions (consensus side) rather than as a separate event type.
 
     Detection (three passes):
-      Pass 1 (isolate):   insertions and translocations
-      Pass 2 (consensus): deletions
+      Pass 1 (isolate):   insertions (including translocated blocks)
+      Pass 2 (consensus): deletions (including consensus positions of translocated blocks)
       Pass 3 (isolate):   inversions
 
     Arguments:
@@ -38,16 +690,16 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         consensus_path: Path object representing the consensus path
 
     Returns:
-        insertions:     dict of isolate -> list of pu.Path objects
-        deletions:      dict of isolate -> list of dicts {"path": pu.Path, "left_nid": ...}
-        inversions:     dict of isolate -> list of pu.Path objects
-        translocations: dict of isolate -> list of pu.Path objects
+        insertions:          dict of isolate -> list of dicts {"path": pu.Path, "ctx": ...}
+        ambiguous_insertions: dict of isolate -> list of dicts
+        deletions:           dict of isolate -> list of dicts {"path": pu.Path, "left_nid": ...}
+        inversions:          dict of isolate -> list of dicts {"path": pu.Path, "ctx": ...}
+        context_stats:       list of per-isolate stat dicts
     """
     insertions            = {}
     ambiguous_insertions  = {}
     deletions             = {}
     inversions            = {}
-    translocations        = {}
     context_stats         = []  # one dict per isolate
 
     for isolate, path in deduplicated_paths.items():
@@ -151,11 +803,6 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         iso_n_blocks, iso_n_ambiguous = _count_ambiguous(iso_nodes, iso_ctxs)
         iso_n_duplicated = sum(1 for n in iso_nodes if iso_id_counts[n.id] > 1)
 
-        c_ctx_by_id = defaultdict(list)
-        for n, ctx in zip(c_nodes, c_ctxs):
-            if (n.id, ctx) not in matched:
-                c_ctx_by_id[n.id].append(ctx)
-
         def _base_ctx(ctx):
             parts = ctx.rsplit("_", 1)
             if len(parts) == 2 and parts[1].isdigit():
@@ -169,20 +816,19 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
         iso_id_ctx_to_node = {(n.id, ctx): n for n, ctx in zip(iso_nodes, iso_ctxs)}
 
         # ------------------------------------------------------------------ #
-        # Pass 1: walk isolate — insertions and translocations               #
+        # Pass 1: walk isolate — insertions                                  #
+        # Translocated blocks are excluded from anchors (above) so their    #
+        # context differs from the consensus; they are detected as           #
+        # insertions here and their consensus counterpart as a deletion      #
+        # in Pass 2.                                                         #
         # ------------------------------------------------------------------ #
         current_insertion     = []
         current_insertion_first_ctx = None
         current_ins_has_dup_ambiguous = False
-        current_translocation = []
-        current_translocation_first_ctx = None
-        current_trans_has_ambiguous = False
-        insertion_or_translocation_id_ctxs = set()
+        non_consensus_id_ctxs = set()
 
         n_insertions_isolate = 0
         n_ambiguous_ins_isolate = 0
-        n_trans_isolate = 0
-        n_ambiguous_trans_isolate = 0
 
         def flush_ins():
             nonlocal current_insertion, current_insertion_first_ctx
@@ -206,64 +852,26 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 current_insertion_first_ctx = None
                 current_ins_has_dup_ambiguous = False
 
-        def flush_trans():
-            nonlocal current_translocation, current_translocation_first_ctx
-            nonlocal n_trans_isolate, n_ambiguous_trans_isolate, current_trans_has_ambiguous
-
-            if current_translocation:
-                translocations.setdefault(isolate, []).append({
-                    "path": pu.Path(list(current_translocation)),
-                    "ctx": current_translocation_first_ctx,
-                })
-                n_trans_isolate += 1
-
-                if current_trans_has_ambiguous:
-                    n_ambiguous_trans_isolate += 1
-
-                current_translocation = []
-                current_translocation_first_ctx = None
-                current_trans_has_ambiguous = False
-
         for n, ctx in zip(iso_nodes, iso_ctxs):
             if (n.id, ctx) in matched:
                 flush_ins()
-                flush_trans()
                 continue
 
-            avail = c_ctx_by_id.get(n.id, [])
+            matched.add((n.id, ctx))
 
-            if avail:
-                if len(avail) > 1:
-                    current_trans_has_ambiguous = True
+            if not current_insertion:
+                current_insertion_first_ctx = ctx
 
-                c_ctx = avail.pop(0)
-                matched.add((n.id, c_ctx))
-                matched.add((n.id, ctx))
+            # ambiguous if this block exists in the consensus under the same anchor
+            # region (same base context, different count) — likely a duplication of
+            # a consensus block rather than a genuine insertion
+            if _base_ctx(ctx) in c_id_to_base_ctxs.get(n.id, set()):
+                current_ins_has_dup_ambiguous = True
 
-                flush_ins()
-
-                if not current_translocation:
-                    current_translocation_first_ctx = ctx
-
-                current_translocation.append(n)
-                insertion_or_translocation_id_ctxs.add((n.id, ctx))
-
-            else:
-                matched.add((n.id, ctx))
-
-                flush_trans()
-
-                if not current_insertion:
-                    current_insertion_first_ctx = ctx
-
-                if _base_ctx(ctx) in c_id_to_base_ctxs.get(n.id, set()):
-                    current_ins_has_dup_ambiguous = True
-
-                current_insertion.append(n)
-                insertion_or_translocation_id_ctxs.add((n.id, ctx))
+            current_insertion.append(n)
+            non_consensus_id_ctxs.add((n.id, ctx))
 
         flush_ins()
-        flush_trans()
 
         context_stats.append(dict(
             isolate=isolate,
@@ -272,8 +880,6 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
             n_ambiguous_blocks=iso_n_ambiguous,
             n_insertions=n_insertions_isolate,
             n_ambiguous_insertions=n_ambiguous_ins_isolate,
-            n_translocations=n_trans_isolate,
-            n_ambiguous_translocations=n_ambiguous_trans_isolate,
         ))
 
         # ------------------------------------------------------------------ #
@@ -331,8 +937,8 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
                 current_inversion_first_ctx = None
 
         for n, ctx in zip(iso_nodes, iso_ctxs):
-            if (n.id, ctx) in insertion_or_translocation_id_ctxs:
-                # Part of an insertion or translocation — skip without flushing
+            if (n.id, ctx) in non_consensus_id_ctxs:
+                # Part of an insertion — skip without flushing
                 # so it does not interrupt a surrounding inversion.
                 continue
 
@@ -348,7 +954,7 @@ def get_insertions_deletions_v2(deduplicated_paths, consensus_path):  # noqa: C9
 
         flush_inv()
 
-    return insertions, ambiguous_insertions, deletions, inversions, translocations, context_stats
+    return insertions, ambiguous_insertions, deletions, inversions, context_stats
 
 
 def write_segment_fasta(example_junction, isolate_name, segment_name, consensus, sequence, path, parent_dir):
@@ -374,9 +980,8 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
     os.makedirs(out_dir, exist_ok=True)
 
     for isolate, inserted_paths in insertions.items():
-        for idx, ins_entry in enumerate(inserted_paths):
-            inserted_path = ins_entry["path"]
-            ctx = ins_entry["ctx"]
+        for idx, inserted_path in enumerate(inserted_paths):
+            parent_clade_id = inserted_path.nodes[0].parent_clade_id if inserted_path.nodes else None
             start_pos = pangraph.nodes[inserted_path.nodes[0].nid].start
             end_pos = pangraph.nodes[inserted_path.nodes[-1].nid].end
 
@@ -401,7 +1006,7 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
                     "strand": "+" if inserted_path.nodes[0].strand else "-",
                     "start_pos": start_pos,
                     "end_pos": end_pos,
-                    "ctx": ctx,
+                    "parent_clade_id": parent_clade_id,
                 }
             )
 
@@ -457,7 +1062,7 @@ def summarize_ambiguous_insertions(example_junction, pangraph, ambiguous_inserti
     return ambiguous_insertions_df
 
 
-def print_insertions_deletions(insertions, deletions, inversions=None, translocations=None):
+def print_insertions_deletions(insertions, deletions, inversions=None):
     def _path(entry):
         return entry["path"] if isinstance(entry, dict) else entry
 
@@ -479,12 +1084,6 @@ def print_insertions_deletions(insertions, deletions, inversions=None, transloca
             for seg in segs:
                 print(isolate, "INVERTED:", _path(seg))
 
-    if translocations:
-        print("\nTranslocations:")
-        for isolate, segs in translocations.items():
-            for seg in segs:
-                print(isolate, "TRANSLOCATED:", _path(seg))
-
 def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, deduplicated_paths, consensus=1, verbose=True, junction_name=None):
     # get isolates belonging to this consensus
     isolates_1 = assignment_df[assignment_df['best_consensus'] == f"consensus_{consensus}"].index.tolist()
@@ -492,20 +1091,20 @@ def get_insertions_deletions_from_consensus(assignment_df, consensus_paths, dedu
     deduplicated_paths = {iso: path for iso, path in deduplicated_paths.items() if iso in isolates_1}
 
     # compare deduplicated paths to consensus paths to find deviations
-    insertions, ambiguous_insertions, deletions, inversions, translocations, context_stats = get_insertions_deletions_v2(deduplicated_paths, consensus_paths[consensus - 1])
+    insertions, ambiguous_insertions, deletions, inversions, context_stats = get_insertions_deletions_v2(deduplicated_paths, consensus_paths[consensus - 1])
 
     # annotate stats with junction name and consensus id
     for row in context_stats:
         row["junction_name"] = junction_name
         row["consensus"] = consensus
 
-    context_stats_df = pd.DataFrame(context_stats, columns=["junction_name", "consensus", "isolate", "n_blocks", "n_duplicated_blocks", "n_ambiguous_blocks", "n_insertions", "n_ambiguous_insertions", "n_translocations", "n_ambiguous_translocations"])
+    context_stats_df = pd.DataFrame(context_stats, columns=["junction_name", "consensus", "isolate", "n_blocks", "n_duplicated_blocks", "n_ambiguous_blocks", "n_insertions", "n_ambiguous_insertions"])
 
     # Print results
     if verbose:
-        print_insertions_deletions(insertions, deletions, inversions, translocations)
+        print_insertions_deletions(insertions, deletions, inversions)
 
-    return insertions, ambiguous_insertions, deletions, inversions, translocations, context_stats_df
+    return insertions, ambiguous_insertions, deletions, inversions, context_stats_df
 
 def combine_NCBI_atb_results(parent_dir):
     parent_dir = Path(parent_dir)
@@ -921,9 +1520,7 @@ def summarize_deletions_consensus(
 
     if rerun_alignment:
         for iso, entries in deletions.items():
-            for idx, entry in enumerate(entries):
-                path = entry["path"]
-                left_nid = entry["left_nid"]
+            for idx, path in enumerate(entries):
                 file_prefix = f"{iso}_deletion{idx}"
 
                 if path in seen_paths:
@@ -957,9 +1554,23 @@ def summarize_deletions_consensus(
     # --- collect consensus sequences ---
     results = []
     for iso, entries in deletions.items():
-        for idx, entry in enumerate(entries):
-            path = entry["path"]
-            left_nid = entry["left_nid"]
+        iso_nodes = path_dict[iso].nodes if iso in path_dict else []
+        for idx, path in enumerate(entries):
+            parent_clade_id = path.nodes[0].parent_clade_id if path.nodes else None
+
+            # find position: end of the node just before the first deleted block
+            position = None
+            if path.nodes:
+                first = path.nodes[0]
+                for i, n in enumerate(iso_nodes):
+                    if n.id == first.id and n.context == first.context:
+                        for j in range(i - 1, -1, -1):
+                            pred = iso_nodes[j]
+                            if pred.type != "deletion" and pred.nid is not None:
+                                position = pangraph.nodes[pred.nid].end
+                                break
+                        break
+
             aln_path = os.path.join(out_dir, f"{iso}_deletion{idx}_blocks_aln.fa")
             if os.path.exists(aln_path):
                 consensus_seq = get_consensus_seq_from_alignment(aln_path)
@@ -971,6 +1582,7 @@ def summarize_deletions_consensus(
                 length = sum(
                     int(pangraph.nodes[n.nid].end - pangraph.nodes[n.nid].start)
                     for n in path.nodes
+                    if n.nid is not None
                 )
 
             results.append(
@@ -982,9 +1594,9 @@ def summarize_deletions_consensus(
                     "deletion": f"deletion{idx}",
                     "consensus_sequence": consensus_sequence,
                     "length": length,
-                    "position": pangraph.nodes[left_nid].end if left_nid is not None else None,
                     "strand": "+" if path.nodes[0].strand else "-",
-                    "ctx": entry.get("ctx"),
+                    "position": position,
+                    "parent_clade_id": parent_clade_id,
                 }
             )
 
@@ -1034,12 +1646,12 @@ def summarize_inversions_consensus(
 
     results = []
     for iso, inv_paths in inversions.items():
-        for idx, inv_entry in enumerate(inv_paths):
-            inv_path = inv_entry["path"]
-            ctx = inv_entry["ctx"]
+        for idx, inv_path in enumerate(inv_paths):
             nodes = inv_path.nodes
             if not nodes:
                 continue
+
+            parent_clade_id = nodes[0].parent_clade_id
 
             # Compute total length from pangraph node coordinates
             total_length = sum(
@@ -1067,7 +1679,7 @@ def summarize_inversions_consensus(
                 "start_pos": start_pos,
                 "end_pos": end_pos,
                 "strand": majority_strand,
-                "ctx": ctx,
+                "parent_clade_id": parent_clade_id,
             })
 
     if not results:
@@ -1689,8 +2301,10 @@ def deduplicate_events(summaries, save_path=None):
     Deduplicate all event summary DataFrames and combine into one DataFrame.
 
     For each event type:
-      - Deduplicate by (junction_name, path, ctx) so each unique event is
-        represented exactly once regardless of which isolate carried it.
+      - Deduplicate by (junction_name, consensus, path, parent_clade_id) so
+        each unique event within a cluster is represented exactly once
+        regardless of which isolate carried it. Raises ValueError if any of
+        these columns is missing.
       - Drop the isolate column (genome_name) since events are no longer
         tied to a specific isolate after deduplication.
       - Add an 'event_type' column with the event type string.
@@ -1726,7 +2340,8 @@ def deduplicate_events(summaries, save_path=None):
     -------
     pd.DataFrame
         One row per unique event with columns: event_type, junction_name,
-        path, ctx, length, ... (genome_name dropped).
+        path, parent_clade_id, length, ..., isolates (genome_name dropped,
+        isolates is a list of all genome_names sharing the event).
     """
     # Maps summaries dict keys (plural, match directory names) to singular event_type labels
     event_type_map = {
@@ -1781,15 +2396,21 @@ def deduplicate_events(summaries, save_path=None):
 
         df = df.copy()
 
-        # Deduplicate by (junction_name, path, ctx) or (junction_name, path)
-        if "ctx" in df.columns:
-            dedup_cols = ["junction_name", "path", "ctx"]
-        else:
-            dedup_cols = ["junction_name", "path"]
-            print(f"Deduplication is done without using context, only based on path because context column was missing for {dtype}")
+        # Deduplicate by (junction_name, consensus, path, parent_clade_id)
+        dedup_cols = ["junction_name", "consensus", "path", "parent_clade_id"]
+        missing = [c for c in dedup_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Cannot deduplicate {dtype}: missing columns {missing}")
+
 
         # Columns to skip (used as group keys or dropped)
         skip_cols = set(dedup_cols) | {"genome_name"}
+
+        # Collect isolate lists before dropping genome_name
+        if "genome_name" in df.columns:
+            isolates_df = df.groupby(dedup_cols, as_index=False)["genome_name"].agg(list).rename(columns={"genome_name": "isolates"})
+        else:
+            isolates_df = None
 
         # Build agg_dict for every column in one pass
         agg_dict = {}
@@ -1808,6 +2429,8 @@ def deduplicate_events(summaries, save_path=None):
                 agg_dict[c] = "first"
 
         df = df.groupby(dedup_cols, as_index=False).agg(agg_dict)
+        if isolates_df is not None:
+            df = df.merge(isolates_df, on=dedup_cols, how="left")
         df = df.reset_index(drop=True)
         df.insert(0, "event_type", etype_label)
         parts.append(df)

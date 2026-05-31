@@ -334,10 +334,19 @@ def make_deduplicated_paths(pangraph, path_dict, rare_context_thresh=0.1) -> dic
     @param rare_context_threshold: is a threshold how rare blocks can be to be allowed as context anchors, right now it is hard coded to 10
     Additionally also return deduplicated block count dictionary.
     """
-    blockstats_df = pangraph.to_blockstats_df()
-    duplicated_ids = set(blockstats_df.loc[blockstats_df['duplicated'] == True].index)
+    # compute duplicated_ids from path_dict directly so seq-dedup renamed ids (e.g. BLOCKID_0)
+    # are correctly identified as duplicated when they still appear more than once per isolate
+    isolate_counts: Counter = Counter()
+    duplicated_ids: set = set()
+    for path in path_dict.values():
+        seen: Counter = Counter(n.id for n in path)
+        for bid, cnt in seen.items():
+            isolate_counts[bid] += 1
+            if cnt > 1:
+                duplicated_ids.add(bid)
+
     rare_context_thresh_abs = np.floor(rare_context_thresh * len(path_dict))
-    rare_ids = set(blockstats_df.loc[blockstats_df['count'] < rare_context_thresh_abs].index)
+    rare_ids = {bid for bid, cnt in isolate_counts.items() if cnt < rare_context_thresh_abs}
     invertible_ids = find_invertible_ids(path_dict)
 
     deduplicated_paths, freq, dedup_stats = _deduplicate_path_dict(path_dict, duplicated_ids, rare_ids, invertible_ids)
@@ -1333,7 +1342,7 @@ def find_consensus_paths_core(junction_name, clustering_bl_thresh = 0.005, conse
 
 def find_consensus_paths_refined(junction_name, clustering_bl_thresh=0.001, tree_path=None,
                                   rare_context_thresh=0.2, z_score_threshold=3.5,
-                                  seq_dedup_length_threshold=0.001,
+                                  seq_dedup_length_threshold=0.002,
                                   plot_consensus=False, plot_pair_dist=False,
                                   plot_snp_dist=False, plot_ambiguities=False):
     """
@@ -1672,6 +1681,49 @@ def collect_all_branch_lengths(results_dir, save_path=None):
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(save_path, index=False)
         print(f"Saved branch lengths to {save_path}.")
+
+    return df
+
+
+def collect_all_block_branch_lengths(results_dir, save_path=None):
+    """
+    Collect branch lengths from all existing per-block FastTree trees.
+
+    Globs for ``block_*_aln.tree`` files under
+    ``results_dir/block_alignments/<junction_name>/`` and joins with the
+    alignment stats CSV to attach ``core`` and ``duplicated`` flags.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        junction_name, block_id, branch_length, core, duplicated
+    """
+    results_dir = Path(results_dir)
+    rows = []
+
+    for tree_path in sorted((results_dir / "block_alignments").glob("*/block_*_aln.tree")):
+        if tree_path.stat().st_size == 0:
+            continue
+        jname = tree_path.parent.name
+        block_id = int(tree_path.name.removeprefix("block_").removesuffix("_aln.tree"))
+        tree = Phylo.read(str(tree_path), "newick")
+        for clade in tree.find_clades():
+            if clade.branch_length is not None:
+                rows.append({"junction_name": jname, "block_id": block_id, "branch_length": clade.branch_length})
+
+    df = pd.DataFrame(rows)
+
+    # attach core/duplicated flags from stats CSVs
+    stats_dfs = []
+    for stats_csv in (results_dir / "block_alignments").glob("*/*_alignment_stats.csv"):
+        stats_dfs.append(pd.read_csv(stats_csv)[["block_id", "core", "duplicated"]])
+    if stats_dfs:
+        stats = pd.concat(stats_dfs).drop_duplicates("block_id")
+        df = df.merge(stats, on="block_id", how="left")
+
+    if save_path is not None:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(save_path, index=False)
 
     return df
 
