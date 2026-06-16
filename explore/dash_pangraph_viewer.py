@@ -14,7 +14,7 @@ REPO_ROOT = HERE.parents[1]
 # Make imports work (repo root must be on sys.path so `import junction_analysis` works)
 sys.path.insert(0, str(REPO_ROOT))
 
-from junction_analysis.plotting import plot_pangraph_base_for_dash, add_annotations_for_dash, _rgb_str, _shades_from_base_rgb, _rgba
+from junction_analysis.plotting import plot_pangraph_base_for_dash, add_annotations_for_dash
 from junction_analysis.consensus import find_consensus_paths_core, find_consensus_paths_edge, find_consensus_paths_refined, save_consensus_cache, load_consensus_cache
 from junction_analysis.annotate_insertions import (
     # get_insertions_deletions_from_consensus,  # replaced by new pipeline
