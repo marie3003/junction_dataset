@@ -1387,9 +1387,9 @@ def find_consensus_paths_refined(junction_name, clustering_bl_thresh=0.001, tree
         for idx, node in enumerate(path.nodes):
             node.nid = pangraph.paths[isolate].nodes[idx]
 
-    path_dict_raw = deduplicate_blocks_by_sequence(pangraph, path_dict_raw, junction_name, length_threshold=seq_dedup_length_threshold)
-
     cluster_map_core, cluster_to_isos, tree_path_core, out_dir = cluster_isolates_by_core_blocks(pangraph, path_dict_raw, junction_name, clustering_bl_thresh)
+
+    path_dict_raw = deduplicate_blocks_by_sequence(pangraph, path_dict_raw, junction_name, length_threshold=seq_dedup_length_threshold)
 
     path_dict, block_freq, global_dedup_stats = make_deduplicated_paths(pangraph, path_dict_raw)
     for row in global_dedup_stats:

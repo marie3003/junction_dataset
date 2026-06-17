@@ -40,13 +40,15 @@ def create_block_msas(example_junction, only_core=False): # 2 min 14
     for block in example_pangraph.blocks:
         if only_core and block.id not in core_ids:
             continue
-        output_path = parent_dir / f"block_{block.id}_sequences.fa"
-        write_isolate_fasta(example_pangraph, block, output_path)
+        fasta_file = parent_dir / f"block_{block.id}_sequences.fa"
+        aln_file   = aligned_dir / f"block_{block.id}_aln.fa"
 
-    for fasta_file in parent_dir.glob("block_*_sequences.fa"):
-        aln_file = aligned_dir / fasta_file.name.replace("_sequences.fa", "_aln.fa")
+        if fasta_file.exists() and aln_file.exists():
+            continue
 
-        # Run MAFFT quietly (you can remove '--quiet' if you want verbose output)
+        if not fasta_file.exists():
+            write_isolate_fasta(example_pangraph, block, fasta_file)
+
         subprocess.run(
             ["mafft", "--quiet", str(fasta_file)],
             stdout=open(aln_file, "w"),

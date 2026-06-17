@@ -818,10 +818,10 @@ if __name__ == "__main__":
         #junction_name = "PLTCZQCVRD_f__RYYAQMEJGY_f"
         #junction_name = "NOAJDCSIVA_f__NZXBIFMPMA_r"
         #junction_name = "EJPOGALASQ_f__KUIFCLFQSI_r"
-        #junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
+        junction_name = "RYYAQMEJGY_r__ZTHKZYHPIX_f"
         #junction_name = "IHKFSQQUKE_r__KPBYGJHRZJ_f" # --> look up again, its the prophage one that would get two clusters
         #junction_name = "AWYUJYFNGP_f__GCNKXNFARN_r"
-        junction_name = "JVNRLCFAVD_f__PLTCZQCVRD_r" # example for a junction that isn't split enough
+        #junction_name = "JVNRLCFAVD_f__PLTCZQCVRD_r" # example for a junction that isn't split enough
         #junction_name = "XXVMWZCEKI_r__YUOECYBHUS_r" # --> wild junctions with 12 clusters
         #junction_name = "OBEJYXNUDN_r__ZTHKZYHPIX_r"
         #junction_name = "AGVTAJTYER_r__OZLYYMOKWU_f" # interesting has one insertion in its own cluster and then the same one again in a different cluster but inverted
@@ -912,7 +912,7 @@ if __name__ == "__main__":
             )
             _, path_dict_annotated = group_events_by_clade(
                 df, path_dict_annotated, isolates_i,
-                tree_path=str(tree_path), method="fitch"
+                tree_path=str(tree_path), method="fitch", polytomy_threshold = 0.7
             )
             insertions, deletions, inversions = find_combined_events(
                 path_dict_annotated, consensus_annotated,

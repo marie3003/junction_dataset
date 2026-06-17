@@ -4134,12 +4134,16 @@ def plot_clustering_threshold_sweep(df, figsize=(7,4), save_path=None, normalize
 
 
 def plot_event_tree(events_df, isolate_list, block_id, event_type, context,
+                    strand=None,
                     clade_df=None,
                     tree_path="../config/polished_tree.nwk",
                     title=None, ax=None, save_path=None):
     """
     Plot the subtree of isolate_list with tips colored by presence/absence
     of a specific (event_type, block_id, context) combination.
+
+    If strand is provided, only isolates carrying the block with that strand
+    are counted as present. If None, all strands are included.
 
     If clade_df (output of group_events_by_clade) is provided, the parent
     node of each gain clade is marked with a dot and labelled with its
@@ -4172,13 +4176,16 @@ def plot_event_tree(events_df, isolate_list, block_id, event_type, context,
 
     tree = Phylo.read(tree_path, "newick")
     subtree = build_subtree(tree, isolate_list)
+    subtree_tips = {c.name for c in subtree.get_terminals()}
 
     mask = (
         (events_df["event_type"] == event_type) &
         (events_df["block_id"]   == block_id)   &
         (events_df["context"]    == context)
     )
-    event_isolates = set(events_df.loc[mask, "isolate"])
+    if strand is not None:
+        mask &= (events_df["strand"] == strand)
+    event_isolates = set(events_df.loc[mask, "isolate"]) & subtree_tips
 
     # for each gain clade in clade_df, resolve parent_clade_id (frozenset of
     # tip names) back to a subtree node via common_ancestor
@@ -4189,6 +4196,8 @@ def plot_event_tree(events_df, isolate_list, block_id, event_type, context,
             (clade_df["block_id"]   == block_id)   &
             (clade_df["context"]    == context)
         )
+        if strand is not None:
+            cmask &= (clade_df["strand"] == strand)
         for _, row in clade_df.loc[cmask].iterrows():
             pid = row.get("parent_clade_id")
             if pid is None:
@@ -4200,7 +4209,7 @@ def plot_event_tree(events_df, isolate_list, block_id, event_type, context,
             node = nodes[0]
             gain_clade_nodes.append((node, pid))
 
-    n_tips = len(isolate_list)
+    n_tips = len(subtree_tips)
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, max(3, n_tips * 0.18)))
         created_fig = True

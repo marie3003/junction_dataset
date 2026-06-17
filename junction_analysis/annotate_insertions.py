@@ -284,7 +284,8 @@ def detect_event_blocks(deduplicated_paths, consensus_path):  # noqa: C901
 
 def group_events_by_clade(events_df, iso_annotated_paths, isolate_list,
                           tree_path="../config/polished_tree.nwk",
-                          method="fitch"):
+                          method="fitch",
+                          polytomy_threshold=0.7):
     """
     Group detected events into clades according to the phylogeny, and annotate
     the isolate paths with the resolved ``parent_clade_id`` for every
@@ -300,12 +301,21 @@ def group_events_by_clade(events_df, iso_annotated_paths, isolate_list,
         over-split when losses occur within an otherwise positive clade.
 
     method="fitch" (default)
-        Runs binary Fitch parsimony (0=absent, 1=present) with a bottom-up
-        pass to assign state sets and a top-down pass to resolve ambiguous
-        nodes. Each 0→1 gain edge defines one independent event acquisition;
-        the clade below that edge (restricted to tips that actually carry the
-        event) is returned as one row. Allows losses within a gain clade, so
-        it merges clades that would be split by the maximal_clades approach.
+        Runs binary Fitch parsimony (0=absent, 1=present).
+
+        Bottom-up pass:
+          - All nodes: standard Fitch — intersection if non-empty, else union.
+          - Polytomies only (≥3 children): if the standard result would be
+            ambiguous {0,1}, apply a symmetric threshold override — if more
+            than polytomy_threshold fraction of children contain 1 → {1}; if
+            more than polytomy_threshold fraction contain 0 (i.e. frac_1 ≤
+            1−threshold) → {0}; otherwise keep {0,1}.
+
+        Top-down pass: ambiguous nodes inherit their parent's resolved state,
+        so each 0→1 gain edge is pushed as high as possible in the tree.
+
+        If the root is still ambiguous after the bottom-up pass it is resolved
+        as absent (0) and a warning is printed.
 
     Parameters
     ----------
@@ -319,6 +329,9 @@ def group_events_by_clade(events_df, iso_annotated_paths, isolate_list,
     tree_path : str
         Path to the full Newick phylogeny.
     method : {"fitch", "maximal_clades"}
+    polytomy_threshold : float
+        (fitch only) Fraction of children at a polytomy that must contain
+        state 1 (or 0) to resolve the node confidently. Default 0.7.
 
     Returns
     -------
@@ -372,41 +385,68 @@ def group_events_by_clade(events_df, iso_annotated_paths, isolate_list,
         _walk(subtree.root)
         return result
 
-    def _fitch_clades(event_isolates):
+    def _fitch_clades(event_isolates, event_label=""):
         event_set = set(event_isolates)
 
-        # bottom-up: assign Fitch state sets
+        # bottom-up pass
         state = {}
         for clade in subtree.find_clades(order="postorder"):
             if clade.is_terminal():
                 state[clade] = {1} if clade.name in event_set else {0}
             else:
-                child_sets = [state[c] for c in clade.clades]
-                inter = set.intersection(*child_sets)
-                state[clade] = inter if inter else set.union(*child_sets)
+                children = clade.clades
+                if len(children) == 2:
+                    # standard Fitch: intersection if non-empty, else union
+                    inter = state[children[0]] & state[children[1]]
+                    state[clade] = inter if inter else state[children[0]] | state[children[1]]
+                else:
+                    # polytomy: standard Fitch (intersection/union), with one
+                    # override: if the result is ambiguous {0,1} and more than
+                    # polytomy_threshold fraction of children contain 1 (or 0),
+                    # resolve confidently as 1 (or 0). Threshold is symmetric.
+                    inter = set.intersection(*[state[c] for c in children])
+                    if inter:
+                        state[clade] = inter
+                    else:
+                        n = len(children)
+                        frac_1 = sum(1 for c in children if 1 in state[c]) / n
+                        if frac_1 >= polytomy_threshold:
+                            state[clade] = {1}
+                        elif frac_1 <= 1 - polytomy_threshold:
+                            state[clade] = {0}
+                        else:
+                            state[clade] = {0, 1}
 
-        # precompute fraction of event-carrying tips below each node
-        tip_fraction = {}
-        for clade in subtree.find_clades(order="postorder"):
-            tips = clade.get_terminals()
-            tip_fraction[clade] = sum(1 for t in tips if t.name in event_set) / len(tips)
+        # --- debug: bottom-up states ---
+        if 139818706072034984 == block_id and context == "1816345530523234386_70":
+            print(f"\n=== bottom-up states for {event_label!r} ===")
+            for clade in subtree.find_clades(order="preorder"):
+                tips = [t.name for t in clade.get_terminals()]
+                kind = "TIP" if clade.is_terminal() else f"INT({len(clade.clades)} children)"
+                print(f"  {kind:25s} {str(clade.name or '?'):30s} state={state[clade]}  tips={tips[:3]}{'...' if len(tips)>3 else ''}")
 
-        # top-down: resolve ambiguous nodes
-        # unambiguous nodes take their Fitch state; ambiguous nodes resolve
-        # towards 1 (present) if the majority of tips below carry the event,
-        # otherwise follow the parent state.
+        # resolve root
+        root_state = state[subtree.root]
+        if len(root_state) == 1:
+            resolved = {subtree.root: next(iter(root_state))}
+        else:
+            print(
+                f"Warning: ambiguous root state for event {event_label!r}. "
+                f"Root node: {subtree.root.name!r}. Resolving as absent."
+            )
+            resolved = {subtree.root: 0}
 
-        resolved = {subtree.root: 0 if 0 in state[subtree.root] else 1}
+        # top-down pass: ambiguous nodes follow their parent's resolved state,
+        # so each gain is pushed as high as possible in the tree
         for clade in subtree.find_clades(order="preorder"):
             if clade is subtree.root:
                 continue
             if len(state[clade]) == 1:
-                resolved[clade] = next(iter(state[clade]))  # unambiguous
+                resolved[clade] = next(iter(state[clade]))
             else:
-                # ambiguous: majority vote on tips below
-                resolved[clade] = 1 if tip_fraction[clade] > 0.5 else resolved[parent_map[clade]]
+                resolved[clade] = resolved[parent_map[clade]]
 
-        # collect all gain edges (parent=0 → child=1)
+        # collect gain edges (parent=0 → child=1)
         gain_clades = [
             clade for clade in subtree.find_clades(order="preorder")
             if clade is not subtree.root
@@ -445,7 +485,9 @@ def group_events_by_clade(events_df, iso_annotated_paths, isolate_list,
         ["event_type", "block_id", "strand", "context"]
     ):
         event_isolates = group["isolate"].tolist()
-        for clade_isolates, clade_bl, parent_id in _group_fn(event_isolates):
+        label = f"{event_type} | block {block_id} | context {context}"
+        _call = (lambda iso: _group_fn(iso, event_label=label)) if method == "fitch" else _group_fn
+        for clade_isolates, clade_bl, parent_id in _call(event_isolates):
             rows.append({
                 "event_type":          event_type,
                 "block_id":            block_id,
