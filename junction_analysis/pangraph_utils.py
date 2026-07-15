@@ -48,6 +48,9 @@ class DeduplicatedNode:
         nid: Optional[str] = None,
         type: Optional[str] = None,
         parent_clade_id: Optional[str] = None,
+        secondary_type: Optional[str] = None,
+        secondary_parent_clade_id: Optional[str] = None,
+        present_at_present: bool = True,
     ) -> None:
         self.id = bid
         self.strand = strand
@@ -55,6 +58,9 @@ class DeduplicatedNode:
         self.nid = nid
         self.type = type
         self.parent_clade_id = parent_clade_id
+        self.secondary_type = secondary_type
+        self.secondary_parent_clade_id = secondary_parent_clade_id
+        self.present_at_present = present_at_present
 
     # for now context is always block that is never inverted, that's why we can just keep the context in the case of an inversion
     def invert(self) -> "DeduplicatedNode":

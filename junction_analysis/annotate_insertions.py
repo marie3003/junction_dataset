@@ -477,11 +477,159 @@ def group_events_by_clade(events_df, iso_annotated_paths, isolate_list,
 
     _group_fn = _fitch_clades if method == "fitch" else _maximal_clades
 
+    def _detect_strand_switches(clade_isolates, iso_to_strand, parent_id, clade_bl, block_id, context):
+        """
+        Run strand Fitch within an insertion gain clade to detect secondary inversions.
+
+        Returns (main_rows, secondary_rows):
+          main_rows      — replacement insertion row(s): one if root strand is
+                           certain, one per child if root is ambiguous (split).
+          secondary_rows — secondary_inversion rows for strand-switch sub-clades.
+
+        Also annotates iso_annotated_paths in-place with secondary_type /
+        secondary_parent_clade_id on the affected insertion nodes.
+        """
+        clade_subtree = build_subtree(subtree, clade_isolates)
+
+        strands = list({iso_to_strand[iso] for iso in clade_isolates if iso in iso_to_strand})
+        strand_to_int = {strands[0]: 0, strands[1]: 1}
+        int_to_strand = {0: strands[0], 1: strands[1]}
+
+        cs_parent = {}
+        for cl in clade_subtree.find_clades(order="preorder"):
+            for ch in cl.clades:
+                cs_parent[ch] = cl
+
+        # bottom-up Fitch on strand — pure standard Fitch, no polytomy threshold.
+        # The polytomy threshold is for presence/absence detection; strand
+        # reconstruction uses unmodified intersection/union rules.
+        cs_state = {}
+        for cl in clade_subtree.find_clades(order="postorder"):
+            if cl.is_terminal():
+                s = iso_to_strand.get(cl.name)
+                cs_state[cl] = {strand_to_int[s]} if s is not None else {0, 1}
+            else:
+                child_sets = [cs_state[c] for c in cl.clades]
+                inter = set.intersection(*child_sets)
+                cs_state[cl] = inter if inter else set.union(*child_sets)
+
+        root_state = cs_state[clade_subtree.root]
+        print(f"[DEBUG strand_fitch] block={block_id} ctx={context} root_state={root_state} n_clade={len(clade_isolates)} strands={strands}")
+
+        # --- resolve root strand ---
+        # If root is ambiguous, check the minority strand fraction:
+        #   minority < (1 - polytomy_threshold) → one strand clearly dominates,
+        #     resolve as majority and detect the minority sub-clade as a
+        #     secondary inversion in the top-down pass.
+        #   minority >= (1 - polytomy_threshold) → both strands are substantial,
+        #     treat as two independent insertions (split at root).
+        if len(root_state) > 1:
+            counts = Counter(iso_to_strand[iso] for iso in clade_isolates if iso in iso_to_strand)
+            total = sum(counts.values())
+            majority_strand, majority_n = counts.most_common(1)[0]
+            minority_frac = (total - majority_n) / total if total > 0 else 0.0
+
+            if minority_frac >= 1 - polytomy_threshold:
+                # genuine split: two independent insertions, one per root child
+                main_rows = []
+                for child in clade_subtree.root.clades:
+                    child_tips = [t.name for t in child.get_terminals()]
+                    child_counts = Counter(iso_to_strand[iso] for iso in child_tips if iso in iso_to_strand)
+                    child_strand = child_counts.most_common(1)[0][0] if child_counts else majority_strand
+                    main_rows.append({
+                        "event_type":          "insertion",
+                        "block_id":            block_id,
+                        "strand":              child_strand,
+                        "context":             context,
+                        "clade_isolates":      child_tips,
+                        "clade_branch_length": _total_branch_length(child),
+                        "parent_clade_id":     child.name,
+                    })
+                return main_rows, []
+
+            root_resolved_int = strand_to_int[majority_strand]
+        else:
+            root_resolved_int = next(iter(root_state))
+
+        # --- top-down to find strand-switch sub-clades ---
+        cs_resolved = {clade_subtree.root: root_resolved_int}
+        for cl in clade_subtree.find_clades(order="preorder"):
+            if cl is clade_subtree.root:
+                continue
+            cs_resolved[cl] = (
+                next(iter(cs_state[cl])) if len(cs_state[cl]) == 1
+                else cs_resolved[cs_parent[cl]]
+            )
+
+        root_strand = int_to_strand[cs_resolved[clade_subtree.root]]
+        main_rows = [{
+            "event_type":          "insertion",
+            "block_id":            block_id,
+            "strand":              root_strand,
+            "context":             context,
+            "clade_isolates":      clade_isolates,
+            "clade_branch_length": clade_bl,
+            "parent_clade_id":     parent_id,
+        }]
+
+        secondary_rows = []
+        switch_ancestors = set()  # nodes already under a detected switch
+
+        for cl in clade_subtree.find_clades(order="preorder"):
+            if cl is clade_subtree.root:
+                continue
+            if id(cl) in switch_ancestors:
+                continue
+            parent_cl = cs_parent[cl]
+            if cs_resolved[parent_cl] == cs_resolved[cl]:
+                continue
+
+            # strand switch detected at this node
+            switch_tips = [t.name for t in cl.get_terminals()]
+            switch_strand = int_to_strand[cs_resolved[cl]]
+
+            # warn about any further switches downstream
+            for desc in cl.find_clades(order="preorder"):
+                if desc is cl:
+                    continue
+                dp = cs_parent.get(desc)
+                if dp and cs_resolved.get(dp) != cs_resolved.get(desc):
+                    print(
+                        f"Warning: multiple strand switches for block {block_id} "
+                        f"context {context!r}: switch at {cl.name!r}, further "
+                        f"switch at {desc.name!r}. Further switches are not handled."
+                    )
+                switch_ancestors.add(id(desc))
+
+            secondary_rows.append({
+                "event_type":          "secondary_inversion",
+                "block_id":            block_id,
+                "strand":              switch_strand,
+                "context":             context,
+                "clade_isolates":      switch_tips,
+                "clade_branch_length": _total_branch_length(cl),
+                "parent_clade_id":     cl.name,
+            })
+
+            # annotate affected nodes in iso_annotated_paths
+            for iso in switch_tips:
+                if iso not in iso_annotated_paths:
+                    continue
+                for dn in iso_annotated_paths[iso].nodes:
+                    if dn.id == block_id and dn.context == context and dn.type == "insertion":
+                        dn.secondary_type = "inversion"
+                        dn.secondary_parent_clade_id = cl.name
+                        break
+
+        return main_rows, secondary_rows
+
     rows = []
     # (event_type, block_id, strand, context, isolate) -> parent_clade_id
     evt_to_clade = {}
 
-    for (event_type, block_id, strand, context), group in events_df.groupby(
+    # non-insertion events: group by strand as before
+    non_ins_df = events_df[events_df["event_type"] != "insertion"]
+    for (event_type, block_id, strand, context), group in non_ins_df.groupby(
         ["event_type", "block_id", "strand", "context"]
     ):
         event_isolates = group["isolate"].tolist()
@@ -499,6 +647,149 @@ def group_events_by_clade(events_df, iso_annotated_paths, isolate_list,
             })
             for iso in clade_isolates:
                 evt_to_clade[(event_type, block_id, strand, context, iso)] = parent_id
+
+    # insertions: merge strands so both orientations count as the same event,
+    # then detect secondary inversions within each gain clade
+    ins_df = events_df[events_df["event_type"] == "insertion"]
+    for (block_id, context), group in ins_df.groupby(["block_id", "context"]):
+        iso_to_strand = dict(zip(group["isolate"], group["strand"]))
+        event_isolates = group["isolate"].tolist()
+        label = f"insertion | block {block_id} | context {context}"
+        _call = (lambda iso: _fitch_clades(iso, event_label=label)) if method == "fitch" else _maximal_clades
+
+        for clade_isolates, clade_bl, parent_id in _call(event_isolates):
+            strands_in_clade = {iso_to_strand.get(iso) for iso in clade_isolates} - {None}
+
+            if block_id == 139818706072034984 and context == "1816345530523234386_70":
+                print(f"[DEBUG ins] parent={parent_id} n={len(clade_isolates)} strands={strands_in_clade}")
+
+            if len(strands_in_clade) > 1 and method == "fitch":
+                main_rows, secondary_rows = _detect_strand_switches(
+                    clade_isolates, iso_to_strand, parent_id, clade_bl, block_id, context
+                )
+                rows.extend(main_rows)
+                rows.extend(secondary_rows)
+                for r in main_rows:
+                    for iso in r["clade_isolates"]:
+                        evt_to_clade[("insertion", block_id, iso_to_strand.get(iso), context, iso)] = r["parent_clade_id"]
+            else:
+                strand = next(iter(strands_in_clade)) if strands_in_clade else None
+                rows.append({
+                    "event_type":          "insertion",
+                    "block_id":            block_id,
+                    "strand":              strand,
+                    "context":             context,
+                    "clade_isolates":      clade_isolates,
+                    "clade_branch_length": clade_bl,
+                    "parent_clade_id":     parent_id,
+                })
+                for iso in clade_isolates:
+                    evt_to_clade[("insertion", block_id, iso_to_strand.get(iso), context, iso)] = parent_id
+
+    # ------------------------------------------------------------------ #
+    # Secondary deletion detection within insertion clades               #
+    # ------------------------------------------------------------------ #
+    # For each detected insertion row (one block, one gain-clade root):
+    # walk the subtree rooted at parent_clade_id and find the maximal
+    # sub-clades (or single tips) where every terminal lacks the block.
+    # These are secondary deletions of that block within the insertion clade.
+
+    sec_del_rows = []
+    path_additions = []   # (iso, new_node, anchor_key)
+
+    for r in rows:
+        if r["event_type"] != "insertion":
+            continue
+
+        bid            = r["block_id"]
+        ctx            = r["context"]
+        bstrand        = r["strand"]
+        parent_clade_id_key = r["parent_clade_id"]
+        has_set        = set(r["clade_isolates"])
+
+        gain_node = subtree.find_any(parent_clade_id_key)
+        if gain_node is None:
+            continue
+
+        # find reference isolate path and block index once per row
+        ref_iso = next((iso for iso in has_set if iso in iso_annotated_paths), None)
+        if ref_iso is None:
+            continue
+        ref_nodes = iso_annotated_paths[ref_iso].nodes
+        ref_idx = next(
+            (i for i, dn in enumerate(ref_nodes)
+             if dn.id == bid and dn.context == ctx and dn.type == "insertion"),
+            None,
+        )
+        if ref_idx is None:
+            continue
+        ref_nid = ref_nodes[ref_idx].nid
+
+        # walk gain_node subtree preorder; collect maximal loss sub-clades
+        def _find_loss_clades(node):
+            tips = [t.name for t in node.get_terminals()]
+            all_missing = all(t not in has_set for t in tips)
+            if all_missing:
+                # entire sub-clade is a loss: record once and stop recursing
+                loss_tips = tips
+                del_parent = node.name if not node.is_terminal() else node.name
+                sec_del_rows.append({
+                    "event_type":          "secondary_deletion",
+                    "block_id":            bid,
+                    "strand":              bstrand,
+                    "context":             ctx,
+                    "clade_isolates":      loss_tips,
+                    "clade_branch_length": _total_branch_length(node),
+                    "parent_clade_id":     del_parent,
+                })
+                for iso in loss_tips:
+                    if iso not in iso_annotated_paths:
+                        continue
+                    aff_keys = {(dn.id, dn.context) for dn in iso_annotated_paths[iso].nodes}
+                    anchor_key = None
+                    for i in range(ref_idx - 1, -1, -1):
+                        dn = ref_nodes[i]
+                        if (dn.id, dn.context) in aff_keys:
+                            anchor_key = (dn.id, dn.context)
+                            break
+                    new_node = pu.DeduplicatedNode(
+                        bid, bstrand, ctx, ref_nid,
+                        type="insertion",
+                        parent_clade_id=parent_clade_id_key,
+                        secondary_type="deletion",
+                        secondary_parent_clade_id=del_parent,
+                        present_at_present=False,
+                    )
+                    path_additions.append((iso, new_node, anchor_key))
+            else:
+                # mixed: recurse into children
+                for child in node.clades:
+                    _find_loss_clades(child)
+
+        for child in gain_node.clades:
+            _find_loss_clades(child)
+
+    rows.extend(sec_del_rows)
+
+    # apply path additions; group by (iso, anchor_key) to preserve insertion
+    # order when multiple blocks are secondarily deleted at the same position
+    additions_by_anchor = defaultdict(list)
+    for iso, new_node, anchor_key in path_additions:
+        additions_by_anchor[(iso, anchor_key)].append(new_node)
+
+    for (iso, anchor_key), new_nodes in additions_by_anchor.items():
+        path = iso_annotated_paths[iso]
+        if anchor_key is None:
+            for node in reversed(new_nodes):
+                path.nodes.insert(0, node)
+        else:
+            insert_idx = next(
+                (i + 1 for i, dn in enumerate(path.nodes)
+                 if (dn.id, dn.context) == anchor_key),
+                len(path.nodes),
+            )
+            for j, node in enumerate(new_nodes):
+                path.nodes.insert(insert_idx + j, node)
 
     clade_df = pd.DataFrame(rows, columns=["event_type", "block_id", "strand", "context", "clade_isolates", "clade_branch_length", "parent_clade_id"])
 
@@ -541,8 +832,12 @@ def find_combined_events(  # noqa: C901
         Interrupt: any matched, inverted, or inserted node.
 
     inversions  (walk isolate path left-to-right)
-        Continue : same ``parent_clade_id`` and type "inversion".
-        Jump     : deleted or inserted nodes (regardless of clade).
+        Continue : type "inversion" with same ``parent_clade_id``, OR
+                   type "insertion" with ``secondary_type="inversion"`` and
+                   the same ``secondary_parent_clade_id``. A node may therefore
+                   belong simultaneously to an insertion group and an inversion
+                   group.
+        Jump     : deleted or pure-inserted nodes (no secondary inversion).
         Interrupt: any matched node.
 
     insertions  (walk isolate path left-to-right)
@@ -621,39 +916,52 @@ def find_combined_events(  # noqa: C901
 
         # ---- deletions --------------------------------------------------- #
         # open_del: clade_id -> list[dn]  (one open group per active clade)
-        # A node with an ancestor clade is a "jump" for the current group but
-        # continues its own open group — so we keep multiple groups alive.
-        # Any matched/inverted/inserted node interrupts ALL open groups.
+        # A node contributes via its primary type (type="deletion",
+        # parent_clade_id) OR via its secondary type (secondary_type="deletion",
+        # secondary_parent_clade_id). This allows a deletion event to span
+        # both consensus deletions and previously-inserted blocks that were
+        # subsequently deleted (present_at_present=False).
+        # Matched or inverted nodes interrupt ALL open groups.
         open_del: dict = {}
         for dn in nodes:
             t = dn.type or "matched"
+            del_ids = []
             if t == "deletion":
-                cl = dn.parent_clade_id
-                # close any open group whose clade is a descendant of cl
-                # (a broader deletion arrived — the narrower one is done)
-                to_close = [c for c in open_del if is_descendant(c, cl) and c != cl]
-                for c in to_close:
-                    deletions.setdefault(isolate, []).append(pu.Path(open_del.pop(c)))
-                open_del.setdefault(cl, []).append(dn)
+                del_ids.append(dn.parent_clade_id)
+            if dn.secondary_type == "deletion" and dn.secondary_parent_clade_id:
+                del_ids.append(dn.secondary_parent_clade_id)
+            if del_ids:
+                for cl in del_ids:
+                    to_close = [c for c in open_del if is_descendant(c, cl) and c != cl]
+                    for c in to_close:
+                        deletions.setdefault(isolate, []).append(pu.Path(open_del.pop(c)))
+                    open_del.setdefault(cl, []).append(dn)
             else:
-                # matched / inverted / inserted — interrupt all
+                # matched / inverted / pure-inserted — interrupt all
                 _flush(open_del, deletions)
         _flush(open_del, deletions)
 
         # ---- inversions -------------------------------------------------- #
-        # deleted and inserted nodes are jumped: they don't belong to the
-        # inversion group but don't break it either.  They are handled by
-        # their own deletion/insertion passes above/below.
-        # Multiple simultaneous inversion groups at different clades are
-        # kept alive in open_inv.
+        # Nodes contribute to an inversion group via their primary event
+        # (type="inversion", parent_clade_id) or their secondary event
+        # (secondary_type="inversion", secondary_parent_clade_id).  A node
+        # with type="insertion" and secondary_type="inversion" therefore
+        # participates in both an insertion group and an inversion group.
+        # Deleted nodes and pure-inserted nodes (no secondary inversion) are
+        # jumped.  Matched nodes interrupt all open inversion groups.
         open_inv: dict = {}
         for dn in nodes:
             t = dn.type or "matched"
+            inv_ids = []
             if t == "inversion":
-                cl = dn.parent_clade_id
-                open_inv.setdefault(cl, []).append(dn)
+                inv_ids.append(dn.parent_clade_id)
+            if dn.secondary_type == "inversion" and dn.secondary_parent_clade_id:
+                inv_ids.append(dn.secondary_parent_clade_id)
+            if inv_ids:
+                for cl in inv_ids:
+                    open_inv.setdefault(cl, []).append(dn)
             elif t in ("deletion", "insertion"):
-                pass  # jump — each is handled by its own pass
+                pass  # jump — handled by its own pass
             else:
                 # matched — interrupt all open inversion groups
                 _flush(open_inv, inversions)
@@ -1024,28 +1332,37 @@ def write_insertions_fasta(example_junction, pangraph, insertions, consensus = 1
     for isolate, inserted_paths in insertions.items():
         for idx, inserted_path in enumerate(inserted_paths):
             parent_clade_id = inserted_path.nodes[0].parent_clade_id if inserted_path.nodes else None
-            start_pos = pangraph.nodes[inserted_path.nodes[0].nid].start
-            end_pos = pangraph.nodes[inserted_path.nodes[-1].nid].end
+
+            # only real (present_at_present=True) nodes contribute to sequence,
+            # position bounds, and path string
+            real_nodes = [n for n in inserted_path.nodes if getattr(n, "present_at_present", True)]
+            if not real_nodes:
+                continue
+
+            start_pos = pangraph.nodes[real_nodes[0].nid].start if real_nodes[0].nid else None
+            end_pos   = pangraph.nodes[real_nodes[-1].nid].end  if real_nodes[-1].nid else None
 
             parts = []
-            for block in inserted_path.nodes:
+            for block in real_nodes:
                 block_seq = get_isolate_sequence(pangraph, block.id, block.nid)
                 if not block.strand:
                     block_seq = str(Seq(block_seq).reverse_complement())
                 parts.append(block_seq)
             seq = "".join(parts)
-            fasta_path = write_segment_fasta(example_junction, isolate, f"segment_{idx}", consensus, seq, inserted_path, parent_dir)
+
+            real_path = pu.Path(real_nodes)
+            fasta_path = write_segment_fasta(example_junction, isolate, f"segment_{idx}", consensus, seq, real_path, parent_dir)
 
             results.append(
                 {
                     "junction_name": example_junction,
                     "consensus": f"consensus_{consensus}",
                     "genome_name": isolate,
-                    "path": str(inserted_path),
+                    "path": str(real_path),
                     "insertion": f"segment_{idx}",
                     "fasta_path": fasta_path,
                     "length": len(seq),
-                    "strand": "+" if inserted_path.nodes[0].strand else "-",
+                    "strand": "+" if real_path.nodes[0].strand else "-",
                     "start_pos": start_pos,
                     "end_pos": end_pos,
                     "parent_clade_id": parent_clade_id,
